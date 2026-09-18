@@ -319,3 +319,77 @@ def test_singleton_is_the_only_observability_entrypoint():
     import app.upstream.jimeng.client as c
 
     assert c.OBS is OBS
+
+
+# ---------------------------------------------------------------------------
+# 部署接线
+# ---------------------------------------------------------------------------
+
+
+def test_dockerfile_cmd_target_resolves():
+    """🔴 `Dockerfile` 里 CMD 指向的启动目标必须真的存在。
+
+    **这条门禁是补的，因为它漏过一次真缺陷**：CMD 原先写的是
+    `app.main:app`（当时模块里**没有**模块级 `app`，只有 `create_app` 工厂）。
+    后果是镜像**永远起不来** —— gunicorn 报
+    `Failed to find attribute 'app' in 'app.main'` / `App failed to load.`
+    而**所有单测都是绿的**：它们直接调 `create_app()`，没有一条碰过 Dockerfile。
+
+    这正是"接线门禁"要覆盖的那一类：静态导入一切正常，只有真正启动时才炸。
+    本地复现命令（不需要 Docker）：
+        gunicorn -c gunicorn_conf.py app.main:app        # 失败
+        gunicorn -c gunicorn_conf.py "app.main:create_app()"   # 成功
+    """
+    import importlib
+    import json
+
+    text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    cmd_lines = [ln for ln in text.splitlines() if ln.strip().startswith("CMD ")]
+    assert cmd_lines, "Dockerfile 里找不到 CMD"
+    argv = json.loads(cmd_lines[-1].strip()[len("CMD "):])
+    target = argv[-1]
+
+    module_name, _, attr = target.partition(":")
+    assert module_name and attr, f"CMD 末尾应是 module:attr 形态，实得 {target!r}"
+    is_factory = attr.endswith("()")
+    attr_name = attr[:-2] if is_factory else attr
+
+    mod = importlib.import_module(module_name)
+    assert hasattr(mod, attr_name), (
+        f"CMD 指向 {target!r}，但 {module_name} 上没有 {attr_name!r} —— "
+        f"镜像会以 `Failed to find attribute` 启动失败（单测看不出来）。")
+    if is_factory:
+        assert callable(getattr(mod, attr_name)), f"{target!r} 的工厂不可调用"
+
+
+def test_dockerfile_needs_no_baked_credentials():
+    """镜像里不许烤进带账号密码的连接串 —— 那是部署期信息。
+
+    早先 `ENV TASK_DB=postgresql+psycopg2://jimeng:jimeng@db:5432/jimeng`
+    把凭据固化进了镜像层，还会让人误以为"直接 docker run 就能用"。
+    """
+    text = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    for ln in text.splitlines():
+        if ln.strip().startswith("ENV") or "TASK_DB=" in ln:
+            assert "://" not in ln, f"Dockerfile 里出现了带密码的 DSN：{ln.strip()[:90]}"
+
+
+def test_compose_required_env_vars_are_documented():
+    """compose 用 `${VAR:?}` **强制要求**的变量，必须在 `.env.example` 里有条目。
+
+    否则 `cp .env.example .env && docker compose up` 这条**写在文档里的首跑路径**
+    会在 compose 插值阶段直接失败（实测缺口：`POSTGRES_PASSWORD` 当时没列进去，
+    而 `.env` 被 gitignore ⇒ 新克隆一定没有它）。
+    """
+    import re
+
+    compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    required = set(re.findall(r"\$\{([A-Z_][A-Z0-9_]*):\?", compose))
+    example = (ROOT / ".env.example").read_text(encoding="utf-8")
+    declared = {ln.split("=", 1)[0].strip()
+                for ln in example.splitlines()
+                if "=" in ln and not ln.strip().startswith("#")}
+    missing = sorted(required - declared)
+    assert not missing, (
+        f"compose 强制要求但 .env.example 没列出的变量：{missing} —— "
+        f"照文档首跑会失败在 compose 插值那一步。")
