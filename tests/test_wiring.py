@@ -362,6 +362,36 @@ def test_dockerfile_cmd_target_resolves():
         assert callable(getattr(mod, attr_name)), f"{target!r} 的工厂不可调用"
 
 
+def test_gunicorn_worker_class_is_importable():
+    """`worker_class` 指向的类必须真的存在，且不许用已弃用的 `uvicorn.workers`。
+
+    这是"部署接线"门禁的第二条（第一条是 Dockerfile 的 CMD）：
+    `uvicorn.workers.UvicornWorker` 已被 uvicorn 官方弃用 ——
+        DeprecationWarning: The `uvicorn.workers` module is deprecated.
+                            Please use `uvicorn-worker` package instead.
+    而本仓 `uvicorn>=0.30` **不锁上界** ⇒ 等它真被移除时，
+    镜像是"构建成功、启动失败"，而**本地一切正常**（本地 venv 里那个版本还在）。
+
+    好消息是这个包已经装好了（`uvicorn-worker`），换过去实测零告警且服务正常。
+    """
+    import importlib
+    import re
+
+    cfg = (ROOT / "gunicorn_conf.py").read_text(encoding="utf-8")
+    m = re.search(r'^worker_class\s*=\s*["\']([^"\']+)["\']', cfg, re.M)
+    assert m, "gunicorn_conf.py 里找不到 worker_class"
+    dotted = m.group(1)
+
+    assert "uvicorn.workers" not in dotted, (
+        f"worker_class={dotted!r} 用的是已弃用的 uvicorn 自带 worker，"
+        f"请改成 'uvicorn_worker.UvicornWorker'（独立包 uvicorn-worker）")
+
+    module_name, _, cls = dotted.rpartition(".")
+    mod = importlib.import_module(module_name)
+    assert hasattr(mod, cls), (
+        f"worker_class={dotted!r} 指向的类不存在 —— gunicorn 会在启动时失败")
+
+
 def test_dockerfile_needs_no_baked_credentials():
     """镜像里不许烤进带账号密码的连接串 —— 那是部署期信息。
 
