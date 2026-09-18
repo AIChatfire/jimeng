@@ -1,0 +1,241 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""jimeng-service 配置。
+
+刻意不引入 pydantic-settings：全部配置项都有一处显式声明 + 一个默认值 +
+一句「为什么是这个默认值」，用 stdlib 解析反而更好审计（依赖越少，行为面越小）。
+
+两条纪律：
+  1. **每个旋钮都必须有人读**（`tests/test_config.py::test_settings_knobs_are_all_wired`
+     会逐条断言）—— 没人读的配置项就是假配置，会让运维以为改了会生效。
+  2. **默认值必须能说出依据**：要么是实测值，要么是刻意的策略选择。
+     拿不出依据的，宁可不给默认值（启动即报错）。
+"""
+from __future__ import annotations
+
+import dataclasses
+import os
+from dataclasses import dataclass, field
+
+_TRUE = {"1", "true", "yes", "on", "y", "t"}
+
+
+class ConfigError(RuntimeError):
+    """配置本身有问题 —— 启动即失败，绝不静默退回某个默认值。
+
+    静默降级是最坏的一种失败：它会让「任务不丢」「鉴权开着」这类承诺
+    在没人注意的时候悄悄失效。
+    """
+
+
+def _s(key: str, default: str = "") -> str:
+    v = os.environ.get(key)
+    return default if v is None else v.strip()
+
+
+def _i(key: str, default: int) -> int:
+    raw = _s(key)
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError as e:
+        raise ConfigError(f"{key} 必须是整数，实得 {raw!r}") from e
+
+
+def _f(key: str, default: float) -> float:
+    raw = _s(key)
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as e:
+        raise ConfigError(f"{key} 必须是数字，实得 {raw!r}") from e
+
+
+def _b(key: str, default: bool) -> bool:
+    raw = _s(key)
+    if not raw:
+        return default
+    return raw.lower() in _TRUE
+
+
+def _csv(key: str) -> tuple[str, ...]:
+    raw = _s(key)
+    return tuple(p.strip() for p in raw.split(",") if p.strip())
+
+
+@dataclass
+class Settings:
+    # ------------------------------------------------------------ 上游凭据
+    #: 即梦唯一的硬前提凭据（cookie 里的 `sessionid`）。空 = 未配置。
+    jimeng_sessionid: str = ""
+    jimeng_cookie: str = ""
+    jimeng_workspace_id: int | None = None
+    jimeng_base_url: str = "https://jimeng.jianying.com"
+
+    # ------------------------------------------------------------ 对外鉴权
+    #: 空元组 = 关闭鉴权（仅限内网/联调；启动时会打 WARNING）。
+    api_keys: tuple[str, ...] = ()
+
+    # ------------------------------------------------------------ 节奏闸门
+    #: 同时在上游跑的生成任务数。默认 1 是策略选择（见 .env.example 的注释）。
+    jm_concurrency: int = 1
+    jm_min_interval: float = 0.0
+    jm_per_minute: int = 0
+    jm_cooldown: float = 600.0
+    jm_max_wait: float = 120.0
+
+    # ------------------------------------------------------------ 轮询
+    jimeng_poll_interval: float = 2.0
+    poll_grace: float = 3.0
+    task_timeout: float = 1800.0
+
+    # ------------------------------------------------------------ 协调器
+    coordinator_enabled: bool = True
+    coordinator_tick: float = 1.0
+    coordinator_lease: float = 30.0
+
+    # ------------------------------------------------------------ 持久化
+    #: 任务库 DSN。生产用 PostgreSQL；`:memory:` 或文件路径（SQLite）留给测试与联调。
+    task_db: str = "postgresql+psycopg://jimeng:jimeng@127.0.0.1:5432/jimeng"
+    #: 连接池。任务接口本身很轻，池子不需要大；但协调器是长驻线程，
+    #: `pre_ping` 必须开 —— 否则 PG 侧重启/空闲断开会让我们拿到死连接。
+    task_db_pool_size: int = 5
+    task_db_max_overflow: int = 10
+    task_db_pool_recycle: int = 1800
+    task_db_pool_pre_ping: bool = True
+    task_db_connect_timeout: int = 10
+    task_retention_days: int = 7
+
+    # ------------------------------------------------------------ 输入图
+    max_download_bytes: int = 32 * 1024 * 1024
+    max_input_bytes: int = 20 * 1024 * 1024
+    normalize_uploads: bool = True
+    normalize_max_side: int = 4096
+    normalize_max_bytes: int = 4 * 1024 * 1024
+
+    # ------------------------------------------------------------ 可观测性
+    #: Logfire write token。留空 = 只在本地留 span、不上报（启动时会说明原因）。
+    otel_token: str = ""
+    otel_service_name: str = "jimeng-service"
+    otel_environment: str = ""
+    #: 1 = 把上游原始报文绑成 span 属性（默认开：观测面**不脱敏**，
+    #: 上游明细原样上报 —— 见 observability 模块 docstring 的口径一节）。
+    otel_capture_upstream: bool = True
+    #: 脱敏开关。**默认 0（不脱敏）**。
+    #: ⚠️ 打开它只会启用 logfire SDK 自带的 scrubber，而那个 scrubber 按
+    #: **值子串**命中 `credential`/`token`/`auth`，会把即梦的 TOS 预签名产物 URL
+    #: （必含 `X-Tos-Credential=`）整条打成 `[Scrubbed due to 'Credential']`
+    #: ⇒ 面板直接不可读。本模块自身**在任何设置下都不改写上报内容**。
+    otel_scrubbing: bool = False
+
+    # ------------------------------------------------------------ 服务
+    host: str = "0.0.0.0"
+    port: int = 8200
+    log_level: str = "INFO"
+
+    #: 装配期一次性算出的告警（启动日志里打出来），便于测试断言
+    startup_warnings: list[str] = field(default_factory=list)
+
+    # ------------------------------------------------------------------ 派生
+
+    @property
+    def upstream_configured(self) -> bool:
+        """上游凭据是否可用。false 时服务仍可启动（/healthz 200），但不受理任务。"""
+        return bool(self.jimeng_sessionid or self.jimeng_cookie)
+
+    @property
+    def auth_enabled(self) -> bool:
+        return bool(self.api_keys)
+
+    @property
+    def db_target(self) -> str:
+        """交给 `TaskStore` 的 PostgreSQL DSN。"""
+        return self.task_db
+
+    def replace(self, **kw) -> "Settings":
+        """返回一个改了若干字段的副本。
+
+        ⚠️ dataclass 没有 Pydantic 的 `model_copy()` —— 本仓用 dataclass，
+        所以派生配置（测试里造"未配凭据"这类部署状态、运维脚本做变体）统一用它。
+        `validate()` 不会被自动重跑：改完校验类字段请自行再调一次。
+        """
+        return dataclasses.replace(self, **kw)
+
+    # ------------------------------------------------------------------ 构造
+
+    @classmethod
+    def from_env(cls) -> "Settings":
+        ws_raw = _s("JIMENG_WORKSPACE_ID")
+        st = cls(
+            jimeng_sessionid=_s("JIMENG_SESSIONID"),
+            jimeng_cookie=_s("JIMENG_COOKIE"),
+            jimeng_workspace_id=int(ws_raw) if ws_raw else None,
+            jimeng_base_url=_s("JIMENG_BASE_URL", "https://jimeng.jianying.com"),
+            api_keys=_csv("API_KEYS"),
+            jm_concurrency=_i("JM_CONCURRENCY", 1),
+            jm_min_interval=_f("JM_MIN_INTERVAL", 0.0),
+            jm_per_minute=_i("JM_PER_MINUTE", 0),
+            jm_cooldown=_f("JM_COOLDOWN", 600.0),
+            jimeng_poll_interval=_f("JIMENG_POLL_INTERVAL", 2.0),
+            poll_grace=_f("POLL_GRACE", 3.0),
+            task_timeout=_f("TASK_TIMEOUT", 1800.0),
+            coordinator_enabled=_b("COORDINATOR_ENABLED", True),
+            coordinator_tick=_f("COORDINATOR_TICK", 1.0),
+            coordinator_lease=_f("COORDINATOR_LEASE", 30.0),
+            task_db=_s("TASK_DB",
+                       "postgresql+psycopg2://jimeng:jimeng@127.0.0.1:5432/jimeng"),
+            task_retention_days=_i("TASK_RETENTION_DAYS", 7),
+            max_download_bytes=_i("MAX_DOWNLOAD_BYTES", 32 * 1024 * 1024),
+            max_input_bytes=_i("MAX_INPUT_BYTES", 20 * 1024 * 1024),
+            normalize_uploads=_b("NORMALIZE_UPLOADS", True),
+            normalize_max_side=_i("NORMALIZE_MAX_SIDE", 4096),
+            normalize_max_bytes=_i("NORMALIZE_MAX_BYTES", 4 * 1024 * 1024),
+            otel_token=_s("LOGFIRE_TOKEN"),
+            otel_service_name=_s("OTEL_SERVICE_NAME", "jimeng-service"),
+            otel_environment=_s("LOGFIRE_ENVIRONMENT"),
+            otel_capture_upstream=_b("OTEL_CAPTURE_UPSTREAM", True),
+            otel_scrubbing=_b("OTEL_SCRUBBING", False),
+            host=_s("HOST", "0.0.0.0"),
+            port=_i("PORT", 8200),
+            log_level=_s("LOG_LEVEL", "INFO").upper(),
+        )
+        st.validate()
+        return st
+
+    # ------------------------------------------------------------------ 校验
+
+    def validate(self) -> None:
+        if self.jm_concurrency < 1:
+            raise ConfigError("JM_CONCURRENCY 必须 >= 1")
+        if self.task_timeout <= 0:
+            raise ConfigError("TASK_TIMEOUT 必须 > 0")
+        if self.jimeng_poll_interval <= 0:
+            raise ConfigError("JIMENG_POLL_INTERVAL 必须 > 0")
+        if self.task_retention_days < 1:
+            raise ConfigError("TASK_RETENTION_DAYS 必须 >= 1")
+        if self.task_db_pool_size < 1:
+            raise ConfigError("TASK_DB_POOL_SIZE 必须 >= 1")
+        if self.normalize_max_side < 64:
+            raise ConfigError("NORMALIZE_MAX_SIDE 太小（<64），会毁图")
+        if self.coordinator_lease < self.jimeng_poll_interval * 2:
+            # 租约比一次轮询还短 ⇒ 每轮都换主，等于没有选主
+            raise ConfigError("COORDINATOR_LEASE 必须 >= 2×JIMENG_POLL_INTERVAL")
+
+        self.startup_warnings = []
+        if not self.auth_enabled:
+            self.startup_warnings.append(
+                "API_KEYS 为空 —— 对外鉴权已关闭。仅限内网/联调使用："
+                "任何能访问本端口的人都能消耗你的即梦积分。")
+        if not self.upstream_configured:
+            self.startup_warnings.append(
+                "JIMENG_SESSIONID 未配置 —— 服务可启动，但 POST /async/v1/images/generations "
+                "会返回 503（capability_unavailable）。")
+        if self.jm_concurrency > 4:
+            self.startup_warnings.append(
+                f"JM_CONCURRENCY={self.jm_concurrency} 超过实测验证过的上限（4）。"
+                "上游是否容忍未知，且并发直接放大积分消耗速率与风控暴露面。")
+
+
+__all__ = ["Settings", "ConfigError"]

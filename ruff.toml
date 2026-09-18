@@ -1,0 +1,48 @@
+# ruff 配置 —— **门禁只收"正确性"规则，不收风格规则**。
+#
+# 为什么收窄：风格规则（shebang / import 排序 / `__all__` 排序 / UTF-8 编码声明）
+# 一口气能报出上百条，门禁一旦红成一片，人就会 `--fix` 一把梭或者干脆无视它 ——
+# 那就等于没有门禁。这里只留**能抓到真缺陷**的那几族。
+#
+# 本配置诞生的直接原因：一次 ruff 跑出**两个真 bug**（都能过 `compileall`、
+# 也都能正常 `import`）：
+#   1. `app/upstream/jimeng/client.py::_report()` 引用 `OBS` 却从没 import 过，
+#      被 `except Exception: pass` 吞掉 ⇒ **上游埋点从来没生效，且毫无报错**（F821）；
+#   2. `app/service.py::fingerprint_secret()` 还在调 SQLite 时代的
+#      `store._connect()`（SQLModel 版没有它）⇒ **`Service()` 一构造就崩**（SLF001）。
+#
+# ⚠️ 本仓踩过两次的坑：**别用 `--select` 覆盖配置再 `--fix`**。
+# RUF100 判断"noqa 是否多余"依赖**当时启用了哪些规则**，而 `--select` 会把
+# select 列表**替换掉**：`ruff check x --select RUF100 --fix` 等于"只启用 RUF100"，
+# 于是 BLE001 之类没启用 ⇒ 它们的 `# noqa: BLE001` 被判成多余并被**删掉**，
+# 回头按完整配置一跑就冒出一堆"未标注的盲吞异常"。
+# 正确姿势：配置定好之后，用 **`ruff check <paths> --add-noqa`**（不带 --select）标注。
+
+target-version = "py313"
+line-length = 100
+
+[lint]
+select = [
+  "F",        # pyflakes：未定义名(F821)、未用导入(F401)、重定义(F811)、未用变量(F841)
+  "E9",       # 语法 / 运行期错误
+  "E402",     # 模块级 import 不在文件顶部 —— 脚本里"先设环境变量再导入 app"是刻意的，
+              #            必须显式 noqa 标注（否则顺序被无意改动会静默改变行为）
+  "BLE",      # 盲吞异常（`except Exception`）—— 必须显式标注意图
+  "S110",     # `try-except-pass`：**专门抓"异常被静默吞掉"**
+  "PLC0415",  # 函数内 import —— 本仓只在"可选依赖降级"处刻意使用
+  "SLF001",   # 访问私有成员 —— 用于抓跨层耦合（真抓到过一个线上级 bug）
+  "RUF100",   # 无用的 noqa（防止 noqa 长期挂着掩盖新问题）
+]
+ignore = []
+
+[lint.per-file-ignores]
+# 测试里的三类刻意用法：
+#   · S110 / BLE001 —— teardown 兜底吞异常；
+#   · PLC0415       —— 函数内 import（配合 monkeypatch 打桩、避免导入顺序耦合）；
+#   · SLF001        —— 断言私有状态往往正是门禁的目的（如 sink id 是否重复堆积）。
+"tests/*" = ["S110", "BLE001", "PLC0415", "SLF001"]
+
+# `scripts/` 是运维/探针脚本，**必须先设好环境变量再导入 app 模块**
+# （`create_app()` 会读 TASK_DB / JIMENG_SESSIONID / COORDINATOR_ENABLED），
+# 所以函数内 import 是刻意的、不是疏漏。
+"scripts/*" = ["PLC0415"]

@@ -1,0 +1,86 @@
+# jimeng-service —— 即梦（jimeng.jianying.com）的异步图片生成出口
+#
+# 对外契约只三条（冻结，见 docs/INTERFACE.md）：
+#   POST /async/v1/images/generations          → 受理，**只回一个 task_id**
+#   GET  /async/v1/images/generations/{id}     → 非终态回排队态 / 终态回 {data,created,usage}
+#   GET  /async/v1/models                      → 能力清单
+#
+# 首次运行：
+#   cp .env.example .env     # 填 JIMENG_SESSIONID 与 POSTGRES_PASSWORD
+#   docker compose up -d --build
+#
+# ⚠️ 四条不要做的事：
+#   1. 不要用 `deploy.replicas` / `docker compose up --scale` 扩容。
+#      节奏闸门是**进程内**状态，副本数 N 等于把「最小间隔 + 每分钟上限 + 冷却」
+#      整体乘 N —— 恰好踩在上游风控最敏感的维度上，等于亲手把闸门拆了。
+#      （任务库是共享的 PostgreSQL，所以扩容**不会**产生重复任务；但闸门会失效。）
+#      要提吞吐请先读 README「扩容前必读」。
+#   2. 不要把凭据写进本文件。业务配置一律走 .env（已在 .dockerignore 里）。
+#   3. 不要把 postgres 的端口暴露到公网 —— 任务库里含调用方的任务记录与凭据指纹。
+#      这里只映射到 127.0.0.1，本机联调用。
+#   4. 不要跳过 healthcheck 就 `depends_on`（短语法只等容器"启动"，不等它"能连"）。
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: jimeng-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-jimeng}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD 必须设置}
+      POSTGRES_DB: ${POSTGRES_DB:-jimeng}
+      # 任务表默认排序用 collation 无关的 epoch 秒，无需额外 locale
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # 关键：`-U` 必须与 POSTGRES_USER 一致，否则 pg_isready 会因角色不存在永远不健康，
+      # 而 app 会因为 depends_on 卡在启动阶段 —— 表面上像"服务起不来"。
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-jimeng} -d ${POSTGRES_DB:-jimeng} -h 127.0.0.1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+  jimeng-service:
+    build:
+      context: .
+    image: jimeng-service:0.1.0
+    container_name: jimeng-service
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+
+    ports:
+      # 宿主端口可调（JIMENG_PORT），容器内固定 8200
+      - "${JIMENG_PORT:-8200}:8200"
+
+    # 全部业务配置来自 .env —— 凭据只存在于这里，不进镜像、不进本文件
+    env_file:
+      - .env
+    environment:
+      HOST: "0.0.0.0"
+      PORT: "8200"
+      # 单进程是架构约束（见文件顶部说明），此处显式固化，避免被 .env 误改
+      WORKERS: "1"
+      # 容器内走服务名 db；密码从 .env 取，不写死在这里
+      TASK_DB: "postgresql+psycopg2://${POSTGRES_USER:-jimeng}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-jimeng}"
+      TZ: Asia/Shanghai
+
+    # 上游最长 180s 量级：给正在跑的请求留出优雅退出的时间，别硬砍
+    stop_grace_period: 90s
+
+    # healthcheck 继承镜像里的定义（探 /healthz，不触上游、不消耗积分）
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+volumes:
+  pgdata:
+    name: jimeng-service-pgdata

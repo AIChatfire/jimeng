@@ -1,0 +1,8 @@
+-r requirements.txt
+pytest>=8.0
+# 接线门禁用的静态检查器。**是门禁，不是可选项** —— `tests/test_wiring.py`
+# 里那条用例在缺 ruff 时会**失败而不是跳过**（跳过会让"没检查"看起来像"检查过了"）。
+# 它真抓到过两个能过 compileall、也能正常 import 的线上级缺陷：
+#   · `client.py::_report()` 引用未 import 的 `OBS`（被 except 吞掉 ⇒ 埋点静默失效）
+#   · `service.py::fingerprint_secret()` 调用已不存在的 `store._connect()`
+ruff>=0.6

@@ -1,0 +1,45 @@
+# ---- 凭据：永远不入库 ----
+# ⚠️ 规则以**所在目录**为根。新增规则后必须 `git check-ignore -v <路径>` 复核，
+#    写错一层等于静默失效（本仓上游项目踩过）。
+.env
+.env.*
+!.env.example
+cookie_*.txt
+*.cookie
+cookies*.json
+session.json
+
+# ---- 运行期数据 ----
+*.db
+*.db-wal
+*.db-shm
+data/
+media/
+probe/out/
+*.part
+# 本地 PG 集群的默认位置（scripts/local-pg.sh 其实放在 $HOME/pgdata，这里是防御性规则）
+.pgdata/
+pgdata/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.vscode/
+.DS_Store
+*.swp
+
+# ---- 工作区记忆 ----
+# 与上游参考仓（reverse-proxy）的约定一致：记忆与推导不入库。
+# ⚠️ 这一条只影响 git，**不要**因此删掉这个目录 —— 它是项目知识，不是缓存。
+.workbuddy/

@@ -1,0 +1,24 @@
+# 运行期依赖 —— 刻意保持最小面。
+# 上游客户端用 httpx（而非 requests）：本仓已需要 httpx 做输入图下载，
+# 少一个 HTTP 栈就少一类行为差异（超时语义、连接池、trust_env）。
+fastapi>=0.115
+uvicorn>=0.30
+gunicorn>=22.0
+httpx>=0.27
+pydantic>=2.7
+
+# ORM：SQLModel = Pydantic + SQLAlchemy。
+# 表结构就是类型定义，读写共用一份 —— 从前"建表 SQL"与"取行映射"两份定义，
+# 改一处忘另一处就会静默丢字段。
+sqlmodel>=0.0.22
+
+# 任务库驱动：PostgreSQL。本服务**只支持 PostgreSQL**（事实源不做双后端）。
+psycopg2-binary>=2.9
+
+# 可观测性：logfire 出 trace、loguru 出日志，两者由 app/observability.py 单一收拢。
+# 未安装 / 未配 token 时降级为 no-op 并**可见地说明原因**，绝不阻塞业务。
+logfire>=3.0
+loguru>=0.7
+
+# 输入图归一化（尺寸/体积压缩）。缺失时自动跳过归一化并留痕，不阻断主流程。
+pillow>=10.0

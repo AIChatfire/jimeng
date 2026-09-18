@@ -1,0 +1,734 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""业务编排：受理 → 入队 → 协调器推进 → 出结果。
+
+## 分工
+
+| 环节 | 谁做 | 为什么 |
+|---|---|---|
+| 校验 + 落库 | **请求线程**（`create`） | 调用方要立刻拿到 `task_id`，且请求内**零上游往返** |
+| 下载输入图 / 上传 / 建任务 / 轮询 | **协调器线程**（`dispatch` / `poll`） | 建任务是**计费**动作，必须单点、受闸门约束、可重试 |
+
+## 🔴 两条贯穿始终的纪律
+
+1. **"被接受" ≠ "能跑通"**：上游 `ret=0` 只说明请求被受理，任务仍可能终态
+   `status=30 generate_failed`，而且**照样计费**。⇒ 判成败只看 `task.status`。
+2. **降级必须可见**：任何"请求了 A、实际做了 B"（张数吸附、图片归一化、
+   能力表读不到退回冻结快照）都必须出现在响应的 `degradations` 里。
+   静默降级等于让调用方按 A 的预期为 B 付费。
+"""
+from __future__ import annotations
+
+import hashlib
+import hmac
+import logging
+import time
+import uuid
+from typing import Any
+
+from . import models
+from .config import Settings
+from .errors import (
+    AdapterError,
+    CapabilityUnavailableError,
+    ContentPolicyError,
+    InvalidParameterError,
+    RiskControlError,
+    TaskNotFoundError,
+    UpstreamQuotaError,
+    UpstreamRateLimitError,
+    UpstreamTimeoutError,
+    UpstreamUnavailableError,
+)
+from .gate import UpstreamGate, build_gate
+from .media import load_images, normalize
+from .observability import OBS
+from .store import TaskRecord, TaskStore
+from .upstream.jimeng import (
+    DEFAULT_MODEL,
+    DEFAULT_SIZE,
+    JimengAuthError,
+    JimengClient,
+    JimengContentError,
+    JimengError,
+    JimengParamError,
+    JimengQuotaError,
+    JimengRateLimitError,
+    JimengRiskError,
+    JimengTimeout,
+    ImageXUploader,
+    parse_size,
+)
+from .upstream.jimeng.capabilities import ModelConfigCache
+
+log = logging.getLogger(__name__)
+
+#: 受理请求允许的字段。
+ACCEPTED_FIELDS = frozenset({
+    "model", "prompt", "image", "size", "n", "seed", "negative_prompt",
+})
+#: **认得但本服务做不到**的字段 —— 见到就进 `degradations`（响亮降级），
+#: 而不是当"未知字段"报错。它们来自 OpenAI/方舟图片接口的习惯写法。
+KNOWN_UNSUPPORTED_FIELDS = frozenset({
+    "watermark", "response_format", "quality", "style", "stream", "user",
+    "sequential_image_generation", "max_images",
+})
+
+#: 建任务失败后最多重投几次（只对**可重试**错误计数）。
+#: 3 是刻意小的数：重试一个付费动作的成本是非线性的。
+DISPATCH_MAX_ATTEMPTS = 3
+
+
+# ---------------------------------------------------------------------------
+# 凭证指纹
+# ---------------------------------------------------------------------------
+
+
+def fingerprint_secret(store: TaskStore) -> str:
+    """取（或首次生成）凭证指纹用的密钥，**持久化在任务库里**。
+
+    🔴 为什么不放 `.env`：它必须"首次启动自动生成、此后永不变"。
+    若每次重启换一个，**所有历史任务会突然不属于任何人** ——
+    调用方会看到自己的任务凭空 404，而任务其实好好躺在库里。
+
+    ⚠️ 这里曾经直接用 `store._connect()` + 裸 SQL 读写 `meta` 表 —— 那是
+    存储层还是 SQLite/JSON 时的写法。切到 SQLModel 后 `_connect` 不存在了，
+    于是 `Service()` **一构造就 AttributeError**（而 `import app.service` 完全正常）。
+    现在一律走存储层的公开接口 `get_meta`/`set_meta`；静态门禁（ruff SLF001）
+    就是为了让"跨层摸私有成员"这类耦合当场现形。
+    """
+    key = "credential_fingerprint_secret"
+    secret = store.get_meta(key)
+    if secret:
+        return secret
+    # 首次启动：生成并落库。多进程同时首启时可能各生成一次，属无害竞态
+    # （最后写入者胜；本服务单进程运行，见 gunicorn_conf.py 的 WORKERS=1）。
+    secret = uuid.uuid4().hex
+    store.set_meta(key, secret)
+    return secret
+
+
+def credential_id(api_key: str | None, secret: str) -> str:
+    """把调用方的 Key 换成一个**不可逆指纹**。
+
+    🔴 用 HMAC 而不是裸 sha256：API Key 是**低熵可枚举空间**，
+    裸哈希等于给了一份可爆破的对照表。
+    ⚠️ 明文 Key **永不落库**（任务表里只有这个指纹）。
+    """
+    if not api_key:
+        return "anonymous"
+    return hmac.new(secret.encode(), api_key.encode(), hashlib.sha256).hexdigest()
+
+
+def new_task_id(model: str) -> str:
+    """`jimeng_<32 位十六进制>`。
+
+    形态对齐参考接口（`doubao_seedream_<32hex>` = 服务名 + uuid4 hex）。
+    这里用固定的 `jimeng` 前缀而不是从 model 推：model 可以带别名/上游 key，
+    推出来的前缀会五花八门，让"同一条链路"的任务看起来不像一类。
+    """
+    _ = model
+    return f"jimeng_{uuid.uuid4().hex}"
+
+
+# ---------------------------------------------------------------------------
+# 错误映射
+# ---------------------------------------------------------------------------
+
+def to_adapter_error(exc: BaseException) -> AdapterError:
+    """上游异常 → 对外错误。**每条都带可执行的下一步**。"""
+    if isinstance(exc, AdapterError):
+        return exc
+    if isinstance(exc, JimengAuthError):
+        # 上游凭据失效是**部署问题**，不是调用方的参数错误 ⇒ 503 而非 401
+        return CapabilityUnavailableError(
+            "上游即梦凭据（sessionid）失效或已过期，本服务当前无法受理任务；"
+            "请联系服务方更新 JIMENG_SESSIONID。",
+            upstream="jimeng")
+    if isinstance(exc, JimengRateLimitError):
+        return UpstreamRateLimitError(str(exc), upstream="jimeng")
+    if isinstance(exc, JimengQuotaError):
+        return UpstreamQuotaError(
+            f"{exc}；即梦积分/日额度已耗尽，**重试无效**，需充值或等额度按日重置。",
+            upstream="jimeng")
+    if isinstance(exc, JimengRiskError):
+        return RiskControlError(
+            f"{exc}；命中即梦风控，重试会延长标记，本服务已进入冷却期。",
+            upstream="jimeng")
+    if isinstance(exc, JimengContentError):
+        return ContentPolicyError(str(exc), upstream="jimeng")
+    if isinstance(exc, JimengParamError):
+        return InvalidParameterError(
+            str(exc) + "（该错误由上游返回，通常与 prompt / 输入图有关）",
+            upstream="jimeng")
+    if isinstance(exc, JimengTimeout):
+        return UpstreamTimeoutError(str(exc), upstream="jimeng")
+    if isinstance(exc, JimengError):
+        return UpstreamUnavailableError(str(exc), upstream="jimeng")
+    return UpstreamUnavailableError(
+        f"未预期的上游错误（{type(exc).__name__}: {exc}）", upstream="jimeng")
+
+
+# ---------------------------------------------------------------------------
+# 响应构造
+# ---------------------------------------------------------------------------
+
+
+def _degradations(rec: TaskRecord) -> dict[str, Any]:
+    """非空时才给 `degradations` 键（无值不给键，别给 `[]` 噪音）。"""
+    return {"degradations": list(rec.degradations)} if rec.degradations else {}
+
+
+def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
+    """任务记录 → (HTTP 状态码, 响应体)。
+
+    三条刻意选择：
+      · **非终态回 202**：调用方拿到 202 就该继续轮询，不该把排队态当结果；
+      · **失败也回 200**：任务本身完成了（只是结果是失败）——
+        请求没有出错，HTTP 层不该报错，否则调用方的重试逻辑会误触发；
+      · **成功体只给 `url`**：与参考接口逐字一致。宽高/格式等真知识别的地方有
+        （trace 里），不塞进这里 —— 多一个键就多一分"契约形状不同"的风险。
+    """
+    deg = _degradations(rec)
+    if rec.status == "queued":
+        return 202, {"task_id": rec.task_id, "status": "queued", **deg}
+    if rec.status == "in_progress":
+        return 202, {"task_id": rec.task_id, "status": "in_progress", **deg}
+    if rec.status == "canceled":
+        return 200, {"task_id": rec.task_id, "status": "canceled", **deg}
+    if rec.status == "failure":
+        return 200, {
+            "task_id": rec.task_id,
+            "status": "failure",
+            "error": rec.error or {"message": "任务失败（原因未记录）"},
+            **deg,
+        }
+
+    usage: dict[str, Any] = {"images": len(rec.images)}
+    if rec.credits is not None:
+        usage["credits"] = rec.credits
+    return 200, {
+        "data": [{"url": im["url"]} for im in rec.images],
+        "created": rec.finished_at or rec.updated_at,
+        "usage": usage,
+        **deg,
+    }
+
+
+# ---------------------------------------------------------------------------
+# 服务
+# ---------------------------------------------------------------------------
+
+
+class Service:
+    """服务组件集合 + 编排逻辑。请求线程与协调器线程共用同一实例。"""
+
+    def __init__(self, settings: Settings, *, store: TaskStore | None = None,
+                 client: JimengClient | None = None,
+                 uploader: ImageXUploader | None = None,
+                 gate: UpstreamGate | None = None,
+                 cfg: ModelConfigCache | None = None) -> None:
+        self.settings = settings
+        self.store = store or TaskStore(
+            settings.db_target,
+            pool_size=settings.task_db_pool_size,
+            max_overflow=settings.task_db_max_overflow,
+            pool_recycle=settings.task_db_pool_recycle,
+            pre_ping=settings.task_db_pool_pre_ping,
+            connect_timeout=settings.task_db_connect_timeout,
+        )
+        self._cred_secret = fingerprint_secret(self.store)
+        self.gate = gate or _build_gate(settings)
+        self.client = client
+        self.uploader = uploader
+        self.cfg = cfg
+        if settings.upstream_configured and self.client is None:
+            self.client = JimengClient(
+                sessionid=settings.jimeng_sessionid,
+                cookie=settings.jimeng_cookie,
+                base=settings.jimeng_base_url,
+                workspace_id=settings.jimeng_workspace_id,
+                poll_interval=settings.jimeng_poll_interval,
+                capture_upstream=settings.otel_capture_upstream,
+            )
+            self.cfg = ModelConfigCache(self.client)
+        if self.client is not None and self.uploader is None:
+            self.uploader = ImageXUploader(self.client)
+
+    # ------------------------------------------------------------------ 生命周期
+
+    def close(self) -> None:
+        for obj in (self.uploader, self.client):
+            closer = getattr(obj, "close", None)
+            if callable(closer):
+                try:
+                    closer()
+                except Exception:  # noqa: BLE001, S110
+                    pass
+
+    def status(self) -> dict:
+        return {
+            "upstream_configured": self.settings.upstream_configured,
+            "auth_enabled": self.settings.auth_enabled,
+            "concurrency": self.settings.jm_concurrency,
+            "tasks": {"active": self.store.count_active(),
+                      "total": self.store.count()},
+            "gate": self.gate.stats(),
+            "model_config": self.cfg.stats() if self.cfg else None,
+            "observability": OBS.status(),
+        }
+
+    # ------------------------------------------------------------------ 受理
+
+    def credential_of(self, api_key: str | None) -> str:
+        return credential_id(api_key, self._cred_secret)
+
+    def create(self, body: dict[str, Any], *, credential: str,
+               dry_run: bool = False) -> TaskRecord:
+        """校验 + 落库，返回任务记录。**请求内零上游往返。**
+
+        🔴 刻意**不在这里下载输入图**：异步接口的语义就是"受理即返回"，
+        把下载塞进请求会让受理时间随上游网络抖动。图片拉取失败会在任务里
+        体现为 `failure`（附明确原因），而不是让人在受理时干等。
+        """
+        if not isinstance(body, dict):
+            raise InvalidParameterError("请求体必须是 JSON 对象")
+
+        # 🔴 **显式 `null` 等价于"没给"**，用默认值。
+        # 否则调用方写 `"n": null` / `"prompt": null` 会被判成参数错误，
+        # 而语义上它只是"这个字段我没设置"。（HTTP 层的 Pydantic schema 会把
+        # 未提供的可选字段填成 None，所以这一步是必需的，不是可选优化。）
+        body = {k: v for k, v in body.items() if v is not None}
+
+        unknown = set(body) - ACCEPTED_FIELDS - KNOWN_UNSUPPORTED_FIELDS
+        if unknown:
+            raise InvalidParameterError(
+                f"未知字段 {sorted(unknown)}；本接口接受 "
+                f"{sorted(ACCEPTED_FIELDS)}（其中 "
+                f"{sorted(KNOWN_UNSUPPORTED_FIELDS)} 是**认得但本服务做不到**的字段，"
+                f"传了会进 `degradations` 而不是报错）",
+                param=sorted(unknown)[0])
+
+        degradations: list[str] = []
+        for k in sorted(set(body) & KNOWN_UNSUPPORTED_FIELDS):
+            if body[k] is not None:
+                degradations.append(
+                    f"参数 {k}={body[k]!r} 本服务不支持（即梦这条链路没有对应能力），已忽略；"
+                    f"不要按它的语义预期结果。")
+
+        if not self.settings.upstream_configured:
+            raise CapabilityUnavailableError(
+                "本服务未配置上游即梦凭据（JIMENG_SESSIONID），无法受理任务。",
+                upstream="jimeng")
+
+        image = self._validate_image(body.get("image"))
+        prompt = body.get("prompt")
+        if prompt is not None and not isinstance(prompt, str):
+            raise InvalidParameterError("prompt 必须是字符串", param="prompt")
+        prompt = (prompt or "").strip()
+
+        cap, upstream_model = models.resolve(body.get("model"), has_image=bool(image))
+        if cap.prompt_required and not prompt:
+            raise InvalidParameterError(
+                f"model {cap.api_id}（{cap.title}）需要 prompt，但本次没给或为空。",
+                param="prompt")
+
+        size = body.get("size") or _default_size()
+        try:
+            parse_size(str(size))
+        except JimengError as e:
+            raise InvalidParameterError(str(e), param="size") from e
+
+        n_raw = body.get("n", 1)
+        if isinstance(n_raw, bool) or not isinstance(n_raw, int) or n_raw < 1:
+            raise InvalidParameterError("n 必须是 >=1 的整数", param="n")
+
+        seed = body.get("seed")
+        if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
+            raise InvalidParameterError("seed 必须是整数", param="seed")
+
+        n = n_raw
+        if cap.name == "t2i" and self.cfg is not None:
+            model_key = upstream_model or DEFAULT_MODEL
+            opts = self.cfg.count_options(model_key)
+            note = self.cfg.degradation_note(model_key)
+            if note:
+                degradations.append(note)
+            from .upstream.jimeng.client import resolve_count  # noqa: PLC0415
+            n, warn = resolve_count(model_key, n_raw, opts)
+            if warn:
+                degradations.append(warn)
+        elif cap.name != "t2i" and n_raw != 1:
+            # 后编辑族一次只出一张；blend 的 metrics 里 generateCount 恒为 1
+            degradations.append(
+                f"model {cap.api_id} 不支持指定张数（实测由上游决定出图数量，"
+                f"如扩图固定出 4 张），请求的 n={n_raw} 已忽略。")
+            n = 1
+
+        now = int(time.time())
+        rec = TaskRecord(
+            task_id=new_task_id(cap.api_id),
+            credential_id=credential,
+            model=cap.api_id,
+            cap_key=cap.key,
+            upstream_model=upstream_model,
+            status="queued",
+            prompt=prompt,
+            image_refs=image,
+            size=str(size),
+            n=n,
+            seed=seed,
+            negative_prompt=str(body.get("negative_prompt") or ""),
+            degradations=degradations,
+            created_at=now,
+            updated_at=now,
+        )
+        self.store.put(rec)
+        OBS.info("task accepted",
+                 task_id=rec.task_id, model=rec.model, capability=rec.cap_key,
+                 has_image=bool(image), image_count=len(image),
+                 size=rec.size, n=rec.n,
+                 degradations=len(degradations), dry_run=dry_run)
+        return rec
+
+    @staticmethod
+    def _validate_image(raw: Any) -> list[str]:
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            raise InvalidParameterError(
+                "image 必须是**数组**（文生图传 `[]`）；收到的是字符串。"
+                "若要传单张图请写 `\"image\": [\"https://…\"]`。",
+                param="image")
+        if not isinstance(raw, list):
+            raise InvalidParameterError("image 必须是数组", param="image")
+        out: list[str] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, str) or not item.strip():
+                raise InvalidParameterError(
+                    f"image[{i}] 必须是非空字符串（http(s) URL / data URI / base64）",
+                    param="image")
+            out.append(item.strip())
+        if len(out) > 1:
+            raise InvalidParameterError(
+                f"本服务这条链路**只支持单张输入图**（收到 {len(out)} 张）。"
+                f"即梦的图生图/后编辑草稿结构实测都只带一张输入图；"
+                f"多图形态未取证，故不做——按「不制造假能力」，宁可不接受也不静默丢掉多余的图。",
+                param="image")
+        return out
+
+    # ------------------------------------------------------------------ 查询
+
+    def get_for_credential(self, task_id: str, credential: str) -> TaskRecord:
+        """按凭证取任务。取不到（不存在 **或** 不属于本 Key）一律 404。
+
+        🔴 **本地拦，不问上游**：放行到上游就是用错的钥匙去查，
+        返回的 404/空**无法区分**"任务真没了"与"钥匙不对"，
+        而且把跨凭证隔离交给了别人的实现去兜。
+        """
+        rec = self.store.get_scoped(task_id, credential)
+        if rec is None:
+            raise TaskNotFoundError(
+                f"任务 {task_id} 不存在，或不属于当前 API Key。")
+        return rec
+
+    def delete_for_credential(self, task_id: str, credential: str) -> dict:
+        """删除/取消任务。
+
+        🔴 **即梦没有取消端点**（实测只有建任务 + 查询两个接口）⇒
+        对**非终态**任务的删除必须**响亮失败**，绝不能本地置 canceled 就返回成功：
+          ① 上游任务会**继续跑、继续扣积分**，而调用方以为停了；
+          ② 本地与上游状态**永久不一致**，且没有任何出口能看出来。
+        已终态的任务（删本地记录）不受此限。
+        """
+        rec = self.get_for_credential(task_id, credential)
+        if not rec.terminal:
+            raise InvalidParameterError(
+                f"任务 {rec.task_id} 仍在 {rec.status}，无法删除："
+                f"即梦上游**没有取消端点**（只有建任务与查询两个接口），"
+                f"本地删除只会造成「你以为停了、实际上还在跑并继续计费」的假象。"
+                f"请轮询到终态后再删除。",
+                param="task_id")
+        self.store.delete(rec.task_id)
+        OBS.info("task deleted", task_id=rec.task_id, status=rec.status)
+        return {"task_id": rec.task_id, "status": "DELETED"}
+
+    def list_for_credential(self, credential: str, *, limit: int = 50) -> dict:
+        recs = self.store.list_recent(credential_id=credential, limit=limit)
+        return {
+            "items": [{"task_id": r.task_id, "status": r.status,
+                       "model": r.model, "created_at": r.created_at}
+                      for r in recs],
+            "total": len(recs),
+        }
+
+    # ------------------------------------------------------------------ 推进
+
+    def dispatch(self, rec: TaskRecord) -> None:
+        """把 queued 任务推到上游（**计费动作**）。协调器线程调用。"""
+        if self.client is None or self.uploader is None:
+            self._fail(rec, CapabilityUnavailableError(
+                "服务未配置上游客户端（JIMENG_SESSIONID 缺失）", upstream="jimeng"))
+            return
+
+        cap = models.REGISTRY[rec.cap_key]
+        # 闸门：节奏 + 冷却。**在这之前不发任何请求**
+        try:
+            self.gate.acquire()
+        except AdapterError as e:
+            # 冷却中/节奏满：**不消耗 attempts**，下个 tick 再说
+            OBS.warning("gate held dispatch", task_id=rec.task_id,
+                        error=e.message, retry_after=e.retry_after)
+            return
+
+        ctx = {"task_id": rec.task_id, "model": rec.model, "capability": rec.cap_key}
+        try:
+            image_uri = ""
+            if cap.image_required:
+                image_uri = self._prepare_input_image(rec)
+
+            sid = self._submit(rec, cap, image_uri)
+        except AdapterError as e:
+            self._on_dispatch_error(rec, e)
+            return
+        except JimengError as e:
+            self._on_dispatch_error(rec, to_adapter_error(e))
+            return
+        except Exception as e:
+            log.exception("dispatch 未预期异常 task=%s", rec.task_id)
+            self._on_dispatch_error(rec, UpstreamUnavailableError(
+                f"未预期的内部错误（{type(e).__name__}: {e}）", upstream="jimeng"))
+            return
+
+        now = int(time.time())
+        self.store.patch(rec.task_id, status="in_progress",
+                         upstream_submit_id=sid, started_at=now,
+                         attempts=rec.attempts + 1)
+        OBS.span("task.dispatched", **ctx)
+        OBS.info("task submitted", upstream_submit_id=sid,
+                 attempts=rec.attempts + 1, **ctx)
+
+    def poll(self, rec: TaskRecord) -> None:
+        """推进**单个** in_progress 任务（单条入口，内部走批量实现）。"""
+        self.poll_many([rec])
+
+    def poll_many(self, recs: list[TaskRecord]) -> dict[str, int]:
+        """一轮推进一批在途任务 —— **上游查询合并成一次**。
+
+        三道门，顺序不能反（都不能省）：
+
+        ① **总超时看门狗**：不处理就永远卡在 in_progress。判超时**不发上游请求**
+           （已经太久没结果，再打一次也白打，还多一次风控暴露）。
+        ② **起轮宽限**（`POLL_GRACE`）：刚提交时上游可能还没落库。
+        ③ 🔴 **轮询间隔**（`JIMENG_POLL_INTERVAL`）：距上次推进不足间隔就**不问**。
+
+        ③ 是这次补上的 —— 在此之前 `JIMENG_POLL_INTERVAL` 只被传给了
+        `JimengClient(poll_interval=…)`，而服务从不调 `client.wait()`/`generate()`，
+        于是协调器**每个 tick（默认 1s）就打一次上游**，比配置值勤一倍。
+        配置项被读了却没有效果，属于"假配置"：静态门禁只能查"有没有人读"，
+        查不出"读了有没有用"（这一条只能靠人对着调用链看）。
+
+        **批量**的意义：上游 `get_history_by_ids` 吃的是 `submit_ids`（复数），
+        逐个查会让请求量随在途任务数**线性增长**；一次查完则与并发无关。
+        默认并发 1 时收益为零，但它是"把并发提上去"的前提 —— 否则提并发就等于
+        把上游请求量一起乘 N，而那正是风控最敏感的维度。
+
+        ⚠️ 三道门读的是**传入记录上的字段**（尤其是 `updated_at`）。
+        调用方必须传**刚从库里读出来的行**；若持有旧对象反复调用，
+        间隔门看到的永远是旧时间 ⇒ 等于门不存在。
+        （协调器每 tick 都 `list_by_status` 重读，所以生产路径是对的；
+        但这确实是个陷阱，本仓的基准脚本第一版就踩了。）
+        """
+        if self.client is None or not recs:
+            return {"polled": 0, "expired": 0, "skipped": 0}
+        now = time.time()
+        asked: list[TaskRecord] = []
+        expired = 0
+        for rec in recs:
+            if now - (rec.started_at or rec.created_at) > self.settings.task_timeout:
+                # ① 看门狗（本地判死，不发上游请求）
+                self._fail(rec, UpstreamTimeoutError(
+                    f"任务超过 {self.settings.task_timeout:.0f}s 仍未到终态，本地判超时。"
+                    f"上游任务可能仍在跑（本服务不再跟进；如需继续，"
+                    f"请保留 submit_id 人工查）。", upstream="jimeng"))
+                expired += 1
+                continue
+            if now - (rec.started_at or 0) < self.settings.poll_grace:
+                continue                                    # ② 起轮宽限
+            if now - rec.updated_at < self.settings.jimeng_poll_interval:
+                continue                                    # ③ 轮询间隔
+            asked.append(rec)
+
+        if not asked:
+            return {"polled": 0, "expired": expired,
+                    "skipped": len(recs) - expired}
+
+        ids = [r.upstream_submit_id for r in asked if r.upstream_submit_id]
+        try:
+            states = self.client.fetch_many(ids)
+        except JimengError as e:
+            err = to_adapter_error(e)
+            for rec in asked:
+                if err.retryable:
+                    # 可重试的探测失败**不改状态**（任务还在跑），只记账
+                    self.store.patch(rec.task_id, attempts=rec.attempts + 1)
+                else:
+                    self._fail(rec, err)
+            OBS.warning("poll failed", error=err.message, retryable=err.retryable,
+                        tasks=len(asked))
+            return {"polled": 0, "expired": expired, "skipped": 0}
+
+        for rec in asked:
+            st = states.get(rec.upstream_submit_id or "")
+            if st is None:                                  # 理论上不会发生
+                continue
+            self._advance(rec, st)
+        return {"polled": len(asked), "expired": expired, "skipped": 0}
+
+    def poll_due(self, rec: TaskRecord, *, now: float | None = None) -> bool:
+        """这个任务现在该不该问上游（供测试与运维观测用，**无副作用**）。
+
+        守卫：不是 in_progress、或没有 `upstream_submit_id` ⇒ 一律 False。
+        没有 submit_id 就压根无从问起（协调器虽然只拿 in_progress 记录来调它，
+        但这个断言是公开的，不该依赖调用方先自己筛过）。
+        """
+        if rec.status != "in_progress" or not rec.upstream_submit_id:
+            return False
+        now = time.time() if now is None else now
+        if now - (rec.started_at or rec.created_at) > self.settings.task_timeout:
+            return False
+        if now - (rec.started_at or 0) < self.settings.poll_grace:
+            return False
+        return now - rec.updated_at >= self.settings.jimeng_poll_interval
+
+    def _advance(self, rec: TaskRecord, st: Any) -> None:
+        """把一次查询结果落到任务上（终态收敛 / 未完成只刷时间）。"""
+        if not st.finished:
+            # 只刷 updated_at：让"上次推进时间"反映真实进度，
+            # 也让 stale 扫描不会把正常轮询的任务误判成卡死。
+            # ⚠️ 它同时是 ③ 轮询间隔的判据，所以这一步不能省。
+            self.store.patch(rec.task_id, updated_at=int(time.time()))
+            return
+
+        if st.failed:
+            self._fail(rec, self._terminal_error(st))
+            return
+
+        images = [{"url": im.url, "width": im.width, "height": im.height,
+                   "format": im.format, "note": im.note} for im in st.images]
+        notes = [im.note for im in st.images if im.note]
+        deg = list(rec.degradations) + [f"产物提示：{n}" for n in notes]
+        now = int(time.time())
+        self.store.patch(
+            rec.task_id, status="success", images=images,
+            credits=st.cost, finished_at=now, degradations=deg)
+        OBS.info("task succeeded", task_id=rec.task_id, model=rec.model,
+                 image_count=len(images), credits=st.cost,
+                 status_name=st.status_name,
+                 elapsed_s=round(now - rec.created_at, 1))
+
+    # ------------------------------------------------------------------ 内部
+
+    def _prepare_input_image(self, rec: TaskRecord) -> str:
+        """下载 → 归一化 → 上传，返回即梦可引用的 `image_uri`。**不计费。**"""
+        assert self.uploader is not None
+        blobs = load_images(rec.image_refs, self.settings)
+        blob = normalize(blobs[0], self.settings)
+        if blob.notes:
+            self.store.patch(rec.task_id,
+                             degradations=list(rec.degradations) + blob.notes)
+        uri = self.uploader.upload(blob.data)
+        OBS.info("input image uploaded", task_id=rec.task_id,
+                 bytes=blob.size, mime=blob.mime, cached=self.uploader.last_cached,
+                 normalized=blob.normalized)
+        return uri
+
+    def _submit(self, rec: TaskRecord, cap: models.Capability,
+                image_uri: str) -> str:
+        assert self.client is not None
+        size = rec.size or _default_size()
+        if cap.name == "t2i":
+            model_key = rec.upstream_model or DEFAULT_MODEL
+            opts = self.cfg.count_options(model_key) if self.cfg else None
+            sid = self.client.submit(
+                rec.prompt, model=model_key, size=size, count=rec.n or 1,
+                negative_prompt=rec.negative_prompt, seed=rec.seed,
+                count_options=opts)
+        elif cap.name == "i2i":
+            sid = self.client.blend(rec.prompt, image_uri=image_uri, size=size)
+        else:
+            assert cap.jimeng_tool
+            sid = self.client.edit(cap.jimeng_tool, image_uri=image_uri, size=size)
+        # 客户端侧还可能产生吸附告警（如 t2i 的张数），一并留痕
+        extra = [w for w in (self.client.last_warnings or []) if w]
+        if extra:
+            self.store.patch(rec.task_id,
+                             degradations=list(rec.degradations) + extra)
+        return sid
+
+    def _on_dispatch_error(self, rec: TaskRecord, err: AdapterError) -> None:
+        """建任务失败的处理。**分两种**：可重试的回队列，其余判死。"""
+        if isinstance(err, RiskControlError):
+            self.gate.mark_risk_hit()
+        elif isinstance(err, UpstreamQuotaError):
+            # 额度耗尽：进静默期。**不做"锁到明天"** —— 上游重置时刻未必是本地零点，
+            # 静默期到点自然重试，能自愈。
+            self.gate.mark_quota_exhausted(
+                min(self.settings.jm_cooldown * 2, 3600.0))
+
+        attempts = rec.attempts + 1
+        if err.retryable and attempts < DISPATCH_MAX_ATTEMPTS:
+            self.store.patch(rec.task_id, status="queued", attempts=attempts,
+                             started_at=None)
+            OBS.warning("dispatch failed, will retry", task_id=rec.task_id,
+                        attempts=attempts, error=err.message)
+            return
+        self._fail(rec, err, attempts=attempts)
+
+    def _fail(self, rec: TaskRecord, err: AdapterError,
+              *, attempts: int | None = None) -> None:
+        now = int(time.time())
+        self.store.patch(
+            rec.task_id, status="failure", error=err.to_error()["error"],
+            finished_at=now, attempts=attempts if attempts is not None
+            else rec.attempts)
+        OBS.error("task failed", task_id=rec.task_id, model=rec.model,
+                  err_type=err.err_type, err_code=err.err_code,
+                  message=err.message)
+
+    @staticmethod
+    def _terminal_error(st: Any) -> AdapterError:
+        """上游任务到终态但**失败** —— 这是"被接受≠能跑通"的落点。"""
+        reason = st.failed_reason or st.status_name
+        code = st.status
+        if code in (10, 40):
+            return ContentPolicyError(
+                f"上游送审未通过（status={code} {st.status_name}）：{reason}。"
+                f"换个 prompt 或换张输入图重试。", upstream="jimeng")
+        return UpstreamUnavailableError(
+            f"上游生成失败（status={code} {st.status_name}）：{reason}。"
+            f"⚠️ 该任务**已被上游计费**（详见积分消耗）。",
+            upstream="jimeng", upstream_status=st.status_name)
+
+
+def _build_gate(settings: Settings) -> UpstreamGate:
+    """构造上游闸门 —— **唯一的构造点**，要调闸门参数改这里。"""
+    return build_gate(settings)
+
+
+def _default_size() -> str:
+    """默认出图尺寸 —— **唯一的默认值定义点**（抓包实测唯一跑通的档位）。
+
+    ⚠️ 这两个 helper 曾经在函数体里做局部 import（`from .gate import build_gate`），
+    而 `DEFAULT_SIZE` 当时**根本没从包 `__init__` 导出** ⇒ 一调用就 `ImportError`。
+    局部 import 会把这类"名字不存在"的问题推迟到运行期才炸，且不容易被静态检查
+    看见。现在一律走模块级导入。
+    """
+    return DEFAULT_SIZE
+
+
+__all__ = [
+    "Service", "view", "to_adapter_error", "credential_id", "new_task_id",
+    "fingerprint_secret", "ACCEPTED_FIELDS", "KNOWN_UNSUPPORTED_FIELDS",
+    "DISPATCH_MAX_ATTEMPTS",
+]
