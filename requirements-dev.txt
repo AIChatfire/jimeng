@@ -6,3 +6,6 @@ pytest>=8.0
 #   · `client.py::_report()` 引用未 import 的 `OBS`（被 except 吞掉 ⇒ 埋点静默失效）
 #   · `service.py::fingerprint_secret()` 调用已不存在的 `store._connect()`
 ruff>=0.6
+# 部署门禁要**解析** `docker-compose.yml`（断言 db 不发布宿主端口等），
+# 而不是拿正则去猜 YAML。同为门禁依赖，缺了会失败而不是跳过。
+pyyaml>=6.0

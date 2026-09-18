@@ -20,7 +20,11 @@ psycopg2-binary>=2.9
 
 # 可观测性：logfire 出 trace、loguru 出日志，两者由 app/observability.py 单一收拢。
 # 未安装 / 未配 token 时降级为 no-op 并**可见地说明原因**，绝不阻塞业务。
-logfire>=3.0
+# 🔴 必须带 `[fastapi]` extra：只写 `logfire` 的话，
+# `logfire.instrument_fastapi()` 会抛 `RuntimeError: requires the
+# opentelemetry-instrumentation-fastapi package`，而调用处是**宽 except 兜底**，
+# 于是"服务照常跑、但 HTTP 请求一条 span 都没有" —— 只有翻容器日志才看得见。
+logfire[fastapi]>=3.0
 loguru>=0.7
 
 # 输入图归一化（尺寸/体积压缩）。缺失时自动跳过归一化并留痕，不阻断主流程。

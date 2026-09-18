@@ -38,14 +38,31 @@ docker compose up -d --build
 curl -s localhost:8200/healthz          # {"status":"ok"}
 ```
 
+⚠️ **数据库刻意不发布宿主端口**（`db` 只有容器内网的 `5432/tcp`）：
+应用走 compose 内网 `db:5432`，宿主端口毫无必要，而发布它只会制造冲突源
+（本机 5432 常年被别的项目占着 ⇒ `compose up` 报 "port is already allocated"，
+看着像本服务的问题，其实不是）。要在宿主上做管理：
+
+```bash
+docker compose exec db psql -U jimeng -d jimeng
+```
+
 本机直接跑（需自备 PostgreSQL）：
 
 ```bash
 export TASK_DB='postgresql+psycopg2://jimeng:<密码>@127.0.0.1:5432/jimeng'
 export JIMENG_SESSIONID='<浏览器 cookie 里的 sessionid>'
 export API_KEYS='sk-xxxxxxxx'           # 留空 = 关闭鉴权（仅内网）
-gunicorn -c gunicorn_conf.py app.main:app
+gunicorn -c gunicorn_conf.py "app.main:create_app()"
 ```
+
+🔴 末尾那对**括号不能省**：目标是**工厂**而不是模块级 `app` 对象。
+写成 `app.main:app` 会得到 `Failed to find attribute 'app' in 'app.main'` /
+`App failed to load.` —— **单测全绿也照样炸**，因为它们都直接调 `create_app()`。
+`tests/test_wiring.py::test_dockerfile_cmd_target_resolves` 钉的就是这条。
+
+⚠️ 直接用 gunicorn 跑时**记得设 `COORDINATOR_ENABLED=0`**，
+否则它会真的去建任务（**计费**动作）。
 
 ### 本机没有 PG？起一个独立的
 

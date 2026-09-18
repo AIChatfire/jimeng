@@ -16,8 +16,10 @@
 #      （任务库是共享的 PostgreSQL，所以扩容**不会**产生重复任务；但闸门会失效。）
 #      要提吞吐请先读 README「扩容前必读」。
 #   2. 不要把凭据写进本文件。业务配置一律走 .env（已在 .dockerignore 里）。
-#   3. 不要把 postgres 的端口暴露到公网 —— 任务库里含调用方的任务记录与凭据指纹。
-#      这里只映射到 127.0.0.1，本机联调用。
+#   3. 不要把 postgres 的端口发布到宿主（更别说公网）—— 任务库里含调用方的任务记录
+#      与凭据指纹。应用在 compose 内网走 `db:5432` 就够了，**不需要**宿主端口；
+#      而发布宿主端口等于凭空制造一个冲突源（本机 5432 早被别的项目占着）。
+#      要在宿主上做管理，用 `docker compose exec db psql -U jimeng -d jimeng`。
 #   4. 不要跳过 healthcheck 就 `depends_on`（短语法只等容器"启动"，不等它"能连"）。
 
 services:
@@ -31,8 +33,15 @@ services:
       POSTGRES_DB: ${POSTGRES_DB:-jimeng}
       # 任务表默认排序用 collation 无关的 epoch 秒，无需额外 locale
       TZ: Asia/Shanghai
-    ports:
-      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    # 🔴 **刻意不发布端口到宿主**（原先映射过 `127.0.0.1:${POSTGRES_PORT:-5432}:5432`）。
+    # 两个理由：
+    #   ① 应用在 compose 内网里走 `db:5432`，**根本不需要**宿主端口；
+    #   ② 发布宿主端口会**凭空制造一个冲突源** —— 本机 5432 早被别的项目容器占着，
+    #      `compose up` 会直接失败在 "port is already allocated"，而这不是本服务的问题。
+    # 要在宿主上连它做管理，用（默认就没有宿主端口，所以也不会误暴露）：
+    #   docker compose exec db psql -U jimeng -d jimeng
+    # 或临时开一次隧道：
+    #   docker compose exec db pg_isready
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:

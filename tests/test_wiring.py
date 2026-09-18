@@ -392,6 +392,45 @@ def test_gunicorn_worker_class_is_importable():
         f"worker_class={dotted!r} 指向的类不存在 —— gunicorn 会在启动时失败")
 
 
+def test_fastapi_instrumentation_dependency_is_installed():
+    """`logfire[fastapi]` 的 extra 必须真的装上 —— 否则 HTTP 埋点**静默失效**。
+
+    🔴 这条是从**容器日志**里抓到的缺陷，本地完全看不出来：
+    `requirements.txt` 原来只写 `logfire`（没有 extra），于是容器里
+    `logfire.instrument_fastapi()` 抛
+    `RuntimeError: ... requires the opentelemetry-instrumentation-fastapi package`，
+    而调用处是**宽 except 兜底**（那是刻意的降级设计）⇒
+    **服务照常起来、接口照常能用，但一条 HTTP 请求 span 都没有。**
+    本地跑得好好的，只因本地 venv 里恰好装过那个包。
+
+    所以这里断言的是**依赖存在性**，而不是"配置写对了" —— 根因就是缺包，
+    而"配置"看起来一直是对的。
+    """
+    import importlib
+
+    mod = importlib.import_module("opentelemetry.instrumentation.fastapi")
+    assert mod is not None, "缺少 opentelemetry-instrumentation-fastapi（logfire[fastapi]）"
+
+
+def test_database_is_not_published_to_the_host():
+    """数据库**不发布宿主端口** —— 它既是冲突源，也是不必要的暴露面。
+
+    应用在 compose 内网里走 `db:5432`，宿主端口毫无必要。
+    而发布宿主端口会让 `compose up` 在宿主已占用该端口时直接失败
+    （实测：本机 5432 常年被别的项目的容器占着），
+    报的是 "port is already allocated" —— 看起来像本服务的问题，其实不是。
+
+    要在宿主上做管理：`docker compose exec db psql -U jimeng -d jimeng`。
+    """
+    import yaml
+
+    compose = yaml.safe_load((ROOT / "docker-compose.yml").read_text(encoding="utf-8"))
+    db = compose["services"]["db"]
+    assert not db.get("ports"), (
+        f"db 服务不该发布宿主端口，实得 {db.get('ports')} —— "
+        f"应用走 compose 内网 db:5432 就够了")
+
+
 def test_dockerfile_needs_no_baked_credentials():
     """镜像里不许烤进带账号密码的连接串 —— 那是部署期信息。
 
