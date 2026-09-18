@@ -88,7 +88,17 @@ class Settings:
 
     # ------------------------------------------------------------ 轮询
     jimeng_poll_interval: float = 2.0
-    poll_grace: float = 3.0
+    #: 建任务之后、**第一次轮询之前**的等待。默认 0.2s。
+    #:
+    #: 🔴 这个值曾经是 3.0，是整条链路上**最大的单点浪费**：实测一次超清任务
+    #: 端到端 5.83s，其中 **3.0s（52%）** 纯粹是在等这个宽限期结束 ——
+    #: 而上游其实在提交后 1s 就出图了。
+    #:
+    #: 为什么现在可以这么小：`fetch_many` 对"上游还没落库的 id"会返回
+    #: `status=0 / init` 态的 **非终态**（不是错误），`poll_many` 见到非终态
+    #: 只刷新时间戳、下一轮再问。所以**早问一次是零代价的**，晚问才是代价。
+    #: 留 0.2s 只是为了别在提交返回的同一毫秒里去打（徒增一次空转）。
+    poll_grace: float = 0.2
     task_timeout: float = 1800.0
 
     # ------------------------------------------------------------ 协调器
@@ -179,7 +189,7 @@ class Settings:
             jm_per_minute=_i("JM_PER_MINUTE", 0),
             jm_cooldown=_f("JM_COOLDOWN", 600.0),
             jimeng_poll_interval=_f("JIMENG_POLL_INTERVAL", 2.0),
-            poll_grace=_f("POLL_GRACE", 3.0),
+            poll_grace=_f("POLL_GRACE", 0.2),
             task_timeout=_f("TASK_TIMEOUT", 1800.0),
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
             coordinator_tick=_f("COORDINATOR_TICK", 1.0),

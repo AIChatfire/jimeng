@@ -55,6 +55,12 @@ class Coordinator:
         self.settings = settings
         self.owner = owner or f"{uuid.uuid4().hex[:8]}"
         self._stop = threading.Event()
+        #: 🔴 "有新任务了，别等下一个 tick" 的唤醒信号。
+        #: 没有它的话，受理与派发之间的延迟平均是 tick/2、最坏是整整一个 tick
+        #: （默认 1s）—— 而对一次 6s 级的任务，这 1s 白等得很明显。
+        #: 用 Event 而不是把 tick 调小：**事件驱动零成本**，调小 tick 会让
+        #: DB 查询次数按倍增加（每轮都要 count + list）。
+        self._wake = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_maintenance = 0.0
         #: 累计统计（运维观测）
@@ -82,9 +88,19 @@ class Coordinator:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        self._wake.set()          # 立刻从 wait 里醒来，别在退出前白等一个 tick
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+
+    def wake(self) -> None:
+        """叫醒循环：**有新任务进来了，不用等下一个 tick**。
+
+        由受理路径调用（`main.py` 里 `create` 之后）。它是**纯优化**：
+        丢了这次唤醒最多也只是慢一个 tick，正确性不受影响 ——
+        因为"该派发谁"始终由库里的状态决定，而不是由谁叫过它决定。
+        """
+        self._wake.set()
 
     def _loop(self) -> None:
         while not self._stop.is_set():
@@ -92,7 +108,10 @@ class Coordinator:
                 self.tick()
             except Exception:
                 log.exception("coordinator tick 异常（已吞掉，下一轮继续）")
-            self._stop.wait(self.settings.coordinator_tick)
+            # 要么被叫醒（有新任务），要么等满一个 tick。
+            # 超时仍然保留：它兜住"唤醒信号丢了"这类情况。
+            self._wake.wait(self.settings.coordinator_tick)
+            self._wake.clear()
 
     # ------------------------------------------------------------------ 单轮
 

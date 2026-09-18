@@ -311,3 +311,36 @@ def test_coordinator_skips_when_upstream_not_configured(settings, store,
     co = Coordinator(svc, blank, owner="x")
     co.tick()                       # 不该抛，也不该调上游
     assert fake_jimeng.calls == []
+
+
+def test_accept_wakes_the_coordinator(client, client_state, monkeypatch):
+    """受理必须**叫醒**协调器，否则这条要白等一个 tick（默认最多 1s）。
+
+    ⚠️ 刻意**不做时序断言** —— 那类断言必然偶发（本仓踩过 1% 概率的假失败，
+    根因是整秒存储的 `updated_at` 撞上亚秒间隔）。改成钉住**接线**：
+    受理路径确实调用了 `wake()`。接线断了才是会静默退化的那种缺陷
+    （变慢但不会报错），而"快多少"由 `Coordinator.wake` 的实现保证。
+    """
+    calls: list[int] = []
+    monkeypatch.setattr(client_state.coordinator, "wake",
+                        lambda: calls.append(1))
+
+    _create(client)
+
+    assert calls == [1], "受理路径没有叫醒协调器 —— 会退化成等下一个 tick"
+
+
+def test_wake_is_harmless_and_idempotent(service, settings):
+    """`wake()` 纯属优化：多叫几次、或没人听，都不该有任何副作用。
+
+    丢掉一次唤醒最多慢一个 tick —— "该派发谁"始终由库里的状态决定，
+    不由"谁叫过它"决定。这条钉住这个性质，免得有人把状态塞进唤醒信号里。
+    """
+    from app.coordinator import Coordinator
+
+    co = Coordinator(service, settings, owner="x")
+    co.wake()
+    co.wake()
+    co.wake()
+    assert co.stats()["running"] is False      # 没 start 过，叫醒也不该把它跑起来
+    co.tick()                                  # 没配置上游 ⇒ 直接返回，不抛

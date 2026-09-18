@@ -246,6 +246,11 @@ def _install_routes(app: FastAPI) -> None:
         """
         svc: Service = request.app.state.service
         rec = svc.create(body.model_dump(), credential=credential)
+
+        # 叫醒协调器：不然这条任务要等到下一个 tick 才被发现（默认最多白等 1s）。
+        # 纯优化 —— 唤醒丢了也只是慢一个 tick，"该派发谁"始终由库里的状态决定。
+        request.app.state.coordinator.wake()
+
         # 202 + 一个 id。不返回状态/时间戳之类的附加信息 —— 调用方要的是"拿着它去轮询"。
         return JSONResponse(
             status_code=202, content={"task_id": rec.task_id},
