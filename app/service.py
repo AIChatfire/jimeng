@@ -351,15 +351,27 @@ class Service:
         except JimengError as e:
             raise InvalidParameterError(str(e), param="size") from e
 
-        n_raw = body.get("n", 1)
-        if isinstance(n_raw, bool) or not isinstance(n_raw, int) or n_raw < 1:
-            raise InvalidParameterError("n 必须是 >=1 的整数", param="n")
+        #: ⚠️ **不传 `n` 与传 `n=...` 是两种情况，必须分开处理。**
+        #:
+        #: 🔴 契约：**不传 `n` ⇒ 取该模型的最小合法值**（通常就是 1），
+        #: **绝不采用上游的 `default_generate_count`** —— 实测各家不同
+        #: （5.0 Pro 默认 2、5.0 Lite 默认 4），照它的默认走，调用方会按"1 张"的
+        #: 预期收到 2~4 张的账单。**默认必须是最省的那个。**
+        #: 另外：这种情况**不该**产生"已吸附"告警 —— 调用方什么都没要求，
+        #: 我们说"把你的 1 改成了 2"只会让人困惑。
+        n_given = body.get("n")
+        if n_given is None:
+            n_raw: int | None = None
+        else:
+            if isinstance(n_given, bool) or not isinstance(n_given, int) or n_given < 1:
+                raise InvalidParameterError("n 必须是 >=1 的整数", param="n")
+            n_raw = n_given
 
         seed = body.get("seed")
         if seed is not None and (isinstance(seed, bool) or not isinstance(seed, int)):
             raise InvalidParameterError("seed 必须是整数", param="seed")
 
-        n = n_raw
+        n = n_raw or 1
         if cap.name in ("t2i", "i2i") and self.cfg is not None:
             # 🔴 blend 的**张数与文生图同源**：草稿里同样写
             # `abilities.gen_option.gen_count`（参考仓自检原文可见该字段）。
@@ -372,10 +384,13 @@ class Service:
             if note:
                 degradations.append(note)
             from .upstream.jimeng.client import resolve_count  # noqa: PLC0415
-            n, warn = resolve_count(model_key, n_raw, opts)
-            if warn:
-                degradations.append(warn)
-        elif cap.name not in ("t2i", "i2i") and n_raw != 1:
+            if n_raw is None:
+                n = min(opts) if opts else 1      # 默认 = **最小合法值**，且不留吸附告警
+            else:
+                n, warn = resolve_count(model_key, n_raw, opts)
+                if warn:
+                    degradations.append(warn)
+        elif cap.name not in ("t2i", "i2i") and n_raw not in (None, 1):
             # 后编辑族（hd / pro-hd / outpaint）的张数控制**未取证**：
             # 它们用单个 `origin_image` + `postedit_param`，与 blend 的 `gen_option`
             # 不是同一条路径 ⇒ 仍然只接受 1，其余**留痕**（不静默）。

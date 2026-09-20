@@ -279,6 +279,44 @@ def test_mixed_reusable_and_foreign_refs_keep_order(
     assert sent[1] == fake_uploader.uri_for(fake_uploader.uploads[0]), "第 2 张是刚上传的"
 
 
+def test_omitted_n_defaults_to_the_smallest_allowed_count(
+        client, client_state, fake_jimeng, fake_uploader, service):
+    """🔴 **不传 `n` ⇒ 取该模型的最小合法值**，**不采用上游的 `default_generate_count`**。
+
+    实测上游各家默认不同（5.0 Pro 默认 **2**、5.0 Lite 默认 **4**）——
+    照它的默认走，调用方按"1 张"的预期会收到 2~4 张的账单。**默认必须是最省的那个。**
+
+    这条刻意把选项设成 `(2, 4)`（**最小值不是 1**）：只有真的取 `min(opts)`
+    才能通过，写死 1 会当场翻车。同时这种情况**不该**留"已吸附"告警 ——
+    调用方什么都没要求，回一句"把你的 1 改成 2"只会让人困惑。
+    """
+    service.cfg.options = (2, 4)          # 假能力表：最小值 ≠ 1
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x")     # 刻意不带 n
+    client_state.coordinator.tick()
+
+    rec = service.store.get(tid)
+    assert rec.n == 2, f"默认应取最小合法值 2，实得 {rec.n}"
+    assert not [d for d in rec.degradations if "吸附" in d], \
+        f"没请求张数却报了吸附：{rec.degradations}"
+    assert fake_jimeng.of("submit")[0]["count"] == 2, "默认值没有真的传给上游"
+
+
+def test_explicit_n_is_still_snapped_onto_the_model_options(
+        client, client_state, fake_jimeng, fake_uploader, service):
+    """显式传了 `n` 时，行为不变：吸附到合法值**并留痕**（这条是既有契约，别改坏）。"""
+    service.cfg.options = (1, 2, 4)
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=3)
+    client_state.coordinator.tick()
+
+    rec = service.store.get(tid)
+    assert rec.n == 2, "3 不在选项里 ⇒ 吸附到不超过它的最大值 2"
+    assert any("吸附" in d for d in rec.degradations), "吸附必须留痕"
+
+
 def test_image_count_has_a_global_ceiling(client, service):
     """全局合理性上限：一次塞 6 张直接拒（真正的额度由能力声明决定）。
 
