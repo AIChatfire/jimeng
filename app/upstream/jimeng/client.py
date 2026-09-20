@@ -601,10 +601,10 @@ POST_EDIT_TOOLS: dict[str, dict[str, Any]] = {
         "scene": None,
         #: ✅ **9-20 路 A 已验证**：单组件 + item_id/origin_history_id
         #: （无 origin_image）真跑成功 —— 死因就是 origin_image，父链非必需
-        #: （见 UPSTREAM.md §9.2）。upload（origin_image 带 tos uri）形态不可用。
-        #: 仍未注册为对外能力：对外契约如何引用已有作品待定
-        #: （见 app/models.py::DELIBERATE_ABSENCES）。
-        "registered": False,
+        #: （见 UPSTREAM.md §9.2）。
+        #: 🔴 **9-20 晚复测（同日第三样本）**：upload（origin_image 带 tos uri）
+        #: 形态再次 generate_failed（8s 即失败，且**零扣费** —— 推翻"失败且
+        #: 计费"的旧记录）。本地图不支持是稳定结论，勿再试。
     },
 }
 
