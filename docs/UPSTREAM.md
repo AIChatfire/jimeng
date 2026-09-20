@@ -203,6 +203,46 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 **代码里那份快照只作探测失败时的兜底，且会如实标注降级**。
 教训：曾按"用户经验 1–4"写死上界 4，对默认模型直接是错的。
 
+## 11.5 积分余额 / 消耗记录（**只读、不计费**，2026-09-20 实测）
+
+```
+POST /commerce/v1/benefits/user_credit_history
+body: {"count": 20, "cursor": "0", "history_type": 2}     # 2 = 消耗
+```
+
+**鉴权：两种形式等价**（实测同一次调用，三种变体都返回 `200` / `ret=0` / 同一余额）：
+
+| 变体 | 结果 |
+|---|---|
+| `Cookie: sessionid=<…>`（本仓客户端现有做法） | ✅ `ret=0` |
+| `Authorization: Bearer <sessionid>` | ✅ `ret=0` |
+| 两者都带 | ✅ `ret=0` |
+
+⇒ 走 Cookie 即可，**不必为它改鉴权代码**。（签名头那套
+`sign` / `x-secsdk-web-signature` / `device-time` / `uifid` 由
+`app/upstream/jimeng/sign.py` 现成算好，`_post` 自动带。）
+
+**响应**：`data.total_credit`（**账户可用积分**）/ `data.records[]` /
+`data.new_cursor` / `data.has_more`。
+`records[]`：`amount` / `create_time`（**秒**）/ `title` / `submit_id` / `status`。
+`title` 例："图片生成"、"智能超清2.0-2k"。
+**`submit_id` 与我们任务的 `upstream_submit_id` 对得上 ⇒ 可按任务对账。**
+
+### 🔴 实测：回执里的 `forecast_generate_cost` **严重高估**
+
+| 任务 | 回执 `forecast_*`（我们报成 `usage.credits`） | **实际扣（本接口）** |
+|---|---|---|
+| i2i 双垫图 | **55** | **12** |
+| hd（"智能超清2.0-2k"） | **9** | **1** |
+
+⇒ **别把 `forecast_generate_cost` 当实际扣费报给调用方**（高估 4~9 倍）。
+`Capability.credits_measured` 目前全部取自 forecast，**都偏高**，应改用本接口校准。
+
+⚠️ 两个陷阱：
+- **消耗记录会延迟结算**：跑完当场查可能还没有那条记录 ——
+  **不能因为"没看到记录"就断定免费**；要等结算，或用 `total_credit` **跑前/跑后差分**。
+- 积分**会过期清零**（记录里出现过 "积分到期清零"）。
+
 ## 12. 模型单价（实测，**别按新旧推**）
 
 `v43` = **35** < `v50` = 44 < `v40` = **51**；
