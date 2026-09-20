@@ -77,19 +77,26 @@ def test_build_video_draft_requires_prompt():
 
 
 def test_resolve_video_commerce_whitelist():
-    # amount = 输出秒数 + 输入视频秒数（两条实抓联立解出的口径）
-    assert resolve_video_commerce("720p", 4) == \
+    # 🔴 计费档位**逐模型**（三份 UI 抓包）；amount = 输出秒 + 输入视频秒
+    assert resolve_video_commerce("dreamina_seedance_40_mini", "720p", 4) == \
         ("seedance_20_mini_720p_output_5s", 4)
-    assert resolve_video_commerce("720p", 5, input_video_s=10.35) == \
+    assert resolve_video_commerce("dreamina_seedance_40_mini", "720p", 5,
+                                  input_video_s=10.35) == \
         ("seedance_20_mini_720p_output_5s", 15.35)
+    assert resolve_video_commerce("dreamina_seedance_40_vision", "720p", 5) == \
+        ("dreamina_seedance_20_fast_5s", 5)
+    assert resolve_video_commerce("dreamina_seedance_40_pro_vision", "720p", 5) == \
+        ("seedance_20_pro_720p_output", 5)
 
 
 def test_resolve_video_commerce_rejects_unverified_tier():
-    # 1080p / 8s 没有抓包依据 —— 拒绝构造计费字段，绝不猜
+    # 未登记的模型/时长：拒绝构造计费字段，绝不猜
     with pytest.raises(JimengParamError):
-        resolve_video_commerce("1080p", 4)
+        resolve_video_commerce("dreamina_seedance_40_mini", "720p", 8)
     with pytest.raises(JimengParamError):
-        resolve_video_commerce("720p", 8)
+        resolve_video_commerce("dreamina_seedance_40_mini", "1080p", 4)
+    with pytest.raises(JimengParamError):
+        resolve_video_commerce("dreamina_seedance_40_vision", "720p", 4)
 
 
 def test_submit_video_dry_run_never_sends():
@@ -328,10 +335,13 @@ def test_video_end_to_end_success(app_and_client, fake_jimeng, client_state):
 def test_models_catalog_lists_video_capability(client):
     r = client.get("/async/v1/models")
     ids = {m["id"]: m for m in r.json()["data"]}
-    assert "jimeng-t2v" in ids
-    assert ids["jimeng-t2v"]["media"] == "video"
-    # 诚实边界写进了 notes：未端到端实跑
-    assert "端到端实跑未验证" in ids["jimeng-t2v"]["notes"]
+    # 三个视频生成模型都在（mini 已真跑；fast/pro 已按抓包适配）
+    for mid in ("jimeng-t2v", "jimeng-t2v-fast", "jimeng-t2v-pro"):
+        assert ids[mid]["media"] == "video"
+    # 诚实边界写进了 notes：t2v 已真跑验证（含实扣）
+    assert "真跑验证" in ids["jimeng-t2v"]["notes"]
+    assert "端到端实跑未验证" in ids["jimeng-t2v-fast"]["notes"]
+    assert "端到端实跑未验证" in ids["jimeng-t2v-pro"]["notes"]
 
 
 # ---------------------------------------------------------------------------

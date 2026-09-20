@@ -849,9 +849,22 @@ def build_blend_draft(*, prompt: str, image_uris: Sequence[str] | None = None,
 DEFAULT_VIDEO_MODEL = "dreamina_seedance_40_mini"
 #: 分辨率 → (benefit_type, 已实抓的输出时长秒集合)。
 #: 🔴 计费口径（两条实抓联立解出）：amount = 输出秒数 + Σ输入视频秒数
-#: （4s 无输入 ⇒ 4；5s + 10.35s 输入 ⇒ **15.35**）。benefit_type 只按分辨率定。
-VIDEO_COMMERCE: dict[str, tuple[str, tuple[int, ...]]] = {
-    "720p": ("seedance_20_mini_720p_output_5s", (4, 5)),
+#: （4s 无输入 ⇒ 4；5s + 10.35s 输入 ⇒ **15.35**）。
+#: ✅ 2026-09-20 晚三份 UI 抓包：计费档位**逐模型**不同 ——
+#:   mini：seedance_20_mini_720p_output_5s（4s/5s）
+#:   vision（Seedance 4.0 Vision，UI 标 Fast 5s 免费试用）：dreamina_seedance_20_fast_5s
+#:   pro_vision（Seedance 4.0 Pro Vision）：seedance_20_pro_720p_output（无 _5s 尾）
+#: 名字全部**逐字照抄抓包**（别"纠正"大小写/前后缀）。
+VIDEO_COMMERCE: dict[str, dict[str, tuple[str, tuple[int, ...]]]] = {
+    "dreamina_seedance_40_mini": {
+        "720p": ("seedance_20_mini_720p_output_5s", (4, 5)),
+    },
+    "dreamina_seedance_40_vision": {
+        "720p": ("dreamina_seedance_20_fast_5s", (5,)),
+    },
+    "dreamina_seedance_40_pro_vision": {
+        "720p": ("seedance_20_pro_720p_output", (5,)),
+    },
 }
 #: 分辨率取值（抓包见 720p；1080p 是站点枚举但**无抓包样本**，登记仅供报错提示）。
 VIDEO_RESOLUTIONS: tuple[str, ...] = ("720p", "1080p")
@@ -862,24 +875,25 @@ DEFAULT_VIDEO_ASPECT_RATIO = "16:9"
 DEFAULT_VIDEO_FPS = 24
 
 
-def resolve_video_commerce(resolution: str, duration_s: int,
+def resolve_video_commerce(model: str, resolution: str, duration_s: int,
                            input_video_s: float = 0.0) -> tuple[str, float]:
     """查视频计费档位：返回 (benefit_type, 预扣 amount)。
 
-    🔴 计费口径（两条实抓联立解出）：
-    · 4s 无输入 ⇒ amount 4；5s + 10.35s 输入视频 ⇒ amount **15.35**
-      ⇒ **amount = 输出秒数 + Σ输入视频秒数**（音频不计入；1 积分/秒）；
-    · `benefit_type` 只按分辨率定，档位名里的 "output_5s" 与实际时长无关
-      （4s 的抓包也叫 output_5s）—— 照抄别"纠正"。
+    🔴 计费口径（实抓解出）：
+    · amount = 输出秒数 + Σ输入视频秒数（音频不计入；≈1 积分/秒）；
+    · benefit_type **逐模型不同**、逐字照抄抓包（见 VIDEO_COMMERCE 注释）。
 
-    白名单外（1080p、>5s 等）没有抓包依据 ⇒ 拒绝，绝不猜计费字段。
+    白名单外（未登记的模型/分辨率/时长）没有抓包依据 ⇒ 拒绝，绝不猜。
     """
-    hit = VIDEO_COMMERCE.get(resolution)
+    tiers = VIDEO_COMMERCE.get(model) or {}
+    hit = tiers.get(resolution)
     if hit is None or int(duration_s) not in hit[1]:
-        known = ", ".join(f"{r}×{d}s" for r, durs in sorted(VIDEO_COMMERCE.items())
-                          for d in durs)
+        known = ", ".join(
+            f"{m.split('_')[-2] + '_' + m.split('_')[-1]}:{r}×{d}s"
+            for m, tiers_ in sorted(VIDEO_COMMERCE.items())
+            for r, durs in tiers_.items() for d in durs)
         raise JimengParamError(
-            f"视频档位 {resolution} × {duration_s}s 没有抓包依据，"
+            f"视频计费档位 {model} × {resolution} × {duration_s}s 没有抓包依据，"
             f"本服务拒绝构造计费字段（benefit_type/amount 写错 = 按错档位扣积分）。"
             f"当前已实抓的档位：{known}。要放开新档位请先补抓对应请求包。",
             code=1001)
@@ -1520,7 +1534,7 @@ class JimengClient:
             raise JimengParamError(
                 f"aspect_ratio 只接受 {list(VIDEO_ASPECT_RATIOS)}，"
                 f"实得 {aspect_ratio!r}", code=1001)
-        benefit, amount = resolve_video_commerce(resolution, duration_s)
+        benefit, amount = resolve_video_commerce(model, resolution, duration_s)
         sid = submit_id or _uid()
         # `metrics_extra` 与草稿内 `video_task_extra` 是同一份内容的两种挂法
         metrics: dict[str, Any] = {
@@ -1534,7 +1548,8 @@ class JimengClient:
                 "videoDuration": duration_s, "batchNumber": 1,
                 "inputVideoDuration": 0, "chargeInputVideoDuration": True,
                 "isLongVideo": False, "hasInputVideo": False,
-                "useSeedanceFast5sFreeTrial": False,
+                # 🔴 照抄抓包：只有 vision（Fast）带免费试用标记
+                "useSeedanceFast5sFreeTrial": model == "dreamina_seedance_40_vision",
                 "reportParams": {
                     "enterSource": "generate", "vipSource": "generate",
                     "extraVipFunctionKey": f"{model}-{resolution}",
@@ -1690,7 +1705,8 @@ class JimengClient:
             raise JimengParamError(
                 f"aspect_ratio 只接受 {list(VIDEO_ASPECT_RATIOS)}，"
                 f"实得 {aspect_ratio!r}", code=1001)
-        benefit, amount = resolve_video_commerce(resolution, duration_s,
+        benefit, amount = resolve_video_commerce(
+            DEFAULT_VIDEO_MODEL, resolution, duration_s,
                                                  input_video_s=input_video_s)
         sid = submit_id or _uid()
         type_code = {"video": 2, "image": 1, "audio": 3}

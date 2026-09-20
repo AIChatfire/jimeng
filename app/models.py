@@ -93,6 +93,8 @@ class Capability:
     #: 默认推导必须排除它们（否则"不写 model"就会在 t2i/detail-fix 之间
     #: 产生歧义 —— 那会让既有图片调用方突然 400）。
     needs_source_ref: bool = False
+    #: 视频族专用：上游 `model_req_key`/`root_model`（计费档位按它查表）。
+    video_model: str | None = None
     notes: str = ""
 
     @property
@@ -162,18 +164,40 @@ CAPABILITIES: tuple[Capability, ...] = (
         key="jimeng:t2v", name="t2v", title="文生视频（Seedance）",
         accepts_image=False, image_required=False, prompt_required=True,
         credits_measured=None, media="video",
+        video_model="dreamina_seedance_40_mini",
         notes="上游模型 dreamina_seedance_40_mini（网页端 Seedance 4.0 Mini，t2v）。"
-              "**提交侧已按 2026-09-20 实抓逐字段适配**（含计费字段 "
-              "benefit_type/amount）；**端到端实跑未验证**（建任务即计费，"
-              "需显式开闸后人工确认），结果回包结构未实抓 —— "
-              "产物解析为尽力而为，解析不到按失败处理。"
-              "已实抓档位仅 720p×4s（benefit_type seedance_20_mini_720p_output_5s，"
-              "预扣 4）；其余档位拒绝构造（白名单见 client.VIDEO_COMMERCE）。"
+              "**✅ 2026-09-20 真跑验证**（114s 出片 1280×720，实扣 24；"
+              "回执 forecast 166 高估 ~7 倍）。"
+              "已实抓档位 720p×4s/5s、4:3/16:9（计费 amount=输出秒+Σ输入视频秒）。"
               "视频草稿没有张数字段（抓包无 gen_option）⇒ 一次一条。"
-              "非 4:3/16:9 的比例未实抓。"
-              "⚠️ 查询侧复用图片同一套 get_history_by_ids 轮询（用户实抓确认）。"
+              "⚠️ 查询侧复用图片同一套 get_history_by_ids 轮询（已实证）。"
               "⚠️ 服务端 get_common_config 只下发图片模型表，视频模型清单"
-              "按场景单独下发 —— 新模型要靠补抓提交包登记。",
+              "按场景单独下发 —— 新模型要靠补抓提交包登记（已补 vision/pro 两档）。",
+    ),
+    Capability(
+        key="jimeng:t2v-fast", name="t2v-fast",
+        title="文生视频·Fast（Seedance 4.0 Vision）",
+        accepts_image=False, image_required=False, prompt_required=True,
+        credits_measured=None, media="video",
+        video_model="dreamina_seedance_40_vision",
+        notes="上游模型 dreamina_seedance_40_vision（网页端 Seedance 4.0 Vision，"
+              "2026-09-20 晚 UI 抓包）。计费 benefit_type="
+              "**dreamina_seedance_20_fast_5s**（前缀带 dreamina_，照抄）；"
+              "UI 标 `useSeedanceFast5sFreeTrial: true`（5s 免费试用）—— "
+              "是否真免费**未对账**。已实抓档位仅 720p×5s/4:3。"
+              "提交侧按抓包适配，**端到端实跑未验证**。",
+    ),
+    Capability(
+        key="jimeng:t2v-pro", name="t2v-pro",
+        title="文生视频·Pro（Seedance 4.0 Pro Vision）",
+        accepts_image=False, image_required=False, prompt_required=True,
+        credits_measured=None, media="video",
+        video_model="dreamina_seedance_40_pro_vision",
+        notes="上游模型 dreamina_seedance_40_pro_vision（网页端 "
+              "Seedance 4.0 Pro Vision，2026-09-20 晚 UI 抓包）。计费 "
+              "benefit_type=**seedance_20_pro_720p_output**（无 _5s 尾巴，照抄）。"
+              "已实抓档位仅 720p×5s/4:3。"
+              "提交侧按抓包适配，**端到端实跑未验证**。",
     ),
     Capability(
         key="jimeng:vfi", name="vfi", title="视频补帧（插帧 insert_frame）",
@@ -249,6 +273,8 @@ ALIASES: dict[str, str] = {
     "text2video": "jimeng-t2v",
     "t2v": "jimeng-t2v",
     "seedance": "jimeng-t2v",
+    "t2v-fast": "jimeng-t2v-fast",
+    "t2v-pro": "jimeng-t2v-pro",
     "补帧": "jimeng-vfi",
     "插帧": "jimeng-vfi",
     "vfi": "jimeng-vfi",
@@ -276,7 +302,8 @@ def is_placeholder(model: str | None) -> bool:
 def _hint() -> str:
     ids = ", ".join(c.api_id for c in CAPABILITIES)
     return (f"model 取值：{ids}；"
-            f"也可只写能力名（t2i / i2i / hd / pro-hd / outpaint / t2v / vfi）、"
+            f"也可只写能力名（t2i / i2i / hd / pro-hd / outpaint / t2v / "
+            f"t2v-fast / t2v-pro / vfi / detail-fix）、"
             f"中文别名，或直接写上游模型 key（如 {DEFAULT_UPSTREAM_MODEL}）。"
             f"完整清单见 GET /async/v1/models")
 

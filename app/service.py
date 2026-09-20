@@ -50,6 +50,7 @@ from .upstream.jimeng import (
     DEFAULT_MODEL,
     DEFAULT_SIZE,
     DEFAULT_VIDEO_ASPECT_RATIO,
+    DEFAULT_VIDEO_MODEL,
     DEFAULT_VIDEO_RESOLUTION,
     VIDEO_ASPECT_RATIOS,
     VIDEO_RESOLUTIONS,
@@ -620,7 +621,9 @@ class Service:
                             param="duration")
             else:
                 try:
-                    resolve_video_commerce(resolution, duration)
+                    resolve_video_commerce(
+                        cap.video_model or DEFAULT_VIDEO_MODEL,
+                        resolution, duration)
                 except JimengError as e:
                     raise InvalidParameterError(str(e), param="duration") from e
             duration_ms = duration * 1000
@@ -1264,6 +1267,7 @@ class Service:
             # 张数恒 1（草稿无 gen_option，受理时已降级留痕）。
             sid = self.client.submit_video(
                 rec.prompt,
+                model=cap.video_model or DEFAULT_VIDEO_MODEL,
                 resolution=rec.size or DEFAULT_VIDEO_RESOLUTION,
                 duration_ms=rec.duration_ms or 4000,
                 aspect_ratio=rec.aspect_ratio or DEFAULT_VIDEO_ASPECT_RATIO,

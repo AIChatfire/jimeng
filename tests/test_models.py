@@ -98,9 +98,9 @@ def test_catalog_hides_deliberately_absent_capabilities():
     assert DELIBERATE_ABSENCES == {}, "缺席必须被显式记录，不是忘了"
     # 五个已端到端验证过的能力都在；t2v/vfi/omni/detail-fix 见各自 notes
     assert ids == {c.api_id for c in CAPABILITIES}
-    assert len(ids) == 9
-    assert {"jimeng-t2v", "jimeng-vfi", "jimeng-omni-video",
-            "jimeng-detail-fix"} <= ids
+    assert len(ids) == 11
+    assert {"jimeng-t2v", "jimeng-t2v-fast", "jimeng-t2v-pro", "jimeng-vfi",
+            "jimeng-omni-video", "jimeng-detail-fix"} <= ids
 
 
 def test_detail_fix_tool_description_is_kept_for_future_investigation():
