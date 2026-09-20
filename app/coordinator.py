@@ -103,6 +103,8 @@ class Coordinator:
         self._wake.set()
 
     def _loop(self) -> None:
+        if self.settings.upstream_configured:
+            self._prewarm()
         while not self._stop.is_set():
             try:
                 self.tick()
@@ -112,6 +114,37 @@ class Coordinator:
             # 超时仍然保留：它兜住"唤醒信号丢了"这类情况。
             self._wake.wait(self.settings.coordinator_tick)
             self._wake.clear()
+
+    def _prewarm(self) -> None:
+        """启动预热：把**与具体任务无关**的只读往返提前做掉。
+
+        两样东西每个进程只需要一次，但原先都是"第一个任务才付"：
+          · 模型/价格表（`get_common_config`，实测约 200ms）
+          · 上传用的 STS（`get_upload_token`，实测约 440ms；本来就有双检锁共享）
+
+        它只影响"重启后第一个任务"的延迟 —— 但那一刻恰好是**部署完立刻试用**的
+        时刻，观感最差。两者都是只读、**不计费**。
+
+        在**协调器线程**里做，所以不拖慢 HTTP 启动（`/healthz` 立刻可用）；
+        任何失败都只告警 —— 预热是优化，绝不能成为启动的前提条件。
+        """
+        t0 = time.monotonic()
+        warmed: list[str] = []
+        try:
+            if self.service.cfg is not None:
+                self.service.cfg.snapshot()
+                warmed.append("model_config")
+        except Exception as e:  # noqa: BLE001
+            log.warning("预热模型配置失败（不影响运行）：%s", e)
+        try:
+            if self.service.uploader is not None:
+                self.service.uploader.token()
+                warmed.append("upload_token")
+        except Exception as e:  # noqa: BLE001
+            log.warning("预热上传凭据失败（不影响运行）：%s", e)
+        if warmed:
+            OBS.info("startup prewarm", items=warmed,
+                     elapsed_ms=round((time.monotonic() - t0) * 1000, 1))
 
     # ------------------------------------------------------------------ 单轮
 

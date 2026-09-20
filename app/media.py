@@ -17,12 +17,17 @@ import base64
 import binascii
 import io
 import re
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import httpx
 
 from .config import Settings
 from .errors import InvalidParameterError, UpstreamUnavailableError
+
+#: 多张垫图时**同时下载**几张。与 `Capability.max_images`（blend 上限 4）同量级。
+#: 下载是纯网络等待，并发收益接近线性；再高没有收益 —— 上限本来只有 4。
+MAX_DOWNLOAD_PARALLELISM = 4
 
 # ---------------------------------------------------------------------------
 # 类型嗅探
@@ -179,19 +184,37 @@ def load_one(raw: str, settings: Settings) -> Blob:
         param="image", got=text[:80])
 
 
+def _load_checked(ref: str, settings: Settings) -> Blob:
+    """`load_one` + 两道校验（可放进线程池，所以单独抽出来）。"""
+    blob = load_one(ref, settings)
+    if blob.mime == "application/octet-stream":
+        raise InvalidParameterError(
+            "输入不是可识别的图片格式（按 magic bytes 判定）",
+            param="image", src=blob.src[:120])
+    if blob.size > settings.max_input_bytes:
+        raise InvalidParameterError(
+            f"输入图片超过上限 {settings.max_input_bytes} 字节", param="image")
+    return blob
+
+
 def load_images(refs: list[str], settings: Settings) -> list[Blob]:
-    blobs: list[Blob] = []
-    for ref in refs:
-        blob = load_one(ref, settings)
-        if blob.mime == "application/octet-stream":
-            raise InvalidParameterError(
-                "输入不是可识别的图片格式（按 magic bytes 判定）",
-                param="image", src=blob.src[:120])
-        if blob.size > settings.max_input_bytes:
-            raise InvalidParameterError(
-                f"输入图片超过上限 {settings.max_input_bytes} 字节", param="image")
-        blobs.append(blob)
-    return blobs
+    """把多个输入图载体变成 Blob 列表。**顺序与 `refs` 一致。**
+
+    多张时**并发下载**：`download()` 每次新建自己的 `httpx.Client`（`with` 块内），
+    没有共享状态，所以并发是安全的；而传多个 URL 时这是**纯网络等待**，
+    串行等于把各自的往返时间加起来。
+
+    ⚠️ 顺序为何重要：垫图的先后对生成语义有影响（见 `build_blend_draft`）。
+    `Executor.map` **保序** —— 结果按 `refs` 顺序产出，
+    连报错也是"按输入顺序遇到的第一个"（确定性，不随线程调度漂移）。
+    """
+    if not refs:
+        return []
+    if len(refs) == 1:
+        return [_load_checked(refs[0], settings)]
+    n = min(len(refs), MAX_DOWNLOAD_PARALLELISM)
+    with ThreadPoolExecutor(max_workers=n) as pool:
+        return list(pool.map(lambda r: _load_checked(r, settings), refs))
 
 
 # ---------------------------------------------------------------------------

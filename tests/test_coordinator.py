@@ -472,3 +472,58 @@ def test_wake_is_harmless_and_idempotent(service, settings):
     co.wake()
     assert co.stats()["running"] is False      # 没 start 过，叫醒也不该把它跑起来
     co.tick()                                  # 没配置上游 ⇒ 直接返回，不抛
+
+
+def test_prewarm_fetches_model_config_and_upload_token_once(service, settings,
+                                                            fake_jimeng):
+    """启动预热要把两次**只读**往返提前做掉（模型表 + 上传 STS）。
+
+    这两样每个进程只需一次，但原先都是"第一个任务才付"（实测 ~200ms + ~440ms）。
+    它只影响重启后第一个任务的延迟 —— 而那恰好是部署完立刻试用的一刻。
+    """
+    from app.coordinator import Coordinator
+
+    svc = settings.replace(jimeng_sessionid="s", jimeng_cookie="")
+    obj = Service(svc, store=service.store, client=fake_jimeng,
+                  uploader=fake_jimeng, cfg=None)
+    # 用替身记账，避免真的构造上游往返
+    calls: list[str] = []
+
+    class _Cfg:
+        def snapshot(self):
+            calls.append("model_config")
+            return object()
+
+    class _Up:
+        def token(self):
+            calls.append("upload_token")
+            return {"k": "v"}
+
+    obj.cfg = _Cfg()          # type: ignore[assignment]
+    obj.uploader = _Up()      # type: ignore[assignment]
+    Coordinator(obj, svc, owner="x")._prewarm()
+
+    assert calls == ["model_config", "upload_token"], "两样都要预热，且各一次"
+
+
+def test_prewarm_failure_never_breaks_startup(service, settings):
+    """预热是**优化**，绝不能成为启动的前提条件 —— 失败只告警。"""
+    from app.coordinator import Coordinator
+
+    svc = settings.replace(jimeng_sessionid="s", jimeng_cookie="")
+
+    class _Boom:
+        def snapshot(self):
+            raise RuntimeError("boom")
+
+        def token(self):
+            raise RuntimeError("boom")
+
+    obj = Service(svc, store=service.store, client=None, uploader=_Boom(), cfg=None)
+    obj.cfg = _Boom()          # type: ignore[assignment]
+    Coordinator(obj, svc, owner="x")._prewarm()      # 不该抛
+
+    # 没配置上游时整段跳过（省得在无凭据部署里空跑）
+    blank = settings.replace(jimeng_sessionid="", jimeng_cookie="")
+    obj2 = Service(blank, store=service.store, client=None, uploader=None, cfg=None)
+    Coordinator(obj2, blank, owner="x")._prewarm()   # 也不该抛
