@@ -198,7 +198,7 @@ Authorization: Bearer <key>
    `HIGH_AES_GENERAL_V50P_LARGE` 会被判「未知 model」。
 2. **只会落成 `jimeng-t2i`（文生图）** ⇒ **上游 key 不能用来选 i2i 的模型**（不能垫图）。
 3. **`v50p_large`（5.0 Pro）是收费档**：实测 **8 积分/张**（2026-09-20，
-   1:1 与 3:4 两种尺寸同价；账单按 `submit_id` 对上、余额差分吻合）。
+   1:1 / 3:4 / 16:9 三种尺寸同价；账单按 `submit_id` 对上、余额差分吻合）。
    Lite 下 t2i/i2i/hd 实测实扣 0。
 
 上游实际有 **9 个**模型：上表 7 个之外还有 **Seedream 3.0 / 3.1**
