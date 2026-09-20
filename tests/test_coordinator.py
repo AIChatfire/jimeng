@@ -812,3 +812,56 @@ def test_delete_still_requires_the_key(client, client_state,
 def test_list_still_requires_the_key(client, service):
     """🔴 **列表**不放宽 —— 否则可以拿 id 枚举别人的任务（id 本来就不可枚举）。"""
     assert client.get(BASE).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# 上传的限流退避（多张并发时"一张被限流 = 整批失败"的那个缺口）
+# ---------------------------------------------------------------------------
+
+def _a_blob(settings):
+    from app.media import load_one
+    return load_one(_data_uri(_PNGS[0]), settings)
+
+
+def test_transfer_one_retries_on_rate_limit(service, fake_uploader, monkeypatch,
+                                            settings):
+    """🔴 上传被限流要**退避重试**，而不是把整批垫图拖垮。
+
+    多张时走 `Executor.map` —— **任何一个异常都会冒泡**，
+    所以没有这一层的话，"某一张被限流"就等于**整单失败**。
+    """
+    calls = {"n": 0}
+    real = fake_uploader.upload
+
+    def flaky(data):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            raise JimengRateLimitError("限流", retry_after=0.01)
+        return real(data)
+
+    monkeypatch.setattr(fake_uploader, "upload", flaky)
+
+    uri, _notes, _size = service._transfer_one(_a_blob(settings))
+
+    assert calls["n"] == 2, f"应该重试一次后成功，实际调了 {calls['n']} 次"
+    assert uri, "重试成功后要拿到 uri"
+
+
+def test_transfer_one_does_not_retry_on_risk_control(service, fake_uploader,
+                                                     monkeypatch, settings):
+    """⚠️ 风控（`retryable=False`）**不许重试** —— 持续施压只会延长标记。
+
+    这条同样重要：把"别再打"当成"等会儿再打"，是能把账号打坏的反模式。
+    """
+    calls = {"n": 0}
+
+    def boom(data):
+        calls["n"] += 1
+        raise JimengRiskError("命中风控")
+
+    monkeypatch.setattr(fake_uploader, "upload", boom)
+
+    with pytest.raises(JimengRiskError):
+        service._transfer_one(_a_blob(settings))
+
+    assert calls["n"] == 1, f"风控不该重试，实际调了 {calls['n']} 次"
