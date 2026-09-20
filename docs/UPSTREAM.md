@@ -159,6 +159,34 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 实测：`high_aes_general_v50`（默认）张数 **1..8**（默认 4）；
 `high_aes_general_v50p_large` = **1..4**。
 
+### 模型枚举全表 —— **key ⇄ 面板名字**（2026-09-20 实时拉取，权威）
+
+面板上看到的名字与请求里的 `model_req_key` **不是一回事**，对照如下
+（`generate_count_options` 同时列上，因为张数直接乘积分）：
+
+| `model_req_key`（请求里传的） | 面板名字 | 张数选项 | 本服务是否登记 |
+|---|---|---|---|
+| `high_aes_general_v50p_large` | **Seedream 5.0 Pro** | **1..4** | ✅ |
+| `high_aes_general_v50` | **Seedream 5.0 Lite** | 1..8 | ✅（**默认**） |
+| `high_aes_general_v43` | Seedream 4.7 | 1..8 | ✅ |
+| `high_aes_general_v42` | Seedream 4.6 | 1..8 | ✅ |
+| `high_aes_general_v40l` | Seedream 4.5 | 1..8 | ✅ |
+| `high_aes_general_v41` | Seedream 4.1 | 1..8 | ✅ |
+| `high_aes_general_v40` | Seedream 4.0 | 1..8 | ✅ |
+| `high_aes_general_v30l_art_fangzhou:general_v3.0_18b` | Seedream 3.1 | —（未声明） | ❌ **未登记** |
+| `high_aes_general_v30l:general_v3.0_18b` | Seedream 3.0 | —（未声明） | ❌ **未登记** |
+
+⚠️ 三条（都实测过）：
+
+1. **key 大小写敏感**：`resolve()` 那条分支**不做小写化**，`HIGH_AES_...` 会被判未知 model。
+2. **key 只会落成文生图（t2i）** ⇒ **不能用它给 i2i 选模型**。
+3. 后两个 key **带冒号**（`:general_v3.0_18b`）且**未登记** ⇒ 传了会被拒；
+   要支持得先登记（并确认它们也能出图）。
+
+> 结论：**"5.0 Pro 怎么传" = `"model": "high_aes_general_v50p_large"`**（全小写、一字不差）。
+> ⚠️ Lite 是免费档（实测 t2i/i2i/hd 实扣 0），**Pro 的实扣从未测过** —— 按收费看待。
+
+
 ### 枚举值逐项复核（2026-09-20，与网页端面板对齐）
 
 **比例** —— `resolution_map[bucket].image_ratio_sizes` 是**数组**，
