@@ -1112,3 +1112,62 @@ def test_continue_is_capped_and_falls_back_to_repeats(client, client_state,
     assert len(body["data"]) == 3, "到顶后要退回补齐"
     degs = body.get("degradations") or []
     assert any("已续生成" in d and "重复" in d for d in degs), f"没写清续了几次：{degs}"
+
+
+def test_partial_45_triggers_continue_instead_of_waiting(client, client_state,
+                                                         fake_jimeng, fake_uploader,
+                                                         service, monkeypatch):
+    """🔴 `status=45`（部分成功）⇒ **立刻续生成**，而不是干等到 `TASK_TIMEOUT`。
+
+    实测（6 组对照）：`action=2` **只在这个状态被接受**；拿已完成（50）的任务去续
+    一律 `ret=1002`。这条同时锁住"4 张垫图卡 30 分钟"那个老问题不再回来 ——
+    原来 45 落到"未完成 ⇒ 只刷时间"那条路上，会一直等到 30 分钟看门狗。
+    """
+    from app.upstream.jimeng.client import GeneratedImage, TaskState
+
+    calls: list = []
+    _arm(fake_jimeng, monkeypatch, calls)
+    partial = TaskState(submit_id="upstream-submit-id", status=45,
+                        status_name="partial_success", finished=False, failed=False,
+                        history_record_id="44853559987980",
+                        total=4, finished_count=1)
+    partial.images = [GeneratedImage(url="https://cdn/a.png", width=1024, height=1024)]
+    fake_jimeng.states = [submitted_state(), partial]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=4)
+    _tick_until_terminal(client_state)
+
+    assert calls, "45（部分成功）就该续，而不是干等"
+    assert calls[0][0] == "44853559987980", "要带对 history_id"
+    rec = service.store.get(tid)
+    assert rec.status == "in_progress", f"续生成后应回 in_progress，实得 {rec.status}"
+    assert rec.continuations == 1
+    assert [im["url"] for im in rec.images] == ["https://cdn/a.png"], \
+        "半成品要留档，供后面合并"
+
+
+def test_partial_45_without_material_still_waits(client, client_state,
+                                                 fake_jimeng, fake_uploader,
+                                                 service, monkeypatch):
+    """⚠️ 没有续生成原料（缺草稿）时**不许硬造请求** —— 保持原行为继续等。
+
+    （否则就是拿一个必然失败的请求去刷上游。）
+    """
+    from app.upstream.jimeng.client import GeneratedImage, TaskState
+
+    calls: list = []
+    monkeypatch.setattr(
+        fake_jimeng, "continue_task",
+        lambda *a, **k: (calls.append(a), "cont-sid")[1], raising=False)
+    partial = TaskState(submit_id="upstream-submit-id", status=45,
+                        status_name="partial_success", finished=False, failed=False,
+                        history_record_id="44853559987980")
+    partial.images = [GeneratedImage(url="https://cdn/a.png", width=1024, height=1024)]
+    fake_jimeng.states = [submitted_state(), partial]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=4)   # 假客户端没有 last_draft
+    _tick_until_terminal(client_state)
+
+    assert not calls, f"没原料还硬发续生成请求：{calls}"
+    rec = service.store.get(tid)
+    assert rec.status in ("in_progress", "queued"), rec.status

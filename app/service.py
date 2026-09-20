@@ -674,11 +674,62 @@ class Service:
             return False
         return now - rec.updated_at >= self.settings.jimeng_poll_interval
 
+    def _continue_partial(self, rec: TaskRecord, st: Any) -> None:
+        """上游报 `status=45`（部分成功）时**立刻续生成**，而不是干等。
+
+        🔴 **为什么必须在这个状态调**：实测 `action=2` **只在"待补生成"态被接受**
+        （`status=45`/部分成功）。拿已完成（`50`）的任务去续一律 `ret=1002` ——
+        我为此做了 6 组对照实验（逐字草稿 / 未续过的 history / 沿用 submit_id /
+        补 query 参数）才定位到：**前四个假设全被"拿已完成任务去续"这个错前提误导**。
+
+        ⚠️ **这是计费动作** ⇒ 由调用方用 `CONTINUE_MAX` 封顶，且每次留痕。
+        ⚠️ **异步**：只提交 + 换上新 `submit_id` 放回 `in_progress`，让协调器照常轮询；
+        **绝不在这里同步等**（单并发下那会堵死协调器）。
+        """
+        have = [{"url": im.url, "width": im.width, "height": im.height,
+                 "format": im.format, "note": im.note} for im in st.images]
+        if rec.images:
+            seen = {im.get("url") for im in rec.images}
+            have = list(rec.images) + [im for im in have if im.get("url") not in seen]
+        want = rec.n or len(have)
+        hist = getattr(st, "history_record_id", None) or rec.upstream_history_id
+        if len(have) >= want or not hist or not rec.draft_json:
+            # 没有缺口 / 没有续生成原料 ⇒ 保持原行为（继续等），不硬造请求
+            self.store.patch(rec.task_id, updated_at=int(time.time()), images=have)
+            return
+        try:
+            sid = self.client.continue_task(hist, rec.draft_json)
+        except AdapterError as e:
+            self.store.patch(
+                rec.task_id, updated_at=int(time.time()), images=have,
+                degradations=list(rec.degradations) + [
+                    f"⚠️ 上游部分成功（45）后自动续生成失败（{e.err_type}）："
+                    f"{e.message}"])
+            return
+        n_used = (rec.continuations or 0) + 1
+        self.store.patch(
+            rec.task_id, status="in_progress", upstream_submit_id=sid,
+            images=have, continuations=n_used,
+            degradations=list(rec.degradations) + [
+                f"⚠️ 上游只完成 {len(have)} 张（请求 n={want}）⇒ 已自动续生成"
+                f"（第 {n_used}/{CONTINUE_MAX} 次，`action=2`）去取剩余的真图。"])
+        OBS.info("task continued", task_id=rec.task_id, model=rec.model,
+                 trigger="partial_45", continuations=n_used,
+                 have=len(have), want=want)
+
     def _advance(self, rec: TaskRecord, st: Any) -> None:
         """把一次查询结果落到任务上（终态收敛 / 未完成只刷时间）。"""
         if not st.finished:
-            # 只刷 updated_at：让"上次推进时间"反映真实进度，
-            # 也让 stale 扫描不会把正常轮询的任务误判成卡死。
+            # 🔴 **`status=45`（部分成功）不是"再等等"，而是上游在问"要不要继续"。**
+            # 实测 `action=2` **只在这个状态被接受**（拿已完成的任务去续一律 1002）；
+            # 所以要**在这里就续**，而不是干等到 `TASK_TIMEOUT`（30 分钟）——
+            # 那正是"4 张垫图卡 30 分钟"的成因。
+            if (st.status == 45 and st.images
+                    and (rec.continuations or 0) < CONTINUE_MAX):
+                self._continue_partial(rec, st)
+                return
+            # 其余未完成态：只刷 updated_at（让"上次推进时间"反映真实进度，
+            # 也让 stale 扫描不会把正常轮询的任务误判成卡死）。
             # ⚠️ 它同时是 ③ 轮询间隔的判据，所以这一步不能省。
             self.store.patch(rec.task_id, updated_at=int(time.time()))
             return
