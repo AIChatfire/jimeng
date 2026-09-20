@@ -89,6 +89,10 @@ class Capability:
     #: 视频端点只在 video 池里 —— 两条池子互不污染，
     #: 否则"不写 model"就会在 t2i / t2v 之间产生歧义。
     media: str = "image"
+    #: 🔴 True = 只能引用**已有产物**（source_task_id），不能凭空发起。
+    #: 默认推导必须排除它们（否则"不写 model"就会在 t2i/detail-fix 之间
+    #: 产生歧义 —— 那会让既有图片调用方突然 400）。
+    needs_source_ref: bool = False
     notes: str = ""
 
     @property
@@ -187,6 +191,19 @@ CAPABILITIES: tuple[Capability, ...] = (
               "Ark 方舟契约没有补帧概念 —— 该能力只在 /async/v1/videos 提供。",
     ),
     Capability(
+        key="jimeng:detail-fix", name="detail-fix", title="细节修复（SuperResolution）",
+        accepts_image=False, image_required=False, prompt_required=False,
+        jimeng_tool="detail", credits_measured=0, needs_source_ref=True,
+        notes="**只支持『引用形态』**：source_task_id 指向本服务一个已成功的"
+              "**图片**任务（引用其 item_id+origin_history_id，不带 origin_image）。"
+              "9-19 两次「单组件+origin_image」提交 generate_failed 且计费；"
+              "9-20 路 A 探针证实死因是 origin_image：引用形态**一次真跑成功**"
+              "（status=50，出图与源图同尺寸，UPSTREAM.md §9.1——勿回退）。"
+              "**免费**（UI 标价 + 实测零出账两证吻合）。"
+              "外部图片走不通：需先 t2i 生成再修复（source_from=link 无证据）。"
+              "直接贴 image 字段会被拒绝——没有证据支持它能过。",
+    ),
+    Capability(
         key="jimeng:omni-video", name="omni-video", title="全能参考视频（图/视频/音频）",
         accepts_image=True, image_required=False, prompt_required=True,
         credits_measured=None, media="video", max_images=4,
@@ -195,10 +212,10 @@ CAPABILITIES: tuple[Capability, ...] = (
               "视频/音频走 VOD 上传（ApplyUploadInner/CommitUploadInner → vid）。"
               "**计费口径（实抓解出）**：amount = 输出秒数 + Σ输入视频秒数"
               "（4s⇒4；5s+10.35s 输入⇒15.35；音频不计）。"
-              "⚠️ 输入视频时长服务端暂探测不到 ⇒ 预扣只按输出时长计并留痕，"
-              "实扣以上游结算为准。已实抓档位 720p×4s/5s。"
-              "提交侧已按实抓逐字段适配；**端到端实跑未验证**（15.35 积分级）。"
-              "Ark 门面的 image_url/video_url/audio_url 角色翻译到本能力。",
+              "输入视频时长由 VOD Duration 探测（✅真实验证）。"
+              "已实抓档位 720p×4s/5s。"
+              "提交侧已按实抓逐字段适配；Ark 门面的 image_url/video_url/"
+              "audio_url 角色翻译到本能力。",
     ),
 )
 
@@ -220,6 +237,7 @@ ALIASES: dict[str, str] = {
     "智能超清": "jimeng-pro-hd",
     "扩图": "jimeng-outpaint",
     "文生视频": "jimeng-t2v",
+    "细节修复": "jimeng-detail-fix",
     "视频": "jimeng-t2v",
     # 常见英文写法
     "text2image": "jimeng-t2i",
@@ -309,6 +327,7 @@ def resolve(model: str | None, *, has_image: bool,
     pool = "video" if video else "image"
     cands = [c for c in CAPABILITIES
              if c.media == pool
+             and not c.needs_source_ref          # 引用型能力不参与默认推导
              and c.accepts_image is has_image
              and not (has_image and not c.image_required)]
     if len(cands) == 1:
@@ -382,18 +401,7 @@ def catalog() -> list[dict]:
 
 
 #: 刻意缺席的能力 —— 出现在文档与门禁里，不出现在 catalog 里。
-DELIBERATE_ABSENCES: dict[str, str] = {
-    "jimeng-detail-fix": (
-        "细节修复（super_resolution）。9-19 两次「单组件+origin_image」提交都"
-        "generate_failed 且计费；9-20 路 A 探针证实**死因是 origin_image**："
-        "单组件 + item_id/origin_history_id（无 origin_image，引用账号已有作品）"
-        "一次真跑成功（status=50，出图与源图同尺寸，见 UPSTREAM.md §9.2）。"
-        "**免费**（UI 标价 + 实测零出账两证吻合）。"
-        "输入图不支持公网直链（source_from=link 无证据），外部图需三步："
-        "上传→生成→修复。**暂不注册**：对外契约如何引用已有作品待定"
-        "（可参考并行落地的 jimeng-vfi 用 source_task_id 引用本服务任务的形态）。"
-    ),
-}
+DELIBERATE_ABSENCES: dict[str, str] = {}
 
 
 __all__ = [

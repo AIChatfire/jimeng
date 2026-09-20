@@ -292,9 +292,11 @@ class FakeVod:
     def upload(self, data: bytes, **kw: Any) -> dict:
         self.uploads.append(data)
         return {"vid": self.vid, "store_uri": "tos-cn-v-fake/x",
+                "width": 480, "height": 360, "duration_ms": 5042,
                 "commit": {"Results": [{"Vid": self.vid,
                                         "VideoMeta": {"Width": 480,
-                                                      "Height": 360}}]}}
+                                                      "Height": 360,
+                                                      "Duration": 5.041667}}]}}
 
     def close(self) -> None:
         pass

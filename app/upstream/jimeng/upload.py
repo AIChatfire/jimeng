@@ -587,7 +587,14 @@ class VodUploader:
         if not vid:
             raise ImageXError(
                 f"CommitUploadInner 成功但拿不到 vid：{json.dumps(out, default=str)[:400]}")
-        return {"vid": vid, "store_uri": store_uri, "commit": out}
+        # VideoMeta（真实视频实测）：{Uri,Width,Height,Duration(秒,浮点),
+        # Bitrate,Md5,Format,Size,FileType,Codec} —— Duration 是全能参考
+        # 计费口径里「输入视频秒数」的唯一探测来源。
+        meta = ((out.get("Results") or [{}])[0].get("VideoMeta") or {})
+        duration_ms = int(round(float(meta.get("Duration") or 0) * 1000))
+        return {"vid": vid, "store_uri": store_uri, "commit": out,
+                "width": meta.get("Width"), "height": meta.get("Height"),
+                "duration_ms": duration_ms}
 
 
 def _unwrap_vod(r: httpx.Response, what: str) -> dict:

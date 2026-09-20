@@ -157,21 +157,47 @@ def test_submit_video_body_matches_capture():
 
 
 def test_parse_task_video_item():
+    """视频产物解析 —— 按 2026-09-20 真实回包形态（status=50 实抓）。"""
     node = {
         "task": {"status": 50, "submit_id": "sid"},
         "item_list": [{
-            "common_attr": {"id": "item-1"},
-            "video": {"video_url": "https://tos.example.com/v.mp4",
-                      "width": 1280, "height": 720, "format": "mp4"},
+            "common_attr": {"id": ITEM_ID},
+            "video": {
+                "video_id": "v02870realvid0001",
+                "duration": 4, "duration_ms": 4000, "has_audio": False,
+                "transcoded_video": {
+                    "360p": {"vid": "t1", "fps": 24, "width": 640,
+                             "height": 360, "video_url": "https://cdn/360.mp4"},
+                    "720p": {"vid": "t2", "fps": 24, "width": 1280,
+                             "height": 720, "video_url": "https://cdn/720.mp4"},
+                },
+            },
         }],
     }
     st = parse_task("sid", node)
     assert st.ok
     assert len(st.images) == 1
-    assert st.images[0].url == "https://tos.example.com/v.mp4"
-    assert st.images[0].width == 1280
-    # 未实抓验证的解析必须留痕（产物上如实标注）
-    assert st.images[0].note
+    # 取**最高分辨率**档的下载 URL
+    assert st.images[0].url == "https://cdn/720.mp4"
+    assert st.images[0].width == 1280 and st.images[0].height == 720
+    assert st.images[0].vid == "v02870realvid0001"
+    assert st.images[0].item_id == ITEM_ID
+    assert st.images[0].duration_ms == 4000
+
+
+def test_parse_task_video_item_takes_highest_transcode():
+    node = {
+        "task": {"status": 50},
+        "item_list": [{
+            "video": {"video_id": "v1", "duration_ms": 4000,
+                      "transcoded_video": {
+                          "360p": {"width": 640, "height": 360,
+                                   "video_url": "https://cdn/lo.mp4"}}},
+        }],
+    }
+    st = parse_task("sid", node)
+    assert st.ok
+    assert st.images[0].url == "https://cdn/lo.mp4"
 
 
 def test_parse_task_video_without_url_is_not_success_payload():
@@ -637,7 +663,72 @@ def test_omni_end_to_end(app_and_client, fake_jimeng, fake_uploader,
     assert mats[0]["uri"].startswith("tos-cn-i-")     # 图片走 ImageX（假上传器）
     assert fake_uploader.uploads and fake_vod.uploads  # 两条上传链都走到了
     assert mats[1]["uri"].startswith("v0")            # VOD vid
+    assert mats[1]["duration_ms"] == 5042             # VOD Duration 探测
     assert call["duration_ms"] == 5000
-    # 输入视频时长探测不到 ⇒ 降级留痕（计费口径偏差必须可见）
-    rec = client_state.service.store.get(task_id)
-    assert any("输入视频时长" in d for d in rec.degradations)
+    # 🔴 计费：amount = 5s 输出 + 5.042s 输入视频（音频不计）
+    assert call["input_video_s"] == 5.04
+
+
+# ---------------------------------------------------------------------------
+# 细节修复（jimeng-detail-fix：引用形态，与补帧同构）
+# ---------------------------------------------------------------------------
+
+
+def _image_ok_state() -> TaskState:
+    """成功的图片任务产物（带 item_id，供引用）。"""
+    st = TaskState(submit_id="up-submit-img", status=50, status_name="success",
+                   finished=True, failed=False, cost=0)
+    st.images = [GeneratedImage(url="https://tos.example.com/a.png",
+                                width=2048, height=2048, format="png",
+                                item_id="7687568450923007257")]
+    st.history_record_id = "44903636599052"
+    return st
+
+
+def test_detail_fix_end_to_end(app_and_client, fake_jimeng, client_state):
+    """图片任务成功 → source_task_id 引用修复：edit 收到 item 引用三件套。"""
+    _, client, _ = app_and_client
+    fake_jimeng.states = [_image_ok_state()]
+    r = client.post("/async/v1/images/generations", headers=AUTH,
+                    json={"model": "jimeng-t2i", "prompt": "一只猫"})
+    src_id = r.json()["task_id"]
+    for _ in range(2):
+        client_state.coordinator.tick()
+    src = client_state.service.store.get(src_id)
+    assert src.status == "success"
+    assert src.images[0]["item_id"] and src.upstream_history_id
+
+    # 细节修复：不带 model（source_task_id 即路由）、不带 image（引用形态）
+    fake_jimeng.states = [_image_ok_state()]
+    r2 = client.post("/async/v1/images/generations", headers=AUTH,
+                     json={"source_task_id": src_id})
+    assert r2.status_code == 202, r2.text
+    rec = client_state.service.store.get(r2.json()["task_id"])
+    assert rec.model == "jimeng-detail-fix"
+    client_state.coordinator.tick()
+    call = fake_jimeng.of("edit")[0]
+    assert call["tool"] == "detail"
+    assert call["item_id"] == 7687568450923007257      # 数字形态
+    assert call["origin_history_id"] == 44903636599052
+    assert not call.get("image_uri") and not call.get("image_url")
+    rec0 = client_state.service.store.get(r2.json()["task_id"])
+    assert rec0 is not None and rec0.upstream_submit_id
+
+
+def test_detail_fix_requires_source_and_rejects_image(client):
+    """无 source_task_id ⇒ 400；贴 image（origin_image 形态）⇒ 400。"""
+    r = client.post("/async/v1/images/generations", headers=AUTH,
+                    json={"model": "jimeng-detail-fix"})
+    assert r.status_code == 400
+    assert "source_task_id" in r.json()["error"]["message"]
+    r = client.post("/async/v1/images/generations", headers=AUTH,
+                    json={"model": "jimeng-detail-fix", "source_task_id": "x",
+                          "image": ["https://x/a.png"]})
+    assert r.status_code == 400
+
+
+def test_detail_fix_default_routing_kept_t2i(client):
+    """🔴 回归门禁：图片端点不带 model、不带 source_task_id ⇒ 仍是 t2i。"""
+    r = client.post("/async/v1/images/generations", headers=AUTH,
+                    json={"prompt": "x"})
+    assert r.status_code == 202

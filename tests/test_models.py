@@ -93,13 +93,14 @@ def test_non_image_capability_with_image_is_400():
 def test_catalog_hides_deliberately_absent_capabilities():
     """「不制造假能力」：实测会失败的能力不许出现在清单里。"""
     ids = {m["id"] for m in catalog()}
-    assert "jimeng-detail-fix" not in ids
-    assert "jimeng-detail-fix" in DELIBERATE_ABSENCES, "缺席必须被显式记录，不是忘了"
-    # 五个已端到端验证过的能力都在；jimeng-t2v / jimeng-vfi 是"已适配、
-    # 未端到端实跑"（notes 里如实写明，见 test_video.py）
+    # jimeng-detail-fix 曾在此列表（两次 origin_image 形态失败）；
+    # 2026-09-20 引用形态真跑成功后**转正**（免费，两证吻合）。
+    assert DELIBERATE_ABSENCES == {}, "缺席必须被显式记录，不是忘了"
+    # 五个已端到端验证过的能力都在；t2v/vfi/omni/detail-fix 见各自 notes
     assert ids == {c.api_id for c in CAPABILITIES}
-    assert len(ids) == 8
-    assert {"jimeng-t2v", "jimeng-vfi", "jimeng-omni-video"} <= ids
+    assert len(ids) == 9
+    assert {"jimeng-t2v", "jimeng-vfi", "jimeng-omni-video",
+            "jimeng-detail-fix"} <= ids
 
 
 def test_detail_fix_tool_description_is_kept_for_future_investigation():

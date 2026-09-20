@@ -426,6 +426,8 @@ class GeneratedImage:
     item_id: str | None = None
     #: 视频 item 的 `vid`（补帧 v2v_opt 与 video_ref_params 都要引用它）
     vid: str | None = None
+    #: 视频时长（毫秒，来自 `video.duration_ms`）
+    duration_ms: int | None = None
     note: str | None = None
 
 
@@ -496,22 +498,31 @@ def parse_task(submit_id: str, node: dict) -> TaskState:
     st.cost = _pick(node, "forecast_generate_cost")
 
     for it in (node.get("item_list") or []):
-        # ---- 视频产物（t2v/i2v）：item 里带的是 `video` 而不是 `image` ----
-        # ⚠️ **回包结构未实抓验证**（2026-09-20 只抓到了提交侧与查询请求侧）。
-        # 这里按站点通用 item 形态做**尽力而为**解析，并在产物上如实标注；
-        # 解析不到视频 URL 时按"没有产物"处理（零产物 = 失败，不会伪装成功）。
-        vid = it.get("video")
-        if isinstance(vid, dict):
-            url = (vid.get("video_url")
-                   or next((u for u in (vid.get("video_url_list") or [])
-                            if isinstance(u, str) and u), None))
+        # ---- 视频产物（t2v/vfi）：item 里带的是 `video` 而不是 `image` ----
+        # ✅ 2026-09-20 真实回包实抓验证（t2v status=50）：
+        #   `video.video_id` 是 vid；**下载 URL 在 `video.transcoded_video`
+        #   里按分辨率分档**（如 "360p": {vid, fps, width, height,
+        #   video_url}）—— 取 width 最大的那档。
+        vid_node = it.get("video")
+        if isinstance(vid_node, dict):
+            vid = vid_node.get("video_id")
+            trans = vid_node.get("transcoded_video") or {}
+            best = None
+            for v in trans.values():
+                if isinstance(v, dict) and v.get("video_url"):
+                    if best is None or (v.get("width") or 0) > \
+                            (best.get("width") or 0):
+                        best = v
+            url = (best or {}).get("video_url")
             if url:
                 st.images.append(GeneratedImage(
-                    url=url, width=vid.get("width"), height=vid.get("height"),
-                    format=vid.get("format"),
+                    url=url, width=best.get("width"),
+                    height=best.get("height"),
+                    format="mp4",
                     item_id=(it.get("common_attr") or {}).get("id"),
-                    vid=vid.get("vid"),
-                    note="视频产物（解析自 item.video；该回包结构未实抓验证）",
+                    vid=vid,
+                    duration_ms=vid_node.get("duration_ms"),
+                    note=None,
                 ))
                 continue
         img = it.get("image") or {}
@@ -955,8 +966,9 @@ DEFAULT_VFI_TARGET_FPS = 60
 DEFAULT_VFI_ORIGIN_FPS = 24
 
 
-def build_video_vfi_draft(source_draft: str, *, prompt: str, vid: str,
-                          origin_history_id: str | int, item_id: str | int,
+def build_video_vfi_draft(source_draft: str | None, *, prompt: str, vid: str,
+                          origin_history_id: str | int | None = None,
+                          item_id: str | int | None = None,
                           resolution: str = DEFAULT_VIDEO_RESOLUTION,
                           duration_ms: int = 4000,
                           origin_fps: int = DEFAULT_VFI_ORIGIN_FPS,
@@ -965,49 +977,81 @@ def build_video_vfi_draft(source_draft: str, *, prompt: str, vid: str,
                           metrics: dict[str, Any] | None = None) -> str:
     """构造**视频补帧**（`scene: "insert_frame"`）的 `draft_content`。
 
-    结构逐字段照抄 2026-09-20 实抓。与 t2v 草稿的关键差异：
+    两种形态（均有真跑实证，2026-09-20）：
 
-    · **两个组件**：父组件 = 源视频任务的 t2v 组件**原样重放**
-      （实抓里连组件 id / created_time 都没变 —— UI 是整份工作区草稿重发），
-      所以本函数**必须**拿到源任务的 `draft_json`，拿不到就拒绝；
-    · 子组件带 `parent_id`（挂到父组件下）、`process_type: 3`、
-      `gen_video.scene: "insert_frame"`、`video_ref_params`
-      （`item_id` + `origin_history_id`，**数字**形态 —— 注意
-      `video_gen_inputs` 里的 `origin_history_id` 是**字符串**形态）；
-    · 子组件 `video_gen_inputs[0]` 额外带 `vid`（源视频播放 id）、
-      `lens_motion_type ""`、`motion_speed ""`、`template_id 0`、
-      `v2v_opt.insert_frame {enable, target_fps, origin_fps, duration_ms}`
-      —— 实抓里 insert 的 duration_ms 是 4097（源视频**实际**时长，略大于
-      请求的 4000）；我们没有源视频实际时长，默认取请求时长并**留痕由调用方
-      说明**。子组件**没有 seed / video_aspect_ratio / model_req_key / priority**。
+    · **产物补帧**（`source_draft` 给出）：双组件 —— 父 = 源 t2v 组件**原样
+      重放**（实抓连组件 id/created_time 都没变）+ 子带 `parent_id`、
+      `process_type: 3`、`video_ref_params{item_id, origin_history_id}`
+      （inputs 里 origin_history_id 是**字符串**、ref_params 里是**数字**）；
+    · **本地视频补帧**（`source_draft=None`）：✅ 真跑实证支持！**单组件、
+      无 `video_ref_params`、无 origin_history_id**，只有 `vid` ——
+      本地/外部视频经 VOD 上传拿 vid 后即可补帧（72s 出片成功）。
+
+    其它差异（两种形态同）：`min_version "3.1.0"`、子组件带 `scene:
+    "insert_frame"`、`v2v_opt.insert_frame{enable,target_fps,origin_fps,
+    duration_ms}`、`vid`/`lens_motion_type ""`/`motion_speed ""`/
+    `template_id 0`；**没有 seed / video_aspect_ratio / model_req_key /
+    priority**。insert 的 duration_ms 实抓里是源视频**实际**时长（4097>4000）；
+    默认取请求时长。
     """
     if not prompt or not prompt.strip():
-        raise JimengParamError("prompt 不能为空（补帧沿用源任务的提示词）", code=1001)
-    if not vid or not origin_history_id or not item_id:
-        raise JimengParamError(
-            "补帧需要源视频的三件引用：vid / origin_history_id / item_id"
-            "（来自源任务的历史记录；本服务通过 source_task_id 自动取）",
-            code=1001)
-    try:
-        source = json.loads(source_draft)
-    except (TypeError, ValueError) as e:
-        raise JimengParamError(f"源草稿不是合法 JSON：{e}", code=1001) from e
-    comps = source.get("component_list") if isinstance(source, dict) else None
-    if (not isinstance(comps, list) or not comps
-            or comps[0].get("generate_type") != "gen_video"):
-        raise JimengParamError(
-            "源草稿不是视频任务草稿（component_list[0].generate_type != gen_video）"
-            "—— 补帧只能引用视频产物。", code=1001)
-
+        raise JimengParamError("prompt 不能为空（补帧必填）", code=1001)
+    if not vid:
+        raise JimengParamError("补帧需要源视频 vid（VOD 上传产物）", code=1001)
+    has_source = origin_history_id is not None and item_id is not None
+    if has_source:
+        if not source_draft:
+            raise JimengParamError(
+                "产物补帧需要源任务的 draft_json（父组件原样重放）", code=1001)
+        try:
+            source = json.loads(source_draft)
+        except (TypeError, ValueError) as e:
+            raise JimengParamError(f"源草稿不是合法 JSON：{e}", code=1001) from e
+        comps = source.get("component_list") if isinstance(source, dict) else None
+        if (not isinstance(comps, list) or not comps
+                or comps[0].get("generate_type") != "gen_video"):
+            raise JimengParamError(
+                "源草稿不是视频任务草稿（component_list[0].generate_type != gen_video）"
+                "—— 补帧只能引用视频产物。", code=1001)
     video_task_extra = json.dumps(metrics or {}, ensure_ascii=False,
                                   separators=(",", ":"))
     child_id = _uid()
-    parent = comps[0]
-    child = {
+    inp: dict[str, Any] = {
+        "type": "", "id": _uid(),
+        "min_version": "3.0.5",
+        "prompt": prompt,
+        "lens_motion_type": "",
+        "motion_speed": "",
+        "vid": vid,
+        "video_mode": 2,
+        "fps": origin_fps,
+        "duration_ms": duration_ms,
+        "template_id": 0,
+        "v2v_opt": {
+            "type": "", "id": _uid(),
+            "min_version": "3.1.0",
+            "insert_frame": {
+                "type": "", "id": _uid(),
+                "enable": True,
+                "target_fps": target_fps,
+                "origin_fps": origin_fps,
+                "duration_ms": insert_duration_ms or duration_ms,
+            },
+        },
+        "resolution": resolution,
+        "idip_meta_list": [],
+    }
+    gen: dict[str, Any] = {
+        "type": "", "id": _uid(),
+        "text_to_video_params": {"type": "", "id": _uid(),
+                                 "video_gen_inputs": [inp]},
+        "scene": "insert_frame",
+        "video_task_extra": video_task_extra,
+    }
+    child: dict[str, Any] = {
         "type": "video_base_component",
         "id": child_id,
         "min_version": "1.0.0",
-        "parent_id": parent.get("id"),
         "aigc_mode": "workbench",
         "metadata": {
             "type": "", "id": _uid(), "created_platform": 3,
@@ -1015,52 +1059,22 @@ def build_video_vfi_draft(source_draft: str, *, prompt: str, vid: str,
             "created_time_in_ms": str(_now_ms()), "created_did": "",
         },
         "generate_type": "gen_video",
-        "abilities": {
-            "type": "", "id": _uid(),
-            "gen_video": {
-                "type": "", "id": _uid(),
-                "text_to_video_params": {
-                    "type": "", "id": _uid(),
-                    "video_gen_inputs": [{
-                        "type": "", "id": _uid(),
-                        "min_version": "3.0.5",
-                        "prompt": prompt,
-                        "lens_motion_type": "",
-                        "motion_speed": "",
-                        "vid": vid,
-                        "video_mode": 2,
-                        "fps": origin_fps,
-                        "duration_ms": duration_ms,
-                        "template_id": 0,
-                        "v2v_opt": {
-                            "type": "", "id": _uid(),
-                            "min_version": "3.1.0",
-                            "insert_frame": {
-                                "type": "", "id": _uid(),
-                                "enable": True,
-                                "target_fps": target_fps,
-                                "origin_fps": origin_fps,
-                                "duration_ms": insert_duration_ms or duration_ms,
-                            },
-                        },
-                        "origin_history_id": str(origin_history_id),
-                        "resolution": resolution,
-                        "idip_meta_list": [],
-                    }],
-                },
-                "scene": "insert_frame",
-                "video_task_extra": video_task_extra,
-                "video_ref_params": {
-                    "type": "", "id": _uid(),
-                    "generate_type": 0,
-                    "item_id": int(item_id) if str(item_id).isdigit() else item_id,
-                    "origin_history_id": int(origin_history_id)
-                    if str(origin_history_id).isdigit() else origin_history_id,
-                },
-            },
-        },
+        "abilities": {"type": "", "id": _uid(), "gen_video": gen},
         "process_type": 3,
     }
+    if has_source:
+        inp["origin_history_id"] = str(origin_history_id)
+        gen["video_ref_params"] = {
+            "type": "", "id": _uid(),
+            "generate_type": 0,
+            "item_id": int(item_id) if str(item_id).isdigit() else item_id,
+            "origin_history_id": int(origin_history_id)
+            if str(origin_history_id).isdigit() else origin_history_id,
+        }
+        child["parent_id"] = comps[0].get("id")  # type: ignore[union-attr]
+        component_list = [comps[0], child]       # 父组件**原样**重放
+    else:
+        component_list = [child]                 # 本地视频：单组件
     draft = {
         "type": "draft",
         "id": _uid(),
@@ -1069,7 +1083,7 @@ def build_video_vfi_draft(source_draft: str, *, prompt: str, vid: str,
         "is_from_tsn": True,
         "version": DA_VERSION,
         "main_component_id": child_id,
-        "component_list": [parent, child],   # 父组件**原样**重放
+        "component_list": component_list,
     }
     return json.dumps(draft, ensure_ascii=False, separators=(",", ":"))
 
@@ -1553,8 +1567,10 @@ class JimengClient:
 
     # ------------------------------------------------------------ 视频补帧
 
-    def submit_video_vfi(self, source_draft: str, *, prompt: str, vid: str,
-                         origin_history_id: str | int, item_id: str | int,
+    def submit_video_vfi(self, source_draft: str | None, *, prompt: str,
+                         vid: str,
+                         origin_history_id: str | int | None = None,
+                         item_id: str | int | None = None,
                          resolution: str = DEFAULT_VIDEO_RESOLUTION,
                          duration_ms: int = 4000,
                          origin_fps: int = DEFAULT_VFI_ORIGIN_FPS,
@@ -1563,20 +1579,13 @@ class JimengClient:
                          source_item_id: str | int | None = None,
                          submit_id: str | None = None,
                          dry_run: bool = False) -> str:
-        """提交一个**视频补帧**任务，返回 `submit_id`（计费动作）。
+        """提交一个**视频补帧**任务，返回 `submit_id`（计费动作，实抓 amount=0）。
 
-        形态逐字段照抄 2026-09-20 实抓（insert_frame，amount=0 免费档）。
-        与 t2v 的差异：
-
-        · 草稿是**两个组件**（父 = 源 t2v 草稿原样重放 + 子 = 补帧组件），
-          `source_draft` 必须是源视频任务的 `draft_json`；
-        · `metrics_extra` 是 click 形态（`promptSource "custom"`、
-          **没有** `position`/`aiFeatureName`/`hasRejectedAudit`），
-          且 `originSubmitId`/`previewSubmitId` 指向**源任务**的 submit_id、
-          `originId` 指向源视频的 item_id；
-        · sceneOptions 多一个 `{"scene": "VideoFrameInterpolation"}` 条目。
-
-        `dry_run=True` 时**不发任何请求**，只走完构造。
+        两种形态（均真跑实证）：
+        · `source_draft` + 三件引用：产物补帧（父组件重放形态）；
+        · `source_draft=None`：**本地/外部视频补帧** —— vid 由 VodUploader
+          上传获得，单组件形态，72s 真跑出片。
+        `dry_run=True` 时**不发任何请求**。
         """
         if duration_ms <= 0 or duration_ms % 1000:
             raise JimengParamError(
