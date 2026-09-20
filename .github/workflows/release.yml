@@ -169,9 +169,12 @@ jobs:
           git add app/__init__.py
           TAG='${{ needs.resolve.outputs.tag }}'
           git commit -m "chore(release): ${TAG} [skip release]"
-          # 并发 push 兜底：rebase 后再推，sha 以 rebase 后为准
+          # 并发 push 兜底：rebase 后再推，sha 以 rebase 后为准。
+          # 🔴 checkout 按 sha 检出是 detached HEAD —— 本地没有叫 main 的分支，
+          #    `git push origin main` 会报 src refspec does not match any（首跑实测），
+          #    必须推 HEAD:main。
           git pull --rebase origin main
-          git push origin main
+          git push origin HEAD:main
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   # --------------------------------------------------------------- test
@@ -209,7 +212,9 @@ jobs:
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pytest
+          # requirements-dev 自带 pytest/ruff/pyyaml —— ruff 与 yaml 都是**接线门禁**，
+          # 缺了用例会失败而不是跳过（首跑就是被这两个缺的）
+          pip install -r requirements-dev.txt
 
       - name: Run tests
         run: python -m pytest -q
@@ -217,7 +222,12 @@ jobs:
   # ----------------------------------------------------- build-and-push
   build-and-push:
     needs: [resolve, bump, test]
-    if: ${{ needs.resolve.outputs.mode != 'skip' && needs.test.result == 'success' }}
+    # bump 失败必须拦下构建（auto 模式下镜像里会是没 bump 的旧版本号）；
+    # tag 模式下 bump 是 skipped，属正常。显式 if 会整体替换默认的 success() 门禁，
+    # 所以这里要把 skipped 放行、failure 拦住。
+    if: >-
+      ${{ needs.resolve.outputs.mode != 'skip' && needs.test.result == 'success'
+          && (needs.bump.result == 'skipped' || needs.bump.result == 'success') }}
     runs-on: ubuntu-latest
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
@@ -263,15 +273,7 @@ jobs:
             || { echo "::error::三个 tag 不是同一镜像"; exit 1; }
           echo "three tags = one image: ${ID1}"
 
-      - name: Push
-        run: |
-          set -euo pipefail
-          IMAGE='${{ steps.img.outputs.image }}'
-          docker push "${IMAGE}:${VERSION}"
-          docker push "${IMAGE}:latest"
-          docker push "${IMAGE}:sha-${SHA}"
-
-      # ------- 冒烟：镜像要能起、要连得上库、鉴权要真的接线 -------
+      # ------- 冒烟（先于 Push：冒烟不过，镜像不上 GHCR）-------
       - name: Smoke test
         run: |
           set -euo pipefail
@@ -334,11 +336,21 @@ jobs:
           [ "$OV" = "${VERSION}" ] || { echo "::error::openapi 版本 ${OV} != ${VERSION}"; exit 1; }
           echo "smoke OK: healthz/readyz/401/404/version=${VERSION}"
 
+      - name: Push (only after smoke passed)
+        run: |
+          set -euo pipefail
+          IMAGE='${{ steps.img.outputs.image }}'
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:sha-${SHA}"
+
   # --------------------------------------------------------------- release
   # 镜像已在手上 ⇒ 现在才打 tag / 建 Release（顺序换过来会有"有 tag、没镜像"半成品）。
   release:
     needs: [resolve, bump, build-and-push]
-    if: ${{ needs.resolve.outputs.mode != 'skip' && needs.build-and-push.result == 'success' }}
+    if: >-
+      ${{ needs.resolve.outputs.mode != 'skip' && needs.build-and-push.result == 'success'
+          && (needs.bump.result == 'skipped' || needs.bump.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
