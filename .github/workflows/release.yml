@@ -322,15 +322,17 @@ jobs:
           curl -fsS http://127.0.0.1:8200/healthz | grep -q '"status":"ok"'
           rcode=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8200/readyz)
           [ "$rcode" = 200 ] || { echo "::error::readyz=${rcode}（库或凭据没接通）"; exit 1; }
-          # ③ 鉴权真的接线：无 key → 401（本地拦截，不发上游）
-          nocode=$(curl -s -o /dev/null -w '%{http_code}' \
-            http://127.0.0.1:8200/async/v1/images/generations/smoke-nonexistent)
-          [ "$nocode" = 401 ] || { echo "::error::无 key 竟得 ${nocode}，鉴权没接线"; exit 1; }
-          # ④ 有 key + 不存在的任务 → 404 task_not_found（同样本地完成）
+          # ③ 创建必须鉴权：无 key + 合法请求体 → 401（本地拦截，不发上游；
+          #    请求体给合法值，排除 422 先于 401 的参数校验干扰）
+          nocode=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' -d '{"prompt":"smoke","n":1}' \
+            http://127.0.0.1:8200/async/v1/images/generations)
+          [ "$nocode" = 401 ] || { echo "::error::无 key 创建竟得 ${nocode}，鉴权没接线"; exit 1; }
+          # ④ GET 按 task_id 查询**刻意不鉴权**（task_id 本身就是凭据，见 main.py）：
+          #    不存在 → 404 task_not_found（本地拦，不发上游）
           kcode=$(curl -s -o /dev/null -w '%{http_code}' \
-            -H 'Authorization: Bearer sk-smoke-key-000000000000' \
             http://127.0.0.1:8200/async/v1/images/generations/smoke-nonexistent)
-          [ "$kcode" = 404 ] || { echo "::error::带 key 查不存在任务得 ${kcode}（期望 404）"; exit 1; }
+          [ "$kcode" = 404 ] || { echo "::error::查不存在任务得 ${kcode}（期望 404）"; exit 1; }
           # ⑤ openapi 版本 = 发布版本（run 期证据，与镜像内常量双确认）
           OV=$(curl -fsS http://127.0.0.1:8200/openapi.json | python3 -c "import sys,json;print(json.load(sys.stdin)['info']['version'])")
           [ "$OV" = "${VERSION}" ] || { echo "::error::openapi 版本 ${OV} != ${VERSION}"; exit 1; }
