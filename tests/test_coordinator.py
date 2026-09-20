@@ -727,20 +727,22 @@ def _capture_warnings(fn):
         logger.remove(sink_id)
     return got
 
-def test_credits_warning_fires_for_billed_capability(client, client_state,
-                                                     fake_jimeng, fake_uploader):
-    """🔴 **实测会扣分的能力**，任务成功时必须有一条 WARNING（别等翻账单才发现）。
+def test_credits_warning_fires_for_unmeasured_capability(client, client_state,
+                                                         fake_jimeng, fake_uploader):
+    """🔴 **实扣未实测的能力**，任务成功时必须有一条 WARNING（别等翻账单才发现）。
 
-    `jimeng-i2i` 的实测价是 12（按 `submit_id` 对账得来）⇒ 必须告警。
+    ⚠️ 这条原先拿 `jimeng-i2i` 当例子（我当时按一条 `amount=12` 的消耗记录把它记成
+    "实扣 12"），但**账号所有者确认 i2i 实际也免费** ⇒ 它已改为 `credits_measured=0`
+    （不告警）。于是"要告警"的样本换成 **`jimeng-pro-hd`（未测 ⇒ 无法排除扣费 ⇒ 报）**。
     """
     fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
     prod = ("https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/"
             + "7" * 32 + "~tplv-x.png?sig=1")
-    _create(client, model="jimeng-i2i", prompt="x", image=[prod])
+    _create(client, model="jimeng-pro-hd", image=[prod])
 
     msgs = _capture_warnings(lambda: _tick_until_terminal(client_state))
 
-    assert any("credits consumed" in m for m in msgs), f"会扣分的任务没有告警：{msgs}"
+    assert any("credits consumed" in m for m in msgs), f"未实测能力的任务没有告警：{msgs}"
 
 
 def test_credits_warning_is_silent_for_measured_free_capability(

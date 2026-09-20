@@ -121,6 +121,7 @@ def test_every_capability_has_measured_credits_where_claimed():
         assert c.credits_measured >= 0, f"{c.api_id} 的实测价不能为负"
     # 实测免费的能力要**如实报 0**（而不是 None、也不是编一个数）
     free = [c.name for c in CAPABILITIES if c.credits_measured == 0]
-    assert "t2i" in free and "hd" in free, f"Lite 上实测免费的应如实报 0，实得 {free}"
+    assert {"t2i", "i2i", "hd"} <= set(free), \
+        f"Lite 上实测免费的应如实报 0，实得 {free}"
     for c in CAPABILITIES:
         assert c.notes, f"{c.api_id} 缺少依据说明"

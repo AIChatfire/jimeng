@@ -103,7 +103,13 @@ CAPABILITIES: tuple[Capability, ...] = (
     Capability(
         key="jimeng:i2i", name="i2i", title="图生图（blend）",
         accepts_image=True, image_required=True, prompt_required=True,
-        jimeng_tool="blend", credits_measured=12,
+        #: 🔴 2026-09-20 用户（账号所有者）确认：**i2i 实际也是免费的**。
+        #: 我先前按一条消耗记录（09-20 11:05，`amount=12`，`submit_id` 对得上）
+        #: 把它标成 12 —— **那是错的**，已更正为 0。
+        #: ⚠️ 证据确有冲突（那条记录真实存在），可能是**免费期开始前**的调用、
+        #: 或属于别的计费口径。**以账号所有者的口径为准**，但冲突本身记在这里，
+        #: 免得后人再看到那条记录又改回去。
+        jimeng_tool="blend", credits_measured=0,
         #: blend 是**唯一**原生用「列表」承载输入图的能力：
         #: 草稿里是 `abilities.blend.ability_list[0].image_uri_list`（列表）
         #: 与 `image_list`（列表）—— 所以多张垫图就是往这两个列表里多放元素，
