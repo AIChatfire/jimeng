@@ -61,6 +61,7 @@ from .upstream.jimeng import (
     parse_size,
 )
 from .upstream.jimeng.capabilities import ModelConfigCache
+from .upstream.jimeng.client import CODES_SECURITY
 
 log = logging.getLogger(__name__)
 
@@ -875,13 +876,24 @@ class Service:
 
     @staticmethod
     def _terminal_error(st: Any) -> AdapterError:
-        """上游任务到终态但**失败** —— 这是"被接受≠能跑通"的落点。"""
+        """上游任务到终态但**失败** —— 这是"被接受≠能跑通"的落点。
+
+        🔴 **内容审核不能只看 `status`。** 实测（用户抓包）：
+        `status=30`（通用的"生成失败"）+ `fail_code=2038`（`InputTextRisk`）才是真因，
+        `fail_starling_message` = "你输入的文字不符合平台规则，请修改后重试"。
+
+        只看 `status`（原先只判 `10/40`）会把它归成 `UpstreamUnavailableError`
+        ⇒ 调用方以为"上游故障、可以重试"，而它**必然再被拒**（还可能每次都计费）。
+        """
         reason = st.failed_reason or st.status_name
         code = st.status
-        if code in (10, 40):
+        fc = getattr(st, "fail_code", None)
+        if code in (10, 40) or fc in CODES_SECURITY:
+            detail = f"，fail_code={fc}" if fc else ""
             return ContentPolicyError(
-                f"上游送审未通过（status={code} {st.status_name}）：{reason}。"
-                f"换个 prompt 或换张输入图重试。", upstream="jimeng")
+                f"内容审核未通过（status={code} {st.status_name}{detail}）：{reason}。"
+                f"换个 prompt 或换张输入图重试 —— **原样重试没有意义**。",
+                upstream="jimeng")
         return UpstreamUnavailableError(
             f"上游生成失败（status={code} {st.status_name}）：{reason}。"
             f"⚠️ 该任务**已被上游计费**（详见积分消耗）。",

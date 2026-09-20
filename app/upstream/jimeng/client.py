@@ -152,6 +152,14 @@ CODES_RISK = frozenset({1018, 1019, 1021, 2035, 2038, 2039,       # 重试会加
                         2041, 2042, 2043})
 CODES_CONTENT = frozenset({1063, 1159, 2003, 2004, 2005,          # 内容审核/版权
                            2048, 2050})
+
+#: 🔴 **终态**的内容/安全拦截码 —— 与提交期的 `CODES_RISK` 不是一回事：
+#: 那些是"退避再试"，这些是"这次结果被平台拒了，**换 prompt / 换图才有用**"。
+#: 实测 `status=30` + `fail_code=2038`（InputTextRisk，
+#: `fail_starling_message` = "你输入的文字不符合平台规则，请修改后重试"）就属此类 ——
+#: 只看 status 会把它归成"上游故障"，调用方会去重试一个必然再被拒的请求。
+CODES_SECURITY = frozenset({1063, 1159, 2003, 2004, 2005, 2038, 2039, 2041,
+                            2042, 2043, 2048, 2050})
 CODES_PARAM = frozenset({1001, 1002, 1161, 1162, 1190, 1189, 3021, 4003,
                          4010, 2203, 2204})
 
@@ -427,6 +435,10 @@ class TaskState:
     finished: bool = False
     failed: bool = False
     failed_reason: str = ""
+    #: 上游 `fail_code` —— **分类真因**。别看 `status` 就下结论：
+    #: 实测 `status=30`（通用"生成失败"）配上 `fail_code=2038`（InputTextRisk）
+    #: 才是真因；只看 status 会把它误归成"上游故障"。
+    fail_code: int | None = None
     images: list[GeneratedImage] = field(default_factory=list)
     total: int | None = None
     finished_count: int | None = None
@@ -470,6 +482,8 @@ def parse_task(submit_id: str, node: dict) -> TaskState:
         key = node.get("fail_starling_key") or ""
         msg = node.get("fail_starling_message") or ""
         st.failed_reason = " ".join(x for x in (key, msg) if x) or st.status_name
+        _fc = node.get("fail_code")
+        st.fail_code = _fc if isinstance(_fc, int) else None
 
     st.history_record_id = node.get("history_record_id")
     st.submit_id_echo = _pick(task, "submit_id") or node.get("submit_id")

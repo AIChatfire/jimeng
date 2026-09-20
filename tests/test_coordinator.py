@@ -865,3 +865,52 @@ def test_transfer_one_does_not_retry_on_risk_control(service, fake_uploader,
         service._transfer_one(_a_blob(settings))
 
     assert calls["n"] == 1, f"风控不该重试，实际调了 {calls['n']} 次"
+
+
+def test_content_review_failure_is_reported_as_policy_error(
+        client, client_state, fake_jimeng, fake_uploader):
+    """🔴 内容审核失败要按**内容审核**报，**不能报成"上游故障"**。
+
+    实测真因（用户抓包）：`status=30`（通用的"生成失败"）
+    + `fail_code=2038`（InputTextRisk），
+    `fail_starling_message` = "你输入的文字不符合平台规则，请修改后重试"。
+
+    原先只看 `status in (10, 40)` ⇒ 这条被归成 `upstream_unavailable`
+    ⇒ **调用方以为"上游故障、可以重试"，而它必然再被拒**（还可能每次都计费）。
+    """
+    from app.errors import ContentPolicyError
+    from app.upstream.jimeng.client import TaskState
+
+    failed = TaskState(
+        submit_id="upstream-submit-id", status=30, status_name="generate_failed",
+        finished=True, failed=True, fail_code=2038,
+        failed_reason="web_text_violates_community_guidelines_toast "
+                      "你输入的文字不符合平台规则，请修改后重试")
+    fake_jimeng.states = [submitted_state(), failed]
+
+    tid = _create(client, model="jimeng-t2i", prompt="某段违规文本")
+    _tick_until_terminal(client_state)
+
+    body = client.get(f"{BASE}/{tid}").json()
+    assert body["status"] == "failure", body
+    assert body["error"]["type"] == ContentPolicyError.err_type, body["error"]
+    assert "内容审核" in body["error"]["message"], body["error"]
+    assert "2038" in body["error"]["message"], "要把上游 fail_code 带上，方便排查"
+
+
+def test_generic_generation_failure_is_not_mislabelled_as_policy(
+        client, client_state, fake_jimeng, fake_uploader):
+    """⚠️ 反向：**没有**安全码的失败仍应归"上游故障"，别一律当审核（会误导排查）。"""
+    from app.errors import ContentPolicyError
+    from app.upstream.jimeng.client import TaskState
+
+    other = TaskState(submit_id="upstream-submit-id", status=30,
+                      status_name="generate_failed", finished=True, failed=True,
+                      failed_reason="内部错误", fail_code=2002)
+    fake_jimeng.states = [submitted_state(), other]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x")
+    _tick_until_terminal(client_state)
+
+    body = client.get(f"{BASE}/{tid}").json()
+    assert body["error"]["type"] != ContentPolicyError.err_type, body["error"]
