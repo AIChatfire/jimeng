@@ -235,6 +235,14 @@ MAX_UPLOAD_PARALLELISM = 4
 MAX_INPUT_IMAGES = 4
 
 
+#: 上传**一张**被限流时最多尝试几次（指数退避，封顶 8s）。
+#:
+#: 为什么要单独给上传加这一层：多张时走 `Executor.map` —— **任何一个异常都会冒泡**，
+#: 所以"某一张被限流"会让**整批垫图失败**（而提交/轮询那条路本来就有退避）。
+#: 上限 3 是刻意小的：3 次都还在限流，说明不该继续打（与 `DISPATCH_MAX_ATTEMPTS` 同一理由）。
+UPLOAD_MAX_ATTEMPTS = 3
+
+
 class Service:
     """服务组件集合 + 编排逻辑。请求线程与协调器线程共用同一实例。"""
 
@@ -713,10 +721,34 @@ class Service:
           · `JimengUploader.token()` 是**双检锁** —— 并发 N 张只会取一次 STS，
             不会退化成"每张各签一次"（`upload.py` 的模块注释里记着实测）；
           · 上传走 `httpx.Client`，它对并发请求是线程安全的。
+
+        ## 🔴 为什么这里要单独退避重试
+
+        多张时走 `Executor.map` —— **任何一个异常都会冒泡**，
+        所以"某一张被限流"会让**整批垫图失败**。而提交/轮询那条路本来就有退避，
+        只有上传这一段没有 ⇒ 这是唯一会把瞬时限流放大成整单失败的缺口。
+
+        只重试**明确可重试**的（`retryable=True`，即限流一类）；
+        **风控（`retryable=False`）立刻抛出** —— 持续施压只会延长标记，
+        重试反而是帮倒忙。`normalize` 也放在循环**外**：同一份字节不该重复算。
         """
         norm = normalize(blob, self.settings)
-        uri = self.uploader.upload(norm.data)   # type: ignore[union-attr]
-        return uri, list(norm.notes), norm.size
+        delay = 0.5
+        for attempt in range(1, UPLOAD_MAX_ATTEMPTS + 1):
+            try:
+                uri = self.uploader.upload(norm.data)   # type: ignore[union-attr]
+                if attempt > 1:
+                    OBS.info("upload retried ok", attempt=attempt)
+                return uri, list(norm.notes), norm.size
+            except Exception as e:
+                if not getattr(e, "retryable", False) or attempt == UPLOAD_MAX_ATTEMPTS:
+                    raise
+                wait = getattr(e, "retry_after", None) or delay
+                OBS.warning("upload rate-limited, backing off", attempt=attempt,
+                            wait_s=round(float(wait), 2), err=type(e).__name__)
+                time.sleep(min(float(wait), 8.0))
+                delay *= 2
+        raise AssertionError("unreachable")
 
     def _prepare_input_images(self, rec: TaskRecord) -> list[str]:
         """下载 → 归一化 → 上传，**每张垫图各一次**，返回 `image_uri` 列表。**不计费。**

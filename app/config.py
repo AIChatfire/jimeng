@@ -87,7 +87,11 @@ class Settings:
     jm_max_wait: float = 120.0
 
     # ------------------------------------------------------------ 轮询
-    jimeng_poll_interval: float = 2.0
+    #: 🔴 上游回执自带 `polling_config.interval_seconds = 30` —— 那才是它期望的节奏。
+    #: 原值 2.0s 等于**比它密 15 倍**：既纯浪费请求，又是被限流的现实风险源。
+    #: 取 10s 作折中（请求少 5 倍，成图检测延迟最多 +10s）；要更省可设 30。
+    #: ⚠️ 改大它要同步满足 `COORDINATOR_LEASE >= 2×本值`（见下方校验）。
+    jimeng_poll_interval: float = 10.0
     #: 建任务之后、**第一次轮询之前**的等待。默认 0.2s。
     #:
     #: 🔴 这个值曾经是 3.0，是整条链路上**最大的单点浪费**：实测一次超清任务
@@ -188,7 +192,7 @@ class Settings:
             jm_min_interval=_f("JM_MIN_INTERVAL", 0.0),
             jm_per_minute=_i("JM_PER_MINUTE", 0),
             jm_cooldown=_f("JM_COOLDOWN", 600.0),
-            jimeng_poll_interval=_f("JIMENG_POLL_INTERVAL", 2.0),
+            jimeng_poll_interval=_f("JIMENG_POLL_INTERVAL", 10.0),
             poll_grace=_f("POLL_GRACE", 0.2),
             task_timeout=_f("TASK_TIMEOUT", 1800.0),
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
