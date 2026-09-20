@@ -680,6 +680,17 @@ class Service:
             self._fail(rec, self._terminal_error(st))
             return
 
+        # 🔴 **"至少有 1 张输出"是成功的最低线**（用户口径）：
+        # 终态 `status=50` 却**零产物**时，报 `success` + 空 `data` 就是
+        # "静默按少的交付"的极端情形 —— 调用方会拿到一个看起来成功、
+        # 实际什么都没有的响应。这种一律按失败处理。
+        if not st.images:
+            self._fail(rec, UpstreamUnavailableError(
+                f"上游报成功但**零产物**（status={st.status} {st.status_name}）。"
+                f"本服务不交付空成功，请重试或联系上游。",
+                upstream="jimeng", upstream_status=st.status_name))
+            return
+
         images = [{"url": im.url, "width": im.width, "height": im.height,
                    "format": im.format, "note": im.note} for im in st.images]
         notes = [im.note for im in st.images if im.note]
@@ -696,8 +707,9 @@ class Service:
                 f"⚠️ 上游只完成 {st.finished_count}/{st.total} 张"
                 f"（本服务交付 {len(images)} 张；请求 n={rec.n}）。"
                 f"上游任务可能仍在生成"
-                f"（`finished_image_count < total_image_count`）—— "
-                f"本服务按**已完成的**交付并如实标注，不补齐也不静默。")
+                f"（`finished_image_count < total_image_count`）。"
+                f"**这是上游侧的问题**：本服务**不补齐**（不做续生成），"
+                f"只要有 ≥1 张就按成功交付并如实标注。")
         now = int(time.time())
         self.store.patch(
             rec.task_id, status="success", images=images,

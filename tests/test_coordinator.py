@@ -924,12 +924,14 @@ def test_short_delivery_is_declared_not_silent(client, client_state,
     （实测 4 张那条是 `total=4, finished=1`，排在队列里慢慢出）。
     终态若两者对不上，调用方会以为"要的 n 张都在里面" ⇒ 必须如实标注。
     """
-    from app.upstream.jimeng.client import TaskState
+    from app.upstream.jimeng.client import GeneratedImage, TaskState
 
     short = TaskState(submit_id="upstream-submit-id", status=50,
                       status_name="success", finished=True, failed=False,
                       total=3, finished_count=1)
-    short.images = []          # 走假的 ok_state 太绕，这里直接断言降级文案
+    # **有 1 张**（够"≥1 张即成功"），但上游说总共有 3 张
+    short.images = [GeneratedImage(url="https://cdn/a.png",
+                                   width=1024, height=1024)]
     fake_jimeng.states = [submitted_state(), short]
 
     tid = _create(client, model="jimeng-t2i", prompt="x", n=3)
@@ -951,3 +953,25 @@ def test_full_delivery_has_no_shortfall_note(client, client_state,
     body = client.get(f"{BASE}/{tid}").json()
     degs = body.get("degradations") or []
     assert not [d for d in degs if "只完成" in d], f"不该有的少给降级：{degs}"
+
+
+def test_zero_images_success_is_delivered_as_failure(client, client_state,
+                                                     fake_jimeng, fake_uploader):
+    """🔴 **"至少有 1 张输出"是成功的最低线**（用户口径）。
+
+    终态 `status=50` 却**零产物**时，报 `success` + 空 `data` 就是"少到 0
+    还静默"—— 调用方会拿到一个看起来成功、实际什么都没有的响应。
+    """
+    from app.upstream.jimeng.client import TaskState
+
+    empty = TaskState(submit_id="upstream-submit-id", status=50,
+                      status_name="success", finished=True, failed=False)
+    empty.images = []
+    fake_jimeng.states = [submitted_state(), empty]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x")
+    _tick_until_terminal(client_state)
+
+    body = client.get(f"{BASE}/{tid}").json()
+    assert body["status"] == "failure", f"零产物不该报成功：{body}"
+    assert "零产物" in body["error"]["message"], body["error"]
