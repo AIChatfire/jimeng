@@ -101,9 +101,12 @@ CAPABILITIES: tuple[Capability, ...] = (
         #: 草稿里是 `abilities.blend.ability_list[0].image_uri_list`（列表）
         #: 与 `image_list`（列表）—— 所以多张垫图就是往这两个列表里多放元素，
         #: 不需要额外的组件串链（后编辑那三族才需要）。
-        #: ⚠️ 4 是保守默认：上游的 `input_image_limit` 原生形态是
-        #: `[{max_image_num, ability_name}]`（按 ability 分），当前解析拿到的是
-        #: None ⇒ **真实上限未取得**，等一次 2 张的实测再校准。
+        #: ⚠️ 4 是**保守值**：上游声明的比它宽 —— `get_common_config` 的
+        #: `input_image_limit` = `[{'max_image_num': 10, 'ability_name': 'byte_edit'}]`
+        #: （`byte_edit` 就是 blend）⇒ 5.0 Pro 允许 **10** 张垫图。
+        #: 但那个字段我们**读不出来**（`capabilities.py` 用 `_as_int()` 读数组 ⇒ 恒 None），
+        #: 所以先钉 4。要放开得先把解析改成按数组取 `max_image_num`，
+        #: 并同步抬高全局 `MAX_INPUT_IMAGES`。详见 `docs/UPSTREAM.md` §11。
         max_images=4,
         notes="输入图由本服务自动上传成即梦资产 uri；**必须给 prompt**"
               "（描述要怎么改）——这是它与后编辑三工具的关键区别。"
