@@ -707,24 +707,26 @@ class Service:
         #   · **必须写明"其中 k 张是重复的"** —— 不假装那是新图。
         #     否则调用方会以为拿到了 n 个不同结果，那是另一种静默失真。
         # ⚠️ 零产物已在上面拦成失败，所以走到这里 `images` 必然 ≥1 张。
+        # 🔴 **判据是「交付张数 < 请求的 n」，不是「finished < total」。**
+        #
+        # 实测 `total_image_count` **跟着垫图张数走、不是跟着"要出几张"**：
+        #   · 4 垫图 + 未传 n（⇒ n=1） ⇒ total=**4**
+        #   · 3 垫图 + n=2              ⇒ total=**3**
+        # ⇒ 拿 `finished < total` 判"少给"会在"3 垫图 + n=2"上**误报**
+        #   （2 < 3，可是我们要的正好就是 2 张，一张没少）。
+        # 所以那两个计数**只当排查上下文**，判据用"交付 vs 请求"。
         want = rec.n or len(images)
-        short = (st.total is not None and st.finished_count is not None
-                 and st.finished_count < st.total)
         if want > len(images):
             uniq = len(images)
             images = [images[i % uniq] for i in range(want)]
+            ctx = (f"（上游计数 finished={st.finished_count}/total={st.total}，"
+                   f"**仅供排查**：该 total 跟的是垫图数、不是出图张数）"
+                   if st.total is not None and st.finished_count is not None else "")
             deg.append(
-                f"⚠️ 上游只完成 {uniq} 张（请求 n={want}"
-                + (f"，上游声明 total={st.total}" if st.total is not None else "")
-                + f"）—— 已按口径**用成功的图补齐**到 {want} 个 url："
+                f"⚠️ 上游只出了 {uniq} 张、请求 n={want}{ctx} —— "
+                f"已按口径**用成功的图补齐**到 {want} 个 url："
                 f"**其中 {want - uniq} 张是重复的**（url 与前 {uniq} 个相同，"
                 f"别当新图用）。")
-        elif short:
-            # 上游少给了，但调用方本来就要这么多（没缺口）⇒ 仍如实标注
-            deg.append(
-                f"⚠️ 上游只完成 {st.finished_count}/{st.total} 张"
-                f"（本服务交付 {len(images)} 张；请求 n={rec.n}）—— "
-                f"上游任务可能仍在生成（`finished_image_count < total_image_count`）。")
         now = int(time.time())
         self.store.patch(
             rec.task_id, status="success", images=images,

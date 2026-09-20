@@ -958,7 +958,7 @@ def test_full_delivery_has_no_shortfall_note(client, client_state,
 
     body = client.get(f"{BASE}/{tid}").json()
     degs = body.get("degradations") or []
-    assert not [d for d in degs if "只完成" in d], f"不该有的少给降级：{degs}"
+    assert not [d for d in degs if "只出了" in d], f"不该有的少给降级：{degs}"
 
 
 def test_zero_images_success_is_delivered_as_failure(client, client_state,
@@ -981,3 +981,39 @@ def test_zero_images_success_is_delivered_as_failure(client, client_state,
     body = client.get(f"{BASE}/{tid}").json()
     assert body["status"] == "failure", f"零产物不该报成功：{body}"
     assert "零产物" in body["error"]["message"], body["error"]
+
+
+def test_total_image_count_tracks_refs_not_outputs(client, client_state,
+                                                   fake_jimeng, fake_uploader):
+    """🔴 `total_image_count` 跟的是**垫图数**，不是出图张数 —— 别拿它判"少给"。
+
+    实测（两次真实回执）：
+      · 4 垫图 + 未传 n（⇒ n=1） ⇒ `total=4`
+      · 3 垫图 + `n=2`            ⇒ `total=3`
+
+    ⇒ "3 垫图 + n=2、交付 2 张"时 `finished(2) < total(3)`，
+    但**我们要的就是 2 张、一张没少** —— 绝不能冒出"少给"降级。
+    这条就是那个回归的门禁（判据必须是「交付 < n」而不是「finished < total」）。
+    """
+    from app.upstream.jimeng.client import GeneratedImage, TaskState
+
+    st = TaskState(submit_id="upstream-submit-id", status=50,
+                   status_name="success", finished=True, failed=False,
+                   total=3, finished_count=2)
+    st.images = [GeneratedImage(url="https://cdn/a.png", width=1024, height=1024),
+                 GeneratedImage(url="https://cdn/b.png", width=1024, height=1024)]
+    fake_jimeng.states = [submitted_state(), st]
+
+    # i2i 必须给输入图；用上游资产 URL（走复用，不必上传）
+    prod = ("https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/"
+            + "9" * 32 + "~tplv-x.png?sig=1")
+    tid = _create(client, model="jimeng-i2i", prompt="融合这三张", n=2,
+                  image=[prod])
+    _tick_until_terminal(client_state)
+
+    body = client.get(f"{BASE}/{tid}").json()
+    urls = [x["url"] for x in body["data"]]
+    assert len(urls) == 2, f"要 2 张就该给 2 张，实得 {len(urls)}"
+    assert urls == ["https://cdn/a.png", "https://cdn/b.png"], "不该被改写/补齐"
+    degs = body.get("degradations") or []
+    assert not [d for d in degs if "只出了" in d], f"误报了少给：{degs}"
