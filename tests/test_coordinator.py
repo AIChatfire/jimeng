@@ -240,6 +240,45 @@ def test_i2i_passes_the_requested_count_to_blend(client, client_state,
     assert len(call["image_uris"]) == 2, "两张垫图要一起带上"
 
 
+def test_reusing_an_upstream_asset_skips_download_and_upload(
+        client, client_state, fake_jimeng, fake_uploader):
+    """🔴 拿**上一次的产物**当这次输入时，一次下载、一次上传都不该发生。
+
+    这是"链式任务"最常见的用法：A 出图 → B 用 A 的图再加工。
+    在此之前我们每次把同一份字节**从上游下回来再传回上游**，
+    实测那两段是 ~0.5s + ~1.3s。产物 URL 里的 `<space>/<32位hex>` 就是
+    草稿要的 `image_uri`，直接复用即可。
+    """
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    key = "2" * 32
+    prod = (f"https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/{key}"
+            f"~tplv-tb4s082cfz-aigc_resize:0:0.png?x-signature=x")
+
+    _create(client, model="jimeng-i2i", prompt="再改一次", image=[prod])
+    client_state.coordinator.tick()
+
+    assert fake_uploader.uploads == [], "可复用的资产不该再上传一次"
+    assert fake_jimeng.of("blend")[0]["image_uris"] == [f"tos-cn-i-tb4s082cfz/{key}"]
+
+
+def test_mixed_reusable_and_foreign_refs_keep_order(
+        client, client_state, fake_jimeng, fake_uploader):
+    """一批里**混着**"可复用资产"与"需要搬运的外链"时，顺序必须照旧。"""
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    key = "3" * 32
+    prod = (f"https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/{key}"
+            f"~tplv-x.png?sig=1")
+    foreign = _data_uri(_PNGS[0])
+
+    _create(client, model="jimeng-i2i", prompt="混合", image=[prod, foreign])
+    client_state.coordinator.tick()
+
+    assert len(fake_uploader.uploads) == 1, "只有那张外链需要搬运"
+    sent = fake_jimeng.of("blend")[0]["image_uris"]
+    assert sent[0] == f"tos-cn-i-tb4s082cfz/{key}", "第 1 张应是复用的资产"
+    assert sent[1] == fake_uploader.uri_for(fake_uploader.uploads[0]), "第 2 张是刚上传的"
+
+
 def test_image_count_has_a_global_ceiling(client, service):
     """全局合理性上限：一次塞 6 张直接拒（真正的额度由能力声明决定）。
 

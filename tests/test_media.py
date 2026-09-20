@@ -97,3 +97,39 @@ def test_single_ref_takes_the_sync_path(monkeypatch, settings):
 
 def test_empty_refs_is_empty(settings):
     assert load_images([], settings) == []
+
+
+# ---------------------------------------------------------------------------
+# 复用上游资产（链式任务：拿上一次的产物当这次输入）
+# ---------------------------------------------------------------------------
+
+#: 实测的真实产物 URL 形态（bucket 与上传产出的 key **同一形态**）
+_REAL = ("https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/"
+         "27a0e40f9075488582c4021b19fad34c~tplv-tb4s082cfz-aigc_resize:0:0.png"
+         "?lk3s=7c3bb0db&x-expires=1789765200&x-signature=x")
+
+
+@pytest.mark.parametrize("url,expected", [
+    (_REAL, "tos-cn-i-tb4s082cfz/27a0e40f9075488582c4021b19fad34c"),
+    # 裸对象地址（没有 ~ 变换后缀）也要认
+    ("https://p11-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/deadbeefdeadbeef",
+     "tos-cn-i-tb4s082cfz/deadbeefdeadbeef"),
+])
+def test_reuse_extracts_the_upstream_asset_uri(url, expected):
+    assert media.reuse_image_uri(url) == expected
+
+
+@pytest.mark.parametrize("url", [
+    # 🔴 换个 host 一律不认 —— 否则任意站点上一个恰好长这样的路径都会被当成我们的资产，
+    # 于是拿着一个不存在的 key 去建任务。
+    "https://evil.example.com/tos-cn-i-tb4s082cfz/27a0e40f9075488582c4021b19fad34c",
+    "https://byteimg.com.evil.com/tos-cn-i-tb4s082cfz/27a0e40f9075488582c4021b19fad34c",
+    # key 不是 hex ⇒ 不认（挡住路径穿越式的怪值）
+    "https://p26-dreamina-sign.byteimg.com/tos-cn-i-x/../../etc/passwd",
+    # 普通外链 / data URI / 空 ⇒ 不认（走原来的下载+上传）
+    "https://cdn.example.com/cat.png",
+    "data:image/png;base64,AAAA",
+    "",
+])
+def test_reuse_refuses_anything_that_is_not_an_upstream_asset(url):
+    assert media.reuse_image_uri(url) is None

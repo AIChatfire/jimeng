@@ -19,6 +19,7 @@ import io
 import re
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from urllib.parse import urlsplit
 
 import httpx
 
@@ -28,6 +29,48 @@ from .errors import InvalidParameterError, UpstreamUnavailableError
 #: 多张垫图时**同时下载**几张。与 `Capability.max_images`（blend 上限 4）同量级。
 #: 下载是纯网络等待，并发收益接近线性；再高没有收益 —— 上限本来只有 4。
 MAX_DOWNLOAD_PARALLELISM = 4
+
+#: 上游产物 URL 的形态（实测）：
+#:   https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/<32位hex>~tplv-...png?x-signature=...
+#: 而草稿要的 `image_uri` 就是 `<space>/<key>` —— 上传流程产出的也是**同一形态**：
+#:   `tos-cn-i-tb4s082cfz/e103c9b4f36543cbbdce65a42f8acaf3`（见 submit 回执的 resources.key）
+#: ⇒ 所以"把上一次的产物当下一次输入"时，**整段下载+归一化+上传都能跳过**。
+#:
+#: 两条守卫都必要：
+#:   · **必须限定 host**：只看路径的话，任意站点上一个恰好长这样的路径都会被认成
+#:     我们的资产 —— 于是拿着一个不存在的 key 去建任务；
+#:   · **key 必须是 hex**：挡住 `/tos-cn-i-x/../../etc` 这类路径穿越式的怪值。
+_TOS_HOST_SUFFIX = ".byteimg.com"
+_TOS_ASSET_RE = re.compile(
+    r"^/?(?P<uri>tos-cn-i-[a-z0-9]+/(?P<key>[0-9a-fA-F]{16,}))(?:~|\?|$)")
+
+
+def reuse_image_uri(ref: str) -> str | None:
+    """若输入**已经是上游存储里的资产**，返回它的 `image_uri`；否则 None。
+
+    ## 为什么值钱
+
+    「拿上一次的产物当这次输入」是最常见的用法。而在此之前，我们每次都把它
+    **从上游下载回来、归一化、再上传回上游** —— 实测这三段合起来是
+    ~0.5s 下载 + ~1.3s 上传（3 张、2.9MB 级），而且完全是在搬同一份字节。
+    直接复用 uri 就是 **0 成本**。
+
+    ## 守卫与代价
+
+    - 只认 `<hex>.byteimg.com` 下的 `tos-cn-i-<space>/<16+ 位 hex>` 路径，其余一律
+      走原路（下载+上传）。**不猜、不宽松匹配** —— 认错了会拿一个不存在的 key 去建任务。
+    - 复用时**拿不到原图字节**，所以"magic bytes / 体积上限"这两道校验做不了；
+      对象不存在的话会在**建任务**那一步暴露（上游拒绝或任务失败）。
+    """
+    text = (ref or "").strip()
+    if not text.lower().startswith(("http://", "https://")):
+        return None
+    parsed = urlsplit(text)
+    host = (parsed.hostname or "").lower()
+    if not host.endswith(_TOS_HOST_SUFFIX):
+        return None
+    m = _TOS_ASSET_RE.match(parsed.path)
+    return m.group("uri") if m else None
 
 # ---------------------------------------------------------------------------
 # 类型嗅探

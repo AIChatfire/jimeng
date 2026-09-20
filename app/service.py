@@ -42,7 +42,7 @@ from .errors import (
     UpstreamUnavailableError,
 )
 from .gate import UpstreamGate, build_gate
-from .media import load_images, normalize
+from .media import load_images, normalize, reuse_image_uri
 from .observability import OBS
 from .store import TaskRecord, TaskStore
 from .upstream.jimeng import (
@@ -670,37 +670,52 @@ class Service:
 
         张数上限已在受理时校验（`Capability.max_images`），所以这里可以放心地
         "来几张传几张"；不会出现"下载了 N 张只用第 1 张"那种静默浪费。
+
+        ## 能复用就不搬运
+
+        输入若**本身就是上游存储里的资产**（典型：拿上一次的产物当这次输入），
+        直接复用它的 `image_uri` —— **下载 + 归一化 + 上传整段跳过**。
+        这段实测是 ~0.5s 下载 + ~1.3s 上传（3 张、2.9MB 级），而搬运的是同一份字节。
+        守卫（host + hex key）与代价见 `media.reuse_image_uri`；
+        可复用的与需要搬运的可以混在一批里，**顺序照旧按 `image_refs` 回填**。
         """
         assert self.uploader is not None
-        blobs = load_images(rec.image_refs, self.settings)
         started = time.monotonic()
+        reused = [reuse_image_uri(r) for r in rec.image_refs]
+        pending = [r for r, u in zip(rec.image_refs, reused) if u is None]
+
         parallel = 1
-
-        if len(blobs) <= 1:
-            # 单张：不值得为一次调用付线程池的钱；顺带 `last_cached` 此时是准确的
-            results = [self._transfer_one(b) for b in blobs]
-            cached: bool | None = self.uploader.last_cached
+        cached: bool | None = None
+        notes: list[str] = []
+        if pending:
+            blobs = load_images(pending, self.settings)
+            if len(blobs) <= 1:
+                # 单张：不值得为一次调用付线程池的钱；顺带 `last_cached` 此时是准确的
+                results = [self._transfer_one(b) for b in blobs]
+                cached = self.uploader.last_cached
+            else:
+                # 🔴 多张**并发**：用 `Executor.map`（**保序**），
+                # 绝不是"谁先传完谁排前面"。
+                parallel = min(len(blobs), MAX_UPLOAD_PARALLELISM)
+                with ThreadPoolExecutor(max_workers=parallel) as pool:
+                    results = list(pool.map(self._transfer_one, blobs))
+                # ⚠️ 并发下 `last_cached` 是**共享字段**，取值不可靠 ⇒ 不报它。
+                cached = None
+            notes = [n for _, ns, _ in results for n in ns]
+            fresh = iter(uri for uri, _, _ in results)
+            uris: list[str] = [u if u is not None else next(fresh) for u in reused]
         else:
-            # 🔴 多张**并发** —— 这是"支持多张垫图"顺手拿到的收益：
-            # 原先这段是串行的（而且只用第 0 张），4 张垫图要等 4 次归一化 + 4 次上传。
-            # 这里没有把并发开到 `len(blobs)`：上游每次上传都要走一遍
-            # apply/put/commit 三段，张数上限本身只有 4，再高没有收益。
-            parallel = min(len(blobs), MAX_UPLOAD_PARALLELISM)
-            with ThreadPoolExecutor(max_workers=parallel) as pool:
-                results = list(pool.map(self._transfer_one, blobs))
-            # ⚠️ 并发下 `last_cached` 是**共享字段**（谁最后写就是谁的值）⇒ 不报它。
-            # 在观测里报一个可能错的值，比不报更糟。
-            cached = None
+            # 全都可复用 ⇒ 一次下载、一次上传都不需要
+            uris = list(reused)          # type: ignore[arg-type]
 
-        uris = [uri for uri, _, _ in results]
-        notes = [n for _, ns, _ in results for n in ns]
         if notes:
             # 一次写完：N 张的降级说明合起来只 patch 一次，别每张都写库
             self.store.patch(rec.task_id,
                              degradations=list(rec.degradations) + notes)
-        OBS.info("input images uploaded", task_id=rec.task_id,
-                 count=len(uris), parallel=parallel,
-                 bytes=sum(s for _, _, s in results),
+        OBS.info("input images ready", task_id=rec.task_id,
+                 count=len(uris),
+                 reused=sum(1 for u in reused if u is not None),
+                 uploaded=len(pending), parallel=parallel,
                  elapsed_ms=round((time.monotonic() - started) * 1000, 1),
                  cached=cached)
         return uris
