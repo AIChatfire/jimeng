@@ -196,12 +196,15 @@ CAPABILITIES: tuple[Capability, ...] = (
         jimeng_tool="detail", credits_measured=0, needs_source_ref=True,
         notes="**只支持『引用形态』**：source_task_id 指向本服务一个已成功的"
               "**图片**任务（引用其 item_id+origin_history_id，不带 origin_image）。"
-              "9-19 两次「单组件+origin_image」提交 generate_failed 且计费；"
+              "9-19 两次「单组件+origin_image」提交 generate_failed；"
               "9-20 路 A 探针证实死因是 origin_image：引用形态**一次真跑成功**"
               "（status=50，出图与源图同尺寸，UPSTREAM.md §9.1——勿回退）。"
               "**免费**（UI 标价 + 实测零出账两证吻合）。"
-              "外部图片走不通：需先 t2i 生成再修复（source_from=link 无证据）。"
-              "直接贴 image 字段会被拒绝——没有证据支持它能过。",
+              "🔴 本地图/外部图的 origin_image 形态：同日 4 样本全败"
+              "（纯单组件 / +自造父组件重放），且失败零扣费——稳定不支持。"
+              "✅ **本地图正解（真跑全通，两步均免费）**：先 i2i（blend）"
+              "生成产物，再 source_task_id 引用修复。"
+              "直接贴 image 字段会被拒绝——origin_image 形态实测必失败。",
     ),
     Capability(
         key="jimeng:omni-video", name="omni-video", title="全能参考视频（图/视频/音频）",

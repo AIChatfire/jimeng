@@ -104,11 +104,11 @@ def test_catalog_hides_deliberately_absent_capabilities():
 
 
 def test_detail_fix_tool_description_is_kept_for_future_investigation():
-    """摘除的是**注册**，不是知识 —— 工具描述要留着，否则下次得重新取证。"""
+    """工具描述要留着，否则下次得重新取证。转正后 registered 标志已删。"""
     from app.upstream.jimeng.client import POST_EDIT_TOOLS
 
     assert "detail" in POST_EDIT_TOOLS
-    assert POST_EDIT_TOOLS["detail"]["registered"] is False
+    assert "registered" not in POST_EDIT_TOOLS["detail"]
 
 
 def test_every_capability_has_measured_credits_where_claimed():
