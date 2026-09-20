@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import json
 import logging
 import time
 import uuid
@@ -75,7 +76,8 @@ ACCEPTED_FIELDS = frozenset({
     "model", "prompt", "image", "size", "n", "seed", "negative_prompt",
 })
 #: **视频接口额外**允许的字段（图片接口见到它们 = 传错了地方，400 说清楚）。
-VIDEO_FIELDS = frozenset({"resolution", "duration", "aspect_ratio"})
+VIDEO_FIELDS = frozenset({"resolution", "duration", "aspect_ratio",
+                          "source_task_id", "target_fps"})
 #: **认得但本服务做不到**的字段 —— 见到就进 `degradations`（响亮降级），
 #: 而不是当"未知字段"报错。它们来自 OpenAI/方舟图片接口的习惯写法。
 KNOWN_UNSUPPORTED_FIELDS = frozenset({
@@ -323,12 +325,18 @@ class Service:
         return credential_id(api_key, self._cred_secret)
 
     def create(self, body: dict[str, Any], *, credential: str,
-               dry_run: bool = False, video: bool = False) -> TaskRecord:
+               dry_run: bool = False, video: bool = False,
+               preset_degradations: list[str] | None = None,
+               ark_model: str | None = None) -> TaskRecord:
         """校验 + 落库，返回任务记录。**请求内零上游往返。**
 
         `video=True` 表示走**视频端点**：候选池切到视频族、额外放行
-        `resolution` / `duration` / `aspect_ratio` 三个字段
-        （图片端点见到它们 = 传错了地方，400 说清楚）。
+        `resolution` / `duration` / `aspect_ratio` / `source_task_id` /
+        `target_fps`（图片端点见到它们 = 传错了地方，400 说清楚）。
+
+        `preset_degradations` / `ark_model` 给 **Ark 门面**用：
+        形态翻译中产生的降级说明要带进任务记录；调用方请求的 Ark 模型名
+        （如 `doubao-seedance-2-0-mini-260615`）要原样留存，查询时回显。
 
         🔴 刻意**不在这里下载输入图**：异步接口的语义就是"受理即返回"，
         把下载塞进请求会让受理时间随上游网络抖动。图片拉取失败会在任务里
@@ -372,7 +380,7 @@ class Service:
                     f"`/async/v1/videos/generations`（图片接口没有这些参数）。",
                     param=misplaced[0])
 
-        degradations: list[str] = []
+        degradations: list[str] = list(preset_degradations or [])
         for k in sorted(set(body) & KNOWN_UNSUPPORTED_FIELDS):
             if body[k] is not None:
                 degradations.append(
@@ -390,20 +398,94 @@ class Service:
             raise InvalidParameterError("prompt 必须是字符串", param="prompt")
         prompt = (prompt or "").strip()
 
-        cap, upstream_model = models.resolve(body.get("model"), has_image=bool(image),
+        #: 🔴 视频端点的默认推导在**这里**定死（resolve 只负责形态校验）：
+        #: 给了 `source_task_id` ⇒ jimeng-vfi（补帧离开源任务没有意义）；
+        #: 否则 ⇒ jimeng-t2v。不留给"两个候选挑不出"的歧义报错 ——
+        #: 那会让上一版"留空即 t2v"的调用方突然全部 400。
+        eff_model = body.get("model")
+        if video and not eff_model:
+            eff_model = "jimeng-vfi" if body.get("source_task_id") else "jimeng-t2v"
+        cap, upstream_model = models.resolve(eff_model, has_image=bool(image),
                                             n_images=len(image), video=video)
         if cap.prompt_required and not prompt:
             raise InvalidParameterError(
                 f"model {cap.api_id}（{cap.title}）需要 prompt，但本次没给或为空。",
                 param="prompt")
 
+        #: 补帧（vfi）的**源任务校验** —— 只做本地库读（请求内零上游往返）。
+        #: 三件引用（vid / item_id / origin_history_id）+ 源草稿，缺一不可；
+        #: 源任务必须属于**当前凭证**（跨凭证引用 = 变相枚举别人的任务）。
+        src_rec: TaskRecord | None = None
+        if cap.name == "vfi":
+            src_id = body.get("source_task_id")
+            if not isinstance(src_id, str) or not src_id.strip():
+                raise InvalidParameterError(
+                    f"model {cap.api_id}（补帧）必须给 source_task_id："
+                    f"本服务一个**已成功**的视频任务 —— 补帧要引用源视频的 "
+                    f"vid / item_id / origin_history_id，只有走本服务产物链才拿得到。",
+                    param="source_task_id")
+            src_rec = self.store.get_scoped(src_id.strip(), credential)
+            if src_rec is None:
+                raise InvalidParameterError(
+                    f"source_task_id {src_id!r} 不存在，或不属于当前 API Key。",
+                    param="source_task_id")
+            img0 = src_rec.images[0] if src_rec.images else {}
+            if (src_rec.cap_key != "jimeng:t2v" or src_rec.status != "success"
+                    or not img0.get("url")):
+                raise InvalidParameterError(
+                    f"source_task_id {src_id!r} 不是已成功的视频任务"
+                    f"（status={src_rec.status}，model={src_rec.model}）—— "
+                    f"补帧只能引用本服务 t2v 任务的产物。",
+                    param="source_task_id")
+            if (not img0.get("vid") or not img0.get("item_id")
+                    or not src_rec.upstream_history_id or not src_rec.draft_json):
+                raise InvalidParameterError(
+                    f"源任务 {src_id!r} 缺少补帧所需的引用"
+                    f"（vid/item_id/history/draft）—— 可能是旧版本生成的任务，"
+                    f"请用当前服务重新生成源视频后再补帧。",
+                    param="source_task_id")
+            if prompt:
+                pass
+            else:
+                # 补帧语义上不需要 prompt；省略时沿用源任务的（实抓里就是同一个）
+                prompt = src_rec.prompt
+                degradations.append(
+                    "prompt 省略 ⇒ 已沿用源视频任务的提示词"
+                    f"「{prompt}」（实抓形态：补帧请求原样带源 prompt）。")
+            tfps = body.get("target_fps")
+            if tfps is None:
+                tfps = 60                      # 实抓：24 → 60
+            if isinstance(tfps, bool) or not isinstance(tfps, int) \
+                    or not (24 <= tfps <= 120):
+                raise InvalidParameterError(
+                    f"target_fps 必须是 24..120 的整数，实得 {tfps!r}（实抓 60）。",
+                    param="target_fps")
+            if body.get("seed") is not None:
+                degradations.append(
+                    "补帧草稿没有 seed 字段（实抓确认）⇒ seed 已忽略。")
+
+        extra_info: dict[str, Any] | None = None
+        if cap.name == "vfi":
+            assert src_rec is not None
+            extra_info = {
+                "source_task_id": src_rec.task_id,
+                "vid": src_rec.images[0].get("vid"),
+                "item_id": str(src_rec.images[0].get("item_id")),
+                "history_id": src_rec.upstream_history_id,
+                "source_submit_id": src_rec.upstream_submit_id,
+                "target_fps": tfps,
+            }
         duration_ms: int | None = None
         aspect_ratio: str | None = None
         if cap.media == "video":
-            # 视频不吃像素尺寸 —— 分辨率/时长/比例各有自己的校验，
-            # 其中 (resolution, duration) 还要过**计费档位白名单**
-            # （benefit_type/amount 没抓包依据的档位当场拒绝，绝不猜）。
-            resolution = body.get("resolution") or DEFAULT_VIDEO_RESOLUTION
+            if body.get("aspect_ratio") and cap.name == "vfi":
+                degradations.append(
+                    "补帧组件没有 video_aspect_ratio 字段（实抓确认）"
+                    "⇒ aspect_ratio 已忽略（沿用源视频画面）。")
+            # 分辨率/时长的默认值：补帧**沿用源任务**（实抓形态），
+            # t2v 用实抓档位（720p × 4s）。
+            resolution = body.get("resolution") or (
+                (src_rec.size if src_rec else None) or DEFAULT_VIDEO_RESOLUTION)
             if not isinstance(resolution, str) or resolution not in VIDEO_RESOLUTIONS:
                 raise InvalidParameterError(
                     f"resolution 只接受 {list(VIDEO_RESOLUTIONS)}，实得 {resolution!r}。",
@@ -411,15 +493,34 @@ class Service:
             size = resolution                      # 复用 size 列存分辨率档位
             duration = body.get("duration")
             if duration is None:
-                duration = 4                       # 实抓档位：720p × 4s
+                duration = ((src_rec.duration_ms or 4000) // 1000
+                            if src_rec else 4)     # 实抓档位：720p × 4s
             if isinstance(duration, bool) or not isinstance(duration, int) \
                     or duration < 1:
                 raise InvalidParameterError(
                     "duration 必须是 >=1 的整数（秒）", param="duration")
-            try:
-                resolve_video_commerce(resolution, duration)
-            except JimengError as e:
-                raise InvalidParameterError(str(e), param="duration") from e
+            if cap.name == "vfi":
+                # 补帧计费字段固定（video_frame_interpolation / amount=0），
+                # **不随 (resolution, duration) 走 t2v 白名单** —— 但实抓形态是
+                # "沿用源任务"：显式改档位没有抓包依据，拒绝而不是猜。
+                assert src_rec is not None
+                if resolution != (src_rec.size or DEFAULT_VIDEO_RESOLUTION):
+                    raise InvalidParameterError(
+                        f"补帧的 resolution 必须与源任务一致"
+                        f"（源任务 {src_rec.size}，本次 {resolution}）。",
+                        param="resolution")
+                if duration_ms is not None and src_rec.duration_ms \
+                        and duration_ms != src_rec.duration_ms:
+                    raise InvalidParameterError(
+                        f"补帧的 duration 必须与源任务一致"
+                        f"（源任务 {src_rec.duration_ms // 1000}s，"
+                        f"本次 {duration}）。",
+                        param="duration")
+            else:
+                try:
+                    resolve_video_commerce(resolution, duration)
+                except JimengError as e:
+                    raise InvalidParameterError(str(e), param="duration") from e
             duration_ms = duration * 1000
             aspect = body.get("aspect_ratio") or DEFAULT_VIDEO_ASPECT_RATIO
             if not isinstance(aspect, str) or aspect not in VIDEO_ASPECT_RATIOS:
@@ -515,6 +616,11 @@ class Service:
             negative_prompt=str(body.get("negative_prompt") or ""),
             duration_ms=duration_ms,
             aspect_ratio=aspect_ratio,
+            extra_json=(json.dumps({**(extra_info or {}),
+                                    **({"ark_model": ark_model}
+                                       if ark_model else {})},
+                                   ensure_ascii=False)
+                       if (extra_info or ark_model) else None),
             degradations=degradations,
             created_at=now,
             updated_at=now,
@@ -766,7 +872,8 @@ class Service:
         **绝不在这里同步等**（单并发下那会堵死协调器）。
         """
         have = [{"url": im.url, "width": im.width, "height": im.height,
-                 "format": im.format, "note": im.note} for im in st.images]
+                 "format": im.format, "note": im.note,
+                 "item_id": im.item_id, "vid": im.vid} for im in st.images]
         if rec.images:
             seen = {im.get("url") for im in rec.images}
             have = list(rec.images) + [im for im in have if im.get("url") not in seen]
@@ -830,7 +937,8 @@ class Service:
             return
 
         images = [{"url": im.url, "width": im.width, "height": im.height,
-                   "format": im.format, "note": im.note} for im in st.images]
+                   "format": im.format, "note": im.note,
+                   "item_id": im.item_id, "vid": im.vid} for im in st.images]
         notes = [im.note for im in st.images if im.note]
         deg = list(rec.degradations) + [f"产物提示：{n}" for n in notes]
 
@@ -1028,6 +1136,24 @@ class Service:
                 duration_ms=rec.duration_ms or 4000,
                 aspect_ratio=rec.aspect_ratio or DEFAULT_VIDEO_ASPECT_RATIO,
                 seed=rec.seed)
+        elif cap.name == "vfi":
+            # 补帧：从 extra_json 取源引用三件套；源草稿**现读现用**
+            # （父组件要原样重放，`draft_json` 在受理时就随源任务落库了）。
+            info = json.loads(rec.extra_json or "{}")
+            src = self.store.get(info.get("source_task_id") or "")
+            if src is None or not src.draft_json:
+                raise JimengParamError(
+                    f"源任务 {info.get('source_task_id')!r} 不存在或缺 draft_json，"
+                    f"无法构造补帧草稿。", code=1001)
+            sid = self.client.submit_video_vfi(
+                src.draft_json, prompt=rec.prompt,
+                vid=info["vid"], origin_history_id=info["history_id"],
+                item_id=info["item_id"],
+                resolution=rec.size or DEFAULT_VIDEO_RESOLUTION,
+                duration_ms=rec.duration_ms or 4000,
+                target_fps=info.get("target_fps") or 60,
+                source_submit_id=info.get("source_submit_id"),
+                source_item_id=info.get("item_id"))
         elif cap.name == "i2i":
             # blend 原生吃**列表** ⇒ 多张垫图一次带上；
             # 张数走与文生图**同一套吸附**（`generate_count_options`）——

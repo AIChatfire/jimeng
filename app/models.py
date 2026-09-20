@@ -171,6 +171,21 @@ CAPABILITIES: tuple[Capability, ...] = (
               "⚠️ 服务端 get_common_config 只下发图片模型表，视频模型清单"
               "按场景单独下发 —— 新模型要靠补抓提交包登记。",
     ),
+    Capability(
+        key="jimeng:vfi", name="vfi", title="视频补帧（插帧 insert_frame）",
+        accepts_image=False, image_required=False, prompt_required=False,
+        credits_measured=None, media="video",
+        notes="上游模型同 seedance（根模型 dreamina_seedance_40_mini），"
+              "scene=insert_frame：把**本服务已生成的视频**插帧到 60fps。"
+              "**必须给 source_task_id**（指向本服务一个成功的视频任务）—— "
+              "补帧要引用源视频的 vid / item_id / origin_history_id，"
+              "只有走本服务产物链才拿得到；target_fps 默认 60。"
+              "提交包计费字段 amount=0（UI 口径免费，**未对账**）。"
+              "提交侧已按 2026-09-20 实抓适配；**端到端实跑未验证**，"
+              "结果解析同 t2v（尽力而为）。draft min_version 3.1.0，"
+              "父组件为源任务草稿原样重放（实抓里连组件 id 都没变）。"
+              "Ark 方舟契约没有补帧概念 —— 该能力只在 /async/v1/videos 提供。",
+    ),
 )
 
 REGISTRY: dict[str, Capability] = {c.key: c for c in CAPABILITIES}
@@ -199,6 +214,9 @@ ALIASES: dict[str, str] = {
     "text2video": "jimeng-t2v",
     "t2v": "jimeng-t2v",
     "seedance": "jimeng-t2v",
+    "补帧": "jimeng-vfi",
+    "插帧": "jimeng-vfi",
+    "vfi": "jimeng-vfi",
 }
 
 #: 第三方 SDK 常硬编码的占位模型名 —— 它们**不代表**调用意图。
@@ -223,7 +241,7 @@ def is_placeholder(model: str | None) -> bool:
 def _hint() -> str:
     ids = ", ".join(c.api_id for c in CAPABILITIES)
     return (f"model 取值：{ids}；"
-            f"也可只写能力名（t2i / i2i / hd / pro-hd / outpaint / t2v）、"
+            f"也可只写能力名（t2i / i2i / hd / pro-hd / outpaint / t2v / vfi）、"
             f"中文别名，或直接写上游模型 key（如 {DEFAULT_UPSTREAM_MODEL}）。"
             f"完整清单见 GET /async/v1/models")
 
@@ -356,9 +374,10 @@ DELIBERATE_ABSENCES: dict[str, str] = {
         "generate_failed 且计费；9-20 路 A 探针证实**死因是 origin_image**："
         "单组件 + item_id/origin_history_id（无 origin_image，引用账号已有作品）"
         "一次真跑成功（status=50，出图与源图同尺寸，见 UPSTREAM.md §9.2）。"
+        "**免费**（UI 标价 + 实测零出账两证吻合）。"
         "输入图不支持公网直链（source_from=link 无证据），外部图需三步："
-        "上传→生成→修复。**暂不注册**：对外契约如何引用已有作品"
-        "（本地 task_id 还是直接 item_id）待定，定了即接线。"
+        "上传→生成→修复。**暂不注册**：对外契约如何引用已有作品待定"
+        "（可参考并行落地的 jimeng-vfi 用 source_task_id 引用本服务任务的形态）。"
     ),
 }
 

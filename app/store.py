@@ -116,6 +116,10 @@ class TaskRecord(SQLModel, table=True):
     duration_ms: Optional[int] = None
     #: 视频任务专用：画面比例（如 "16:9"）。图片任务恒 None。
     aspect_ratio: Optional[str] = None
+    #: 任务附加信息（JSON 串）：补帧的源引用（source_task_id / vid / item_id /
+    #: history_id / target_fps）、Ark 门面收到的原始 model 名等。
+    #: 🔴 老库靠启动期幂等迁移补列（`_ensure_video_columns`）。
+    extra_json: Optional[str] = None
 
     # ---- 上游与结果 ----
     #: 即梦的 `submit_id`。**绝不对外暴露**（对外只有本地 task_id）。
@@ -183,7 +187,7 @@ class Meta(SQLModel, table=True):
 _PATCHABLE = {
     "credential_id", "model", "cap_key", "upstream_model", "status", "prompt",
     "image_refs", "size", "n", "seed", "negative_prompt", "duration_ms",
-    "aspect_ratio", "upstream_submit_id",
+    "aspect_ratio", "extra_json", "upstream_submit_id",
     "upstream_history_id", "draft_json", "continuations",
     "images", "credits", "error", "degradations", "created_at", "updated_at",
     "started_at", "finished_at", "attempts", "lease_owner", "lease_until",
@@ -272,6 +276,7 @@ class TaskStore:
         stmts = (
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS duration_ms INT",
             "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS aspect_ratio VARCHAR",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS extra_json TEXT",
         )
         with self.engine.begin() as c:
             for s in stmts:

@@ -6,8 +6,10 @@
 ```
 POST /async/v1/images/generations        → 202 {"task_id": "jimeng_…"}     只回一个 id
 GET  /async/v1/images/generations/{id}   → 202 排队态 / 200 {data,created,usage}
-POST /async/v1/videos/generations        → 202 文生视频（jimeng-t2v，Seedance）
+POST /async/v1/videos/generations        → 202 文生视频（t2v）/ 补帧（vfi + source_task_id）
 GET  /async/v1/videos/generations/{id}   → 202 排队态 / 200 {data,created,usage.videos}
+POST /api/v3/contents/generations/tasks  → 200 {"id": …}  火山方舟原生契约门面（视频）
+GET  /api/v3/contents/generations/tasks/{id} → 200 方舟查询形态（queued/running/succeeded/failed）
 GET  /async/v1/models                    → 能力清单
 ```
 

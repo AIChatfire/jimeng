@@ -190,11 +190,14 @@ def test_parse_task_video_without_url_is_not_success_payload():
 def test_resolve_video_default_and_alias():
     from app import models
 
-    cap, upstream = models.resolve(None, has_image=False, video=True)
+    # 🔴 视频池现有两个能力（t2v/vfi）⇒ resolve 的裸默认是**歧义报错**
+    #（与图片族带输入图时同一纪律）；确定性默认由 service 层给
+    #（无 source_task_id ⇒ t2v，有 ⇒ vfi，见 test_vfi_end_to_end）。
+    with pytest.raises(Exception, match="无法确定用哪个"):
+        models.resolve(None, has_image=False, video=True)
+    cap, upstream = models.resolve("文生视频", has_image=False, video=True)
     assert cap.api_id == "jimeng-t2v"
     assert upstream is None                       # 视频模型 key 由 client 携带
-    cap, _ = models.resolve("文生视频", has_image=False, video=True)
-    assert cap.api_id == "jimeng-t2v"
     cap, _ = models.resolve("jimeng-t2v", has_image=False, video=True)
     assert cap.key == "jimeng:t2v"
 
@@ -336,3 +339,186 @@ def _TaskRecord_for_test():
                       model="jimeng-t2v", cap_key="jimeng:t2v", status="queued",
                       prompt="x", n=1, created_at=int(time.time()),
                       updated_at=int(time.time()))
+
+
+# ---------------------------------------------------------------------------
+# 视频补帧（jimeng-vfi，scene=insert_frame，amount=0 免费档）
+# ---------------------------------------------------------------------------
+
+from app.upstream.jimeng import GeneratedImage, TaskState, build_video_vfi_draft  # noqa: E402
+
+VID = "v02870g10004danqpu27dld82i49g5r0"
+ITEM_ID = "7687552710358420760"
+HIST = "44854324452620"
+
+
+def _vfi_metrics() -> dict:
+    return {"promptSource": "custom", "enterFrom": "click"}
+
+
+def _video_ok_state() -> TaskState:
+    st = TaskState(submit_id="upstream-submit-id", status=50,
+                   status_name="success", finished=True, failed=False, cost=4)
+    st.images = [GeneratedImage(url="https://tos.example.com/v.mp4",
+                                width=1280, height=720, format="mp4",
+                                item_id=ITEM_ID, vid=VID, note="视频产物")]
+    st.history_record_id = HIST
+    return st
+
+
+def test_build_vfi_draft_matches_capture():
+    """补帧草稿逐字段对 2026-09-20 实抓：父组件原样重放 + 子组件 insert_frame。"""
+    src = ('{"type":"draft","id":"src-draft","min_version":"3.0.5",'
+           '"main_component_id":"parent-1","component_list":'
+           '[{"type":"video_base_component","id":"parent-1",'
+           '"generate_type":"gen_video","metadata":{"created_time_in_ms":"111"},'
+           '"abilities":{}}]}')
+    draft = json.loads(build_video_vfi_draft(
+        src, prompt="iphone100", vid=VID, origin_history_id=HIST,
+        item_id=ITEM_ID, resolution="720p", duration_ms=4000,
+        origin_fps=24, target_fps=60, metrics=_vfi_metrics()))
+    assert draft["min_version"] == "3.1.0"           # 补帧实抓是 3.1.0
+    comps = draft["component_list"]
+    assert len(comps) == 2
+    parent, child = comps
+    assert parent["id"] == "parent-1"                # 🔴 父组件原样（连 id 都不变）
+    assert parent["metadata"]["created_time_in_ms"] == "111"
+    assert child["parent_id"] == "parent-1"
+    assert child["process_type"] == 3                # t2v 组件是 1，补帧子组件是 3
+    assert child["id"] == draft["main_component_id"]
+    gen = child["abilities"]["gen_video"]
+    assert gen["scene"] == "insert_frame"
+    inp = gen["text_to_video_params"]["video_gen_inputs"][0]
+    assert inp["vid"] == VID
+    assert inp["origin_history_id"] == HIST          # 字符串形态
+    assert inp["lens_motion_type"] == "" and inp["motion_speed"] == ""
+    assert inp["template_id"] == 0
+    ins = inp["v2v_opt"]["insert_frame"]
+    assert ins["enable"] is True
+    assert ins["target_fps"] == 60 and ins["origin_fps"] == 24
+    assert ins["duration_ms"] == 4000
+    # 🔴 子组件没有 seed / video_aspect_ratio / model_req_key / priority（实抓确认）
+    t2p = gen["text_to_video_params"]
+    assert "seed" not in t2p and "video_aspect_ratio" not in t2p
+    assert "model_req_key" not in t2p and "priority" not in t2p
+    # video_ref_params：item_id / origin_history_id 是**数字**形态
+    ref = gen["video_ref_params"]
+    assert ref["item_id"] == int(ITEM_ID)
+    assert ref["origin_history_id"] == int(HIST)
+    assert ref["generate_type"] == 0
+    # video_task_extra 是 metrics 复本
+    assert json.loads(gen["video_task_extra"]) == _vfi_metrics()
+
+
+def test_build_vfi_draft_rejects_non_video_source():
+    src = '{"component_list":[{"generate_type":"generate"}]}'
+    with pytest.raises(JimengParamError, match="视频"):
+        build_video_vfi_draft(src, prompt="x", vid="v", origin_history_id="1",
+                              item_id="2")
+
+
+def test_submit_vfi_body_matches_capture():
+    """补帧请求体：计费 amount=0 + metrics 指向**源任务**。"""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ret": 0, "data": {}})
+
+    src_draft = ('{"type":"draft","component_list":[{"id":"parent-1",'
+                 '"generate_type":"gen_video"}]}')
+    with JimengClient(sessionid="s", workspace_id=22052346345484,
+                      transport=httpx.MockTransport(handler)) as c:
+        c.submit_video_vfi(src_draft, prompt="iphone100", vid=VID,
+                                 origin_history_id=HIST, item_id=ITEM_ID,
+                                 source_submit_id="src-submit-1",
+                                 source_item_id=ITEM_ID)
+        body = captured["body"]
+    assert body["draft_content"] == c.last_draft
+    commerce = body["extend"]["m_video_commerce_info"]
+    # 🔴 补帧免费档：amount=0（实抓），benefit_type 与 t2v 完全不同
+    assert commerce["amount"] == 0
+    assert commerce["benefit_type"] == "video_frame_interpolation"
+    metrics = json.loads(body["metrics_extra"])
+    assert metrics["originSubmitId"] == "src-submit-1"   # 指向源任务
+    assert metrics["previewSubmitId"] == "src-submit-1"
+    assert metrics["originId"] == ITEM_ID
+    assert metrics["promptSource"] == "custom"
+    assert metrics["enterFrom"] == "click"               # t2v 是 ai_feature
+    scenes = json.loads(metrics["sceneOptions"])
+    assert [s["scene"] for s in scenes] == ["BasicVideoGenerateButton",
+                                            "VideoFrameInterpolation"]
+
+
+def test_submit_vfi_dry_run_never_sends():
+    calls: list[Any] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json={"ret": 0, "data": {}})
+
+    src = ('{"component_list":[{"id":"p","generate_type":"gen_video"}]}')
+    with JimengClient(sessionid="s", transport=httpx.MockTransport(handler)) as c:
+        c.submit_video_vfi(src, prompt="x", vid="v", origin_history_id="1",
+                           item_id="2", dry_run=True)
+    assert calls == []
+
+
+def test_vfi_end_to_end(app_and_client, fake_jimeng, client_state):
+    """t2v 成功 → 用它的产物补帧：引用三件套自动透传给假上游。"""
+    _, client, _ = app_and_client
+    fake_jimeng.states = [_video_ok_state()]
+    r = client.post("/async/v1/videos/generations", headers=AUTH,
+                    json={"prompt": "iphone100"})
+    src_id = r.json()["task_id"]
+    for _ in range(2):
+        client_state.coordinator.tick()               # 源任务到 success
+    src = client_state.service.store.get(src_id)
+    assert src.status == "success"
+    assert src.images[0]["vid"] == VID and src.images[0]["item_id"] == ITEM_ID
+    assert src.upstream_history_id == HIST and src.draft_json
+
+    # 补帧受理：不带 model（source_task_id 即路由到 vfi）、不带 prompt（沿用源）
+    fake_jimeng.states = [_video_ok_state()]
+    r2 = client.post("/async/v1/videos/generations", headers=AUTH,
+                     json={"source_task_id": src_id, "target_fps": 60})
+    assert r2.status_code == 202
+    vfi_id = r2.json()["task_id"]
+    rec = client_state.service.store.get(vfi_id)
+    assert rec.model == "jimeng-vfi"
+    assert rec.prompt == "iphone100"                  # 沿用源任务提示词
+    assert any("沿用源视频任务的提示词" in d for d in rec.degradations)
+
+    client_state.coordinator.tick()
+    call = fake_jimeng.of("submit_video_vfi")[0]
+    assert call["source_draft"] == src.draft_json     # 父组件=源草稿原样重放
+    assert call["vid"] == VID
+    assert call["origin_history_id"] == HIST
+    assert call["item_id"] == ITEM_ID
+    assert call["resolution"] == "720p"
+    assert call["duration_ms"] == 4000                # 沿用源任务档位
+    assert call["target_fps"] == 60
+    assert call["source_submit_id"] == "upstream-submit-id-0"
+
+
+def test_vfi_requires_source(app_and_client, client):
+    """不给 source_task_id / 源不存在 / 源未成功 —— 都在受理时 400。"""
+    _, client0, _ = app_and_client
+    r = client0.post("/async/v1/videos/generations", headers=AUTH,
+                     json={"model": "jimeng-vfi", "prompt": "x"})
+    assert r.status_code == 400
+    assert "source_task_id" in r.json()["error"]["message"]
+
+    r = client0.post("/async/v1/videos/generations", headers=AUTH,
+                     json={"source_task_id": "jimeng_nope", "prompt": "x"})
+    assert r.status_code == 400
+    assert "不存在" in r.json()["error"]["message"]
+
+    # 源任务是排队中的（非 success）⇒ 拒绝
+    r = client0.post("/async/v1/videos/generations", headers=AUTH,
+                     json={"prompt": "src"})
+    src_id = r.json()["task_id"]
+    r = client0.post("/async/v1/videos/generations", headers=AUTH,
+                     json={"source_task_id": src_id})
+    assert r.status_code == 400
+    assert "已成功" in r.json()["error"]["message"]

@@ -29,6 +29,8 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
 from . import models
+from .ark import ark_task_view as ark_view
+from .ark import translate_ark_create as ark_translate
 from .config import Settings
 from .coordinator import Coordinator
 from .errors import AdapterError, AuthError, InvalidParameterError
@@ -84,6 +86,8 @@ class VideoGenerationRequest(BaseModel):
     aspect_ratio: str | None = Field(default=None, description="画面比例（如 16:9）")
     n: int | None = Field(default=None, description="条数（视频草稿无张数字段，恒按 1 处理并降级留痕）")
     seed: int | None = None
+    source_task_id: str | None = Field(default=None, description="jimeng-vfi（补帧）：源视频任务 id")
+    target_fps: int | None = Field(default=None, description="jimeng-vfi：插帧目标帧率（默认 60）")
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +381,40 @@ def _install_routes(app: FastAPI) -> None:
     ) -> dict:
         """删除视频任务（未终态响亮失败 —— 与图片删除同一纪律）。"""
         return request.app.state.service.delete_for_credential(task_id, credential)
+
+    # ------------------------------------------------- Ark 契约门面（方舟形态）
+    @app.post("/api/v3/contents/generations/tasks", status_code=200)
+    async def ark_create_task(
+        request: Request,
+        body: GenerationRequest,
+        credential: str = Depends(require_key),
+    ) -> JSONResponse:
+        """创建视频生成任务 —— **火山方舟原生契约**（`model` + `content[]`）。
+
+        请求/响应逐字段对齐方舟《创建视频生成任务》；底层翻译到即梦
+        Seedance 链路（翻译规则与降级留痕见 `app/ark.py`）。
+        鉴权沿用本服务 API Key（`Authorization: Bearer <key>`，形态同方舟）。
+        """
+        ark_body = body.model_dump()
+        our, degradations = ark_translate(ark_body)
+        svc: Service = request.app.state.service
+        rec = svc.create(our, credential=credential, video=True,
+                         preset_degradations=degradations,
+                         ark_model=str(ark_body.get("model") or ""))
+        request.app.state.coordinator.wake()
+        # 方舟创建响应只回 {"id": ...}
+        return JSONResponse(status_code=200, content={"id": rec.task_id})
+
+    @app.get("/api/v3/contents/generations/tasks/{task_id}")
+    async def ark_get_task(
+        request: Request,
+        task_id: str,
+        credential: str | None = Depends(require_key_optional),
+    ) -> JSONResponse:
+        """查询视频生成任务 —— **火山方舟原生契约**（id 即凭据，同方舟语义）。"""
+        svc: Service = request.app.state.service
+        rec = svc.get_for_credential(task_id, credential)
+        return JSONResponse(status_code=200, content=ark_view(rec))
 
     # ------------------------------------------------------------- 模型
     @app.get("/async/v1/models")

@@ -21,7 +21,42 @@
 鉴权：`Authorization: Bearer <key>`。`API_KEYS` 为空时**关闭鉴权**（仅限内网，
 启动会打 WARNING）。任务与 Key 指纹绑定。
 
-### 0.1 视频端点（2026-09-20 起，与图片端点同构）
+### 0.2 火山方舟（Ark）契约门面（2026-09-20 起）
+
+对外形态逐字段对齐方舟《创建/查询视频生成任务》（实现收拢在 `app/ark.py`），
+底层翻译到即梦 Seedance 链路 —— 方舟 SDK 客户端无需改代码即可切换：
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `POST` | `/api/v3/contents/generations/tasks` | 方舟创建形态：`{model, content[], ratio, duration, resolution, seed, …}` → **只回 `{"id": …}`** |
+| `GET` | `/api/v3/contents/generations/tasks/{id}` | 方舟查询形态：`{id, model, status, error, content{video_url}, created_at, …}`；`status ∈ queued/running/succeeded/failed` |
+
+翻译与降级规则（全部在 `degradations` 里可见，查询响应原样带回）：
+
+* `model`：任何 `doubao-seedance-*` → 映射到 `jimeng-t2v`（降级留痕）；
+* `content[]`：只接受 `text`；`image_url`/`video_url`/`audio_url`（r2v/i2v）
+  **不支持，400** —— 即梦 t2v 无参考能力（未抓包）；
+* `ratio "adaptive"` → 默认 16:9（降级留痕）；`duration`/`resolution` 过
+  即梦计费档位白名单（当前 720p×4s）；
+* `watermark` / `generate_audio` / `callback_url` / `return_last_frame` 等
+  方舟常规参数 → **降级留痕不挡人**；
+* 🔴 `usage`（completion_tokens/total_tokens）**不给** —— 即梦链路没有
+  token 口径，伪造数字等于说谎；预估积分以扩展字段 `usage.forecast_credits`
+  给出（仅成功任务）。
+
+### 0.3 视频补帧（jimeng-vfi，仅 /async/v1/videos 提供）
+
+```json
+{ "source_task_id": "jimeng_…", "target_fps": 60 }   // model/prompt 可省略
+```
+
+* `source_task_id` 必填：指向本服务一个**已成功的 t2v 任务**（同 API Key）
+  —— 补帧要引用源视频的 `vid`/`item_id`/`origin_history_id`，
+  只有走本服务产物链才拿得到；
+* `prompt` 省略 ⇒ 沿用源任务提示词（降级留痕）；`resolution`/`duration`
+  必须**与源任务一致**（实抓形态是沿用，改档位没有抓包依据）；
+* 提交包计费字段 `amount=0`（UI 口径免费，未对账）；
+* Ark 方舟契约没有补帧概念，该能力不进门面。
 
 | 方法 | 路径 | 状态码 | 用途 |
 |---|---|---|---|

@@ -286,9 +286,9 @@ def test_wrong_key_is_401(client):
 def test_models_endpoint_lists_only_verified_capabilities(client):
     data = client.get("/async/v1/models").json()
     ids = {m["id"] for m in data["data"]}
-    # jimeng-t2v：已适配（提交侧实抓）但未端到端实跑 —— notes 里如实写明
+    # jimeng-t2v / jimeng-vfi：已适配（提交侧实抓）但未端到端实跑 —— notes 里如实写明
     assert ids == {"jimeng-t2i", "jimeng-i2i", "jimeng-hd",
-                   "jimeng-pro-hd", "jimeng-outpaint", "jimeng-t2v"}
+                   "jimeng-pro-hd", "jimeng-outpaint", "jimeng-t2v", "jimeng-vfi"}
     assert "jimeng-detail-fix" not in ids, "刻意缺席的能力不许出现在清单里"
 
 

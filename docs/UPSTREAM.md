@@ -138,7 +138,7 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 | 超清 | `normal_hd` | 13 | ✅ 实扣见过 **1**（forecast 报 9），2048² → **4096²** |
 | 智能超清 | `pro_hd` | 35 | ✅ → 2160²（又贵又小）；forecast 报 91，**实扣未测** |
 | 扩图 | `painting` | 8 | ✅ → **4 张** 4000²（张数由上游定）；forecast 报 28，**实扣未测** |
-| 细节修复 | `super_resolution` | 2 | ✅ **item 引用形态**（2026-09-20 路 A）；upload 形态 ❌ 两次 failed |
+| 细节修复 | `super_resolution` | 2 | ✅ **item 引用形态 + 免费**（2026-09-20 路 A）；upload 形态 ❌ 两次 failed |
 
 ### 9.1 细节修复的输入图：不支持公网直链，且仅上传也未必够（2026-09-20 抓包）
 
@@ -169,8 +169,9 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 - **结论**：细节修复的前置条件 = 引用账号已有作品（`item_id` +
   `origin_history_id`）；带上 `origin_image`（tos uri）反而失败。
   9-19 两次失败的死因即此，链式父组件**不是**必要条件。
-- **实扣待定**：截至提交后 ~5 分钟账单未出记录、余额未变（此前观察过延迟
-  结算，不能凭此断定免费；结算后再补记）。
+- **实扣 = 免费（定论）**：UI 标价"细节修复 免费"；实测提交后 ~20 分钟
+  `user_credit_history` 零出账、余额 6140 分文未动 —— 标价与实测两证吻合
+  （2026-09-20 18:12 关账）。
 - `build_post_edit_draft` 已支持该形态（不给 uri/url 时要求
   `item_id`+`origin_history_id`，此时不带 `origin_image`），
   用例 `test_post_edit_item_reference_form_has_no_origin_image` 钉死。
@@ -387,3 +388,24 @@ body: {"count": 20, "cursor": "0", "history_type": 2}     # 2 = 消耗
 3. **视频模型清单服务端不下发**：`get_common_config` 的 `model_list` 只有 9 个
    `high_aes_general_*`（图片）。视频模型按场景（babi_param `tool_video`）单独下发，
    只读接口拿不到 ⇒ **新模型要靠补抓提交包**登记（`dump_video_models.py` 探针可复跑验证）。
+
+### 13.1 视频补帧（insert_frame / VideoFrameInterpolation，2026-09-20 实抓）
+
+同一端点、同一根模型（`dreamina_seedance_40_mini`），但形态与 t2v 有四处硬差异：
+
+| 维度 | t2v | **补帧（vfi）** |
+|---|---|---|
+| 草稿结构 | 单组件 | **双组件**：父 = 源 t2v 组件**原样重放**（实抓连组件 id/created_time 都没变）+ 子带 `parent_id`、`process_type: 3` |
+| 子组件参数 | `video_aspect_ratio`/`seed`/`model_req_key`/`priority` | **全没有**；多了 `vid` / `lens_motion_type ""` / `motion_speed ""` / `template_id 0` / `v2v_opt.insert_frame{enable,target_fps:60,origin_fps:24,duration_ms}` / `origin_history_id`（**字符串**） |
+| 引用 | — | `gen_video.scene="insert_frame"` + `video_ref_params{generate_type:0, item_id, origin_history_id（**数字**）}` |
+| 计费 | `seedance_20_mini_720p_output_5s` / 4 | **`video_frame_interpolation` / `amount 0`（免费档）** |
+
+`metrics_extra` 也是 click 形态（`promptSource "custom"`、无 `position`/`aiFeatureName`），
+且 `originSubmitId`/`previewSubmitId` 指向**源任务** submit_id、`originId` 指源视频 item_id；
+`sceneOptions` 多一个 `{"scene":"VideoFrameInterpolation"}` 条目。
+草稿 `min_version` 是 **3.1.0**（t2v 是 3.0.5）。
+
+⚠️ 实抓里 `insert_frame.duration_ms=4097`（源视频**实际**时长）≠ 请求的 4000 ——
+我们拿不到实际时长，默认取请求时长，语义差异未验证。
+⚠️ 引用三件套（vid/item_id/origin_history_id）只有走我们自己的产物链才拿得到
+⇒ 补帧入口必须给本服务的 `source_task_id`（跨凭证引用已拦）。

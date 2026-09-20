@@ -130,6 +130,12 @@ class FakeJimeng:
     fetch_count: int = 0
     #: 历次建任务产生的 submit_id（**逐个不同**，如同真实客户端生成的 uuid4）
     submitted: list[str] = field(default_factory=list)
+    #: 最近一次视频建任务的 draft_content（真实客户端有 `last_draft`，
+    #: 补帧要引用源任务的草稿 ⇒ 假上游也得能留下它）
+    last_draft: str | None = None
+
+    _VIDEO_DRAFT = ('{"type":"draft","component_list":'
+                    '[{"id":"parent-1","generate_type":"gen_video"}]}')
 
     def _new_submit_id(self) -> str:
         """每次建任务给一个**唯一** id —— 真实客户端生成的是 uuid4。
@@ -163,6 +169,15 @@ class FakeJimeng:
     def submit_video(self, prompt: str, **kw: Any) -> str:
         """文生视频 —— 与图片族同构：记录收到过什么，按剧本回 id。"""
         self._record("submit_video", prompt=prompt, **kw)
+        self.last_draft = self._VIDEO_DRAFT
+        if self.fail_submit:
+            raise self.fail_submit
+        return self._new_submit_id()
+
+    def submit_video_vfi(self, source_draft: str, **kw: Any) -> str:
+        """视频补帧 —— 记录源草稿与引用三件套。"""
+        self._record("submit_video_vfi", source_draft=source_draft, **kw)
+        self.last_draft = source_draft
         if self.fail_submit:
             raise self.fail_submit
         return self._new_submit_id()
