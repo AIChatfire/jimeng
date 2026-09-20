@@ -142,7 +142,7 @@ jobs:
           ref: ${{ needs.resolve.outputs.commit }}
           fetch-depth: 0
 
-      - name: Bump __version__
+      - name: Bump __version__ (idempotent)
         run: |
           set -euo pipefail
           python3 - "$VERSION" <<'PY'
@@ -153,9 +153,13 @@ jobs:
           pat = re.compile(r'^__version__\s*=\s*"[^"]*"', re.M)
           assert len(pat.findall(src)) == 1, f"__version__ 定义应恰好 1 处，实得 {len(pat.findall(src))}"
           out = pat.sub(f'__version__ = "{new}"', src, count=1)
-          assert out != src, "bump 未产生变化"
-          open(p, "w", encoding="utf-8").write(out)
-          print(f"__version__ -> {new}")
+          if out == src:
+              # 上一次 bump 已把它写到目标版本（bump 提交已在触发提交的历史里）
+              # ⇒ 幂等跳过，别让 no-op 断言炸掉整个 run
+              print(f"__version__ 已是 {new} —— 无需提交")
+          else:
+              open(p, "w", encoding="utf-8").write(out)
+              print(f"__version__ -> {new}")
           PY
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
@@ -166,13 +170,16 @@ jobs:
           set -euo pipefail
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git add app/__init__.py
           TAG='${{ needs.resolve.outputs.tag }}'
-          git commit -m "chore(release): ${TAG} [skip release]"
+          # 只在真有变化时提交（版本已是目标值 ⇒ 触发提交本身就是发布内容）
+          if ! git diff --quiet app/__init__.py; then
+            git add app/__init__.py
+            git commit -m "chore(release): ${TAG} [skip release]"
+          fi
           # 并发 push 兜底：rebase 后再推，sha 以 rebase 后为准。
           # 🔴 checkout 按 sha 检出是 detached HEAD —— 本地没有叫 main 的分支，
           #    `git push origin main` 会报 src refspec does not match any（首跑实测），
-          #    必须推 HEAD:main。
+          #    必须推 HEAD:main。无变化时 push 是 no-op（Everything up-to-date）。
           git pull --rebase origin main
           git push origin HEAD:main
           echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
