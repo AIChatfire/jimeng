@@ -464,14 +464,26 @@ class Service:
 
     # ------------------------------------------------------------------ 查询
 
-    def get_for_credential(self, task_id: str, credential: str) -> TaskRecord:
-        """按凭证取任务。取不到（不存在 **或** 不属于本 Key）一律 404。
+    def get_for_credential(self, task_id: str, credential: str | None) -> TaskRecord:
+        """按 id 取任务。
+
+        · `credential` 给了 ⇒ 走**属主校验**（取不到一律 404，见 `get_scoped`）；
+        · `credential is None` ⇒ **只按 id 取（免鉴权读）**。
+
+        🔴 为什么 `None` 可以放行：`task_id` 是 128 位随机（`jimeng_<uuid4 hex>`），
+        **不可猜**，而且**只在受理时返回给带 Key 的调用方** ⇒ id 本身就是凭据
+        （调用方能把这个链接直接分享出去）。
+
+        ⚠️ 这是**刻意放宽**的边界，所以另外两处**不放宽**：
+        `delete_for_credential` 与 `list_for_credential` 仍然强制鉴权 ——
+        否则拿到一个 id 的人可以删任务、或枚举别人的任务。
 
         🔴 **本地拦，不问上游**：放行到上游就是用错的钥匙去查，
         返回的 404/空**无法区分**"任务真没了"与"钥匙不对"，
         而且把跨凭证隔离交给了别人的实现去兜。
         """
-        rec = self.store.get_scoped(task_id, credential)
+        rec = (self.store.get_scoped(task_id, credential) if credential
+               else self.store.get(task_id))
         if rec is None:
             raise TaskNotFoundError(
                 f"任务 {task_id} 不存在，或不属于当前 API Key。")

@@ -108,6 +108,27 @@ def require_key(request: Request) -> str:
     return request.app.state.service.credential_of(key)
 
 
+def require_key_optional(request: Request) -> str | None:
+    """**可选的**调用方 Key —— 只给"按 id 即凭据"的读接口用（GET 单条任务）。
+
+    三种情况分得很清（刻意不合并）：
+
+    · **完全没带** `Authorization` ⇒ 返回 `None`，**放行**。
+      理由：`task_id` 是不可猜的 128 位随机值，且**只在受理时返回给带 Key 的调用方**
+      ⇒ id 本身就是凭据（调用方可以把结果链接直接给别人看）。
+    · **带了但无效**（不在白名单）⇒ **照旧报 401**。不能因为"反正放行"就把错的 Key
+      蒙过去 —— 那会让调用方的配置错误被静默吞掉，是最难查的一类问题。
+    · **带了且有效、但不是该任务的属主** ⇒ 返回该指纹；上游按 id 取，
+      **不做属主校验**（与"没带"同一待遇，语义统一好预测）。
+    """
+    settings: Settings = request.app.state.settings
+    if _bearer(request) is None:
+        # 鉴权关闭（dev）时也走这条路：与"没带"同样放行
+        _ = settings
+        return None
+    return require_key(request)
+
+
 # ---------------------------------------------------------------------------
 # 装配
 # ---------------------------------------------------------------------------
@@ -261,14 +282,19 @@ def _install_routes(app: FastAPI) -> None:
     async def get_generation(
         request: Request,
         task_id: str,
-        credential: str = Depends(require_key),
+        credential: str | None = Depends(require_key_optional),
     ) -> JSONResponse:
-        """查任务。
+        """查任务。**不需要 Authorization：`task_id` 本身就是凭据。**
 
         · 非终态 → **202** + `{task_id, status}`（调用方据此继续轮询）；
         · 成功 → **200** + `{data: [{url}], created, usage}`；
         · 失败 → **200** + `{task_id, status: "failure", error}`；
-        · 不存在 / 不属于本 Key → **404**（**本地拦，不发上游请求**）。
+        · 不存在 → **404**（**本地拦，不发上游请求**）。
+
+        鉴权（2026-09-20 起刻意放宽，判据见 `require_key_optional`）：
+        **不带 Key 也能查**；带了**无效** Key 仍报 401；
+        带了有效但不属于该任务的 Key **照样能查**（id 即凭据）。
+        ⚠️ `DELETE` 与**列表**接口**仍然强制鉴权** —— 否则可以枚举/删除别人的任务。
         """
         svc: Service = request.app.state.service
         rec = svc.get_for_credential(task_id, credential)

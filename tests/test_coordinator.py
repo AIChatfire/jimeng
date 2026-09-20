@@ -759,3 +759,54 @@ def test_credits_warning_is_silent_for_measured_free_capability(
 
     assert not [m for m in msgs if "credits consumed" in m], \
         f"实测免费的能力不该告警，却报了：{msgs}"
+
+
+# ---------------------------------------------------------------------------
+# GET 免鉴权（task_id 即凭据）以及**刻意不放宽**的边界
+# ---------------------------------------------------------------------------
+
+def _a_terminal_task(client, client_state, fake_jimeng, fake_uploader):
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    tid = _create(client, model="jimeng-t2i", prompt="x")
+    _tick_until_terminal(client_state)
+    return tid
+
+
+def test_get_task_without_authorization_is_allowed(client, client_state,
+                                                   fake_jimeng, fake_uploader):
+    """🔴 **查任务不需要 Bearer** —— `task_id` 是不可猜的 128 位随机值，本身就是凭据。
+
+    这样调用方可以把结果链接直接分享出去（不需要连带交出 API Key）。
+    """
+    tid = _a_terminal_task(client, client_state, fake_jimeng, fake_uploader)
+
+    r = client.get(f"{BASE}/{tid}")          # 刻意**不带** Authorization
+
+    assert r.status_code == 200, r.text
+    assert r.json()["data"][0]["url"] == "https://cdn/a.png"
+
+
+def test_get_task_with_invalid_key_still_401(client, client_state,
+                                             fake_jimeng, fake_uploader):
+    """⚠️ 但**带了无效 Key 仍要报 401** —— 不能因为"反正放行"把错的 Key 蒙过去。
+
+    否则调用方写错 Key 会被静默吞掉（最难查的一类问题）。
+    """
+    tid = _a_terminal_task(client, client_state, fake_jimeng, fake_uploader)
+
+    r = client.get(f"{BASE}/{tid}", headers={"Authorization": "Bearer wrong-key"})
+
+    assert r.status_code == 401, r.text
+
+
+def test_delete_still_requires_the_key(client, client_state,
+                                      fake_jimeng, fake_uploader):
+    """🔴 `DELETE` **不放宽** —— 否则拿到一个 id 就能把别人的任务删了。"""
+    tid = _a_terminal_task(client, client_state, fake_jimeng, fake_uploader)
+
+    assert client.delete(f"{BASE}/{tid}").status_code == 401
+
+
+def test_list_still_requires_the_key(client, service):
+    """🔴 **列表**不放宽 —— 否则可以拿 id 枚举别人的任务（id 本来就不可枚举）。"""
+    assert client.get(BASE).status_code == 401
