@@ -360,8 +360,13 @@ class Service:
             raise InvalidParameterError("seed 必须是整数", param="seed")
 
         n = n_raw
-        if cap.name == "t2i" and self.cfg is not None:
-            model_key = upstream_model or DEFAULT_MODEL
+        if cap.name in ("t2i", "i2i") and self.cfg is not None:
+            # 🔴 blend 的**张数与文生图同源**：草稿里同样写
+            # `abilities.gen_option.gen_count`（参考仓自检原文可见该字段）。
+            # 早先这里只放行 t2i，理由是"blend 的 metrics 里 generateCount 恒为 1"——
+            # 那是把**埋点计数**误当成控制字段了：实测请求 n=1 仍出 4 张、按 4 张计费。
+            model_key = (upstream_model or DEFAULT_MODEL) if cap.name == "t2i" \
+                else DEFAULT_MODEL
             opts = self.cfg.count_options(model_key)
             note = self.cfg.degradation_note(model_key)
             if note:
@@ -370,8 +375,10 @@ class Service:
             n, warn = resolve_count(model_key, n_raw, opts)
             if warn:
                 degradations.append(warn)
-        elif cap.name != "t2i" and n_raw != 1:
-            # 后编辑族一次只出一张；blend 的 metrics 里 generateCount 恒为 1
+        elif cap.name not in ("t2i", "i2i") and n_raw != 1:
+            # 后编辑族（hd / pro-hd / outpaint）的张数控制**未取证**：
+            # 它们用单个 `origin_image` + `postedit_param`，与 blend 的 `gen_option`
+            # 不是同一条路径 ⇒ 仍然只接受 1，其余**留痕**（不静默）。
             degradations.append(
                 f"model {cap.api_id} 不支持指定张数（实测由上游决定出图数量，"
                 f"如扩图固定出 4 张），请求的 n={n_raw} 已忽略。")
@@ -710,8 +717,12 @@ class Service:
                 negative_prompt=rec.negative_prompt, seed=rec.seed,
                 count_options=opts)
         elif cap.name == "i2i":
-            # blend 原生吃**列表** ⇒ 多张垫图一次带上
-            sid = self.client.blend(rec.prompt, image_uris=image_uris, size=size)
+            # blend 原生吃**列表** ⇒ 多张垫图一次带上；
+            # 张数走与文生图**同一套吸附**（`generate_count_options`）——
+            # 草稿里真的把 `gen_count` 写进 `abilities.gen_option` 了，所以 `n` 生效。
+            opts = self.cfg.count_options(DEFAULT_MODEL) if self.cfg else None
+            sid = self.client.blend(rec.prompt, image_uris=image_uris, size=size,
+                                    count=rec.n or 1, count_options=opts)
         else:
             # 后编辑三族（hd / pro-hd / outpaint）：上游用单个 `origin_image` 承载，
             # 张数已被 `Capability.max_images`（=1）在受理时钉死，这里取第 0 张即可

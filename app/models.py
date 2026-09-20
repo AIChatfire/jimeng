@@ -96,7 +96,7 @@ CAPABILITIES: tuple[Capability, ...] = (
     Capability(
         key="jimeng:i2i", name="i2i", title="图生图（blend）",
         accepts_image=True, image_required=True, prompt_required=True,
-        jimeng_tool="blend", credits_measured=40,
+        jimeng_tool="blend", credits_measured=59,
         #: blend 是**唯一**原生用「列表」承载输入图的能力：
         #: 草稿里是 `abilities.blend.ability_list[0].image_uri_list`（列表）
         #: 与 `image_list`（列表）—— 所以多张垫图就是往这两个列表里多放元素，
@@ -107,7 +107,10 @@ CAPABILITIES: tuple[Capability, ...] = (
         max_images=4,
         notes="输入图由本服务自动上传成即梦资产 uri；**必须给 prompt**"
               "（描述要怎么改）——这是它与后编辑三工具的关键区别。"
-              "支持**多张垫图**（最多 4 张，超出会明确报错）。",
+              "支持**多张垫图**（最多 4 张，超出会明确报错）。"
+              "支持**指定张数** `n`（走 `abilities.gen_option.gen_count`）。"
+              "⚠️ 实测**积分与张数不成正比**：n=1 实测 59 积分、n=4 实测 55 积分，"
+              "所以别按「张数 × 单价」估算成本。",
     ),
     Capability(
         key="jimeng:hd", name="hd", title="超清（SuperDefinition）",

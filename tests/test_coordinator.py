@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import base64
+import json
 import time
 
 import pytest
@@ -206,13 +207,45 @@ def test_single_image_capabilities_reject_extra_images_instead_of_dropping_them(
     assert "jimeng-i2i" in err["message"], "要指路：要多张垫图请用 i2i"
 
 
-def test_image_count_has_a_global_ceiling(client, service):
-    """全局合理性上限：一次塞 6 张直接拒（真正额度由能力声明决定）。
+def test_blend_draft_carries_the_requested_count():
+    """🔴 blend 的草稿必须带 `abilities.gen_option.gen_count` —— 否则张数不生效。
 
-    ⚠️ `jimeng-i2i` 的按能力上限（4）与这里的全局上限相等，
-    所以"i2i 超限"这条**不可单独到达** —— 全局那道先拦。
-    两道并存的用意是：全局那道挡住"一次塞几百个 URL"，免得在解析出能力之前
-    就先去做昂贵的图片校验；能力那道负责精确额度（如后编辑族只许 1 张）。
+    实测教训：这个字段原先**漏了**，于是请求 `n=1` 时上游按**模型默认**出图
+    （实测得到 **4 张**、按 4 张计费 55 积分），而调用方以为只要 1 张。
+    `metrics_extra.generateCount` 只是**埋点计数**、不是控制字段。
+
+    位置照文生图：`gen_option` 与 `blend` **平级**（即 `abilities.gen_option`），
+    参考仓自检原文 `component_list[0]["abilities"]["gen_option"]["gen_count"] == 2`。
+    """
+    from app.upstream.jimeng.client import build_blend_draft
+
+    for n in (1, 2, 8):
+        d = json.loads(build_blend_draft(prompt="x", image_uri="tos-cn-i-x/a", count=n))
+        ab = d["component_list"][0]["abilities"]
+        assert "blend" in ab and "gen_option" in ab, "两者应平级"
+        assert ab["gen_option"]["gen_count"] == n
+        assert ab["gen_option"]["generate_all"] is False
+
+
+def test_i2i_passes_the_requested_count_to_blend(client, client_state,
+                                                 fake_jimeng, fake_uploader):
+    """`n` 必须真的流到 `blend()` —— 不是"收下了却不用"。"""
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    _create(client, model="jimeng-i2i", prompt="两张合成", n=2,
+            image=[_data_uri(_PNGS[0]), _data_uri(_PNGS[1])])
+    client_state.coordinator.tick()
+
+    call = fake_jimeng.of("blend")[0]
+    assert call["count"] == 2, "请求的 n 没有传到 blend"
+    assert len(call["image_uris"]) == 2, "两张垫图要一起带上"
+
+
+def test_image_count_has_a_global_ceiling(client, service):
+    """全局合理性上限：一次塞 6 张直接拒（真正的额度由能力声明决定）。
+
+    ⚠️ `jimeng-i2i` 的按能力上限（4）与这里全局上限相等，所以"i2i 超限"这条
+    **不可单独到达** —— 全局那道先拦。两道并存的用意：全局那道挡住"一次塞几百个
+    URL"，免得在解析出能力之前就先做昂贵的图片校验；能力那道负责精确额度。
     """
     r = client.post(BASE, json={"model": "jimeng-i2i", "prompt": "x",
                                 "image": [_data_uri(b) for b in _PNGS] * 2},

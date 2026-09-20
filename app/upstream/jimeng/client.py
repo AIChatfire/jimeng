@@ -676,7 +676,7 @@ def build_blend_draft(*, prompt: str, image_uris: Sequence[str] | None = None,
                       image_uri: str = "", image_url: str = "",
                       source_from: str = "upload", model: str = DEFAULT_MODEL,
                       strength: float = 0.5, width: int = 2048, height: int = 2048,
-                      resolution_type: str = "2k") -> str:
+                      resolution_type: str = "2k", count: int = 1) -> str:
     """构造**图生图（blend）**的 `draft_content`（JSON 字符串）。
 
     `source_from`：`upload` = 即梦存储里的 `image_uri`（**样本实测形态**）；
@@ -743,6 +743,16 @@ def build_blend_draft(*, prompt: str, image_uris: Sequence[str] | None = None,
                     "prompt_placeholder_info_list": [
                         {"type": "", "id": _uid(), "ability_index": 0}],
                     "postedit_param": {"type": "", "id": _uid(), "generate_type": 0},
+                },
+                # 🔴 张数控制就在这里 —— 与 `blend` **平级**（即 `abilities.gen_option`），
+                # 与文生图共用同一个字段（参考仓自检：
+                # `component_list[0]["abilities"]["gen_option"]["gen_count"] == 2`）。
+                # ⚠️ 早先漏了它：请求 `n=1` 时上游按**模型默认**（实测 4 张）出图，
+                # 于是调用方按 1 张的预期被按 4 张收费。`metrics_extra.generateCount`
+                # 只是**埋点计数**、不是控制字段（实测它写 1 也照样出 4 张）。
+                "gen_option": {
+                    "type": "", "id": _uid(),
+                    "gen_count": count, "generate_all": False,
                 },
             },
         }],
@@ -954,7 +964,9 @@ class JimengClient:
               source_from: str = "upload", model: str = DEFAULT_MODEL,
               strength: float = 0.5, size: str = DEFAULT_SIZE,
               submit_id: str | None = None, dry_run: bool = False,
-              image_uris: Sequence[str] | None = None) -> str:
+              image_uris: Sequence[str] | None = None,
+              count: int = 1,
+              count_options: tuple[int, ...] | None = None) -> str:
         """提交一个**图生图（blend）**任务，返回 `submit_id`（**计费动作**）。
 
         结构照抄账号历史里的真实 blend 样本。
@@ -962,15 +974,19 @@ class JimengClient:
         与文生图不同）—— 照抄样本，不拼凑。
 
         `image_uris` 多张垫图；与 `image_uri`（单张）二选一，复数优先。
+
+        `count` 出图张数，走**与文生图同一套吸附**（`generate_count_options`）。
         """
         width, height = parse_size(size)
+        count, warn = resolve_count(model, count, count_options)
+        # ⚠️ 必须在 dry_run 早退**之前**设好，否则 dry 路径会把告警漏掉
+        self.last_warnings = [warn] if warn else []
         draft = build_blend_draft(prompt=prompt, image_uris=image_uris,
                                   image_uri=image_uri,
                                   image_url=image_url, source_from=source_from,
                                   model=model, strength=strength,
-                                  width=width, height=height)
+                                  width=width, height=height, count=count)
         sid = submit_id or _uid()
-        self.last_warnings = []
         if dry_run:
             return sid
         body = {
@@ -979,7 +995,7 @@ class JimengClient:
                           if self.workspace_id else {})},
             "submit_id": sid,
             "metrics_extra": json.dumps({
-                "templateId": "", "generateCount": 1, "promptSource": "custom",
+                "templateId": "", "generateCount": count, "promptSource": "custom",
                 "templateSource": "", "lastRequestId": "", "originRequestId": "",
             }, separators=(",", ":")),
             "draft_content": draft,
