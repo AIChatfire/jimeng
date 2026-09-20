@@ -180,7 +180,9 @@ def test_success_body_matches_the_frozen_shape(client, client_state, fake_jimeng
                                                 "https://cdn/2.png"]
     assert set(body["data"][0]) == {"url"}, "data[] 里只该有 url（与冻结契约逐字一致）"
     assert isinstance(body["created"], int)
-    assert body["usage"] == {"images": 2, "credits": 44}
+    # 🔴 名字里带 forecast：它是上游的**预估**，不是实际扣费
+    # （实测 i2i 报 55 / 实扣 12，高估 4~9 倍）
+    assert body["usage"] == {"images": 2, "forecast_credits": 44}
 
 
 def test_usage_omits_unknown_fields_instead_of_inventing_them(client,
@@ -199,7 +201,7 @@ def test_usage_omits_unknown_fields_instead_of_inventing_them(client,
     client_state.coordinator.tick()
     usage = client.get(f"{BASE}/{tid}", headers=AUTH).json()["usage"]
     assert usage == {"images": 1}, "不知道的值不许编 —— 键不出现才对"
-    assert "credits" not in usage
+    assert "credits" not in usage and "forecast_credits" not in usage
 
 
 def test_unknown_task_is_404_with_openai_error_envelope(client):

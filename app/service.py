@@ -207,7 +207,11 @@ def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
 
     usage: dict[str, Any] = {"images": len(rec.images)}
     if rec.credits is not None:
-        usage["credits"] = rec.credits
+        # 🔴 **这是上游回执里的 `forecast_generate_cost`，是"预估"，不是实际扣费。**
+        # 实测它**严重高估**：i2i 报 55 / 实扣 **12**（t2i / hd 在 Lite 上实测**免费**，
+        # 回执照样报 44 / 9）。按 `submit_id` 对账见
+        # `POST /commerce/v1/benefits/user_credit_history`。名字里必须带 `forecast`。
+        usage["forecast_credits"] = rec.credits
     return 200, {
         "data": [{"url": im["url"]} for im in rec.images],
         "created": rec.finished_at or rec.updated_at,
@@ -667,6 +671,26 @@ class Service:
                  image_count=len(images), credits=st.cost,
                  status_name=st.status_name,
                  elapsed_s=round(now - rec.created_at, 1))
+
+        # 🔴 **扣了积分就必须在 Logfire 上看得见** —— 生成是这条链上唯一花钱的动作，
+        # 不能等翻账单才发现。落点选**任务翻终态这一刻**，不是读接口 `view()`：
+        # 后者有两个毛病 —— 没人轮询就不报警，而同一条被轮询多次会**重复报**。
+        #
+        # ⚠️ 规则刻意**不是**「forecast > 0 就报」：t2i / hd 在 Seedream 5.0 Lite 上
+        # **实测免费**（没有任何消耗记录），但上游回执照样报 44 / 9 —— 若那也告警，
+        # 告警会次次都响，真扣费的那次反而没人看了（狼来了）。按**实测价**判定：
+        #   · `credits_measured > 0` ⇒ 实测会扣 ⇒ **报**
+        #   · `credits_measured == 0` ⇒ 实测免费 ⇒ **不报**
+        #   · `credits_measured is None` ⇒ 未实测、无法排除扣费 ⇒ **报**
+        _cap = models.REGISTRY.get(rec.cap_key)
+        _measured = _cap.credits_measured if _cap else None
+        if _measured != 0:
+            OBS.warning(
+                "credits consumed", task_id=rec.task_id, model=rec.model,
+                images=len(images), n=rec.n,
+                forecast_credits=st.cost, measured_credits=_measured,
+                why=("该能力实测会扣分" if (_measured or 0) > 0
+                     else "该能力的实扣未实测，无法排除扣费"))
 
     # ------------------------------------------------------------------ 内部
 

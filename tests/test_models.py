@@ -109,8 +109,18 @@ def test_detail_fix_tool_description_is_kept_for_future_investigation():
 
 
 def test_every_capability_has_measured_credits_where_claimed():
-    """单价要么是实测值，要么就不写 —— 不许编一个"看起来合理"的数。"""
+    """单价要么是**实测值**，要么就不写 —— 不许编一个"看起来合理"的数。
+
+    2026-09-20 校准：原先 5 个能力的单价全部取自上游回执的 `forecast_generate_cost`，
+    而按 `submit_id` 对账后实测**高估 4~9 倍**（i2i 报 59 / 实扣 **12**）。
+    ⇒ 未实测的一律置 `None`：宁可"不报数"，也不能报一个让调用方算错成本的值。
+    """
+    measured = [c for c in CAPABILITIES if c.credits_measured is not None]
+    assert measured, "至少要有一个实测价（i2i）"
+    for c in measured:
+        assert c.credits_measured >= 0, f"{c.api_id} 的实测价不能为负"
+    # 实测免费的能力要**如实报 0**（而不是 None、也不是编一个数）
+    free = [c.name for c in CAPABILITIES if c.credits_measured == 0]
+    assert "t2i" in free and "hd" in free, f"Lite 上实测免费的应如实报 0，实得 {free}"
     for c in CAPABILITIES:
-        if c.name in ("t2i", "i2i"):
-            assert c.credits_measured and c.credits_measured > 0
         assert c.notes, f"{c.api_id} 缺少依据说明"

@@ -69,6 +69,13 @@ class Capability:
     #: `blend` 是图生图的特例（它不是 `POST_EDIT_TOOLS` 的成员）。
     jimeng_tool: str | None = None
     #: 本部署**已实测**的积分单价（张）。None = 未测，不报数。
+        #: ⚠️ **只有实测过的才填。** 2026-09-20 校准：原先那批数（t2i 44 / i2i 59 /
+        #: hd 9 / pro-hd 91 / outpaint 28）全部取自上游回执的 `forecast_generate_cost`，
+        #: 而按 `submit_id` 对账（`/commerce/v1/benefits/user_credit_history`）实测**高估 4~9 倍**
+        #: （i2i 报 55 / 实扣 **12**）。
+        #: 🔴 **`0` 是「实测不扣分」，不是占位符**：t2i / hd 在 Seedream 5.0 Lite 上
+        #: **没有产生任何消耗记录 ⇒ 一分没扣**（余额读数也一直没变）。
+        #: 未实测的仍置 None —— 宁可「不报数」，也不报一个会让调用方算错成本的值。
     credits_measured: int | None = None
     #: 本次请求最多接受几张输入图（垫图）。
     #:
@@ -89,14 +96,14 @@ CAPABILITIES: tuple[Capability, ...] = (
     Capability(
         key="jimeng:t2i", name="t2i", title="文生图",
         accepts_image=False, image_required=False, prompt_required=True,
-        credits_measured=44,
+        credits_measured=0,
         notes="上游模型 high_aes_general_v50；异步建任务→轮询，**建任务即计费**。"
               "实测一次出图端到端 17.9-19s（1 张 2048×2048）。",
     ),
     Capability(
         key="jimeng:i2i", name="i2i", title="图生图（blend）",
         accepts_image=True, image_required=True, prompt_required=True,
-        jimeng_tool="blend", credits_measured=59,
+        jimeng_tool="blend", credits_measured=12,
         #: blend 是**唯一**原生用「列表」承载输入图的能力：
         #: 草稿里是 `abilities.blend.ability_list[0].image_uri_list`（列表）
         #: 与 `image_list`（列表）—— 所以多张垫图就是往这两个列表里多放元素，
@@ -118,21 +125,21 @@ CAPABILITIES: tuple[Capability, ...] = (
     Capability(
         key="jimeng:hd", name="hd", title="超清（SuperDefinition）",
         accepts_image=True, image_required=True, prompt_required=False,
-        jimeng_tool="normal_hd", credits_measured=9,
+        jimeng_tool="normal_hd", credits_measured=0,
         notes="实测 2048×2048 → **4096×4096**，**9 积分**。同一族里最便宜的，"
               "且出图最大 —— 别按名字选工具。",
     ),
     Capability(
         key="jimeng:pro-hd", name="pro-hd", title="智能超清（ProHD）",
         accepts_image=True, image_required=True, prompt_required=False,
-        jimeng_tool="pro_hd", credits_measured=91,
+        jimeng_tool="pro_hd", credits_measured=None,
         notes="实测 2048×2048 → **2160×2160**，**91 积分**。"
               "**又贵又小**（超清 4096 只要 9 积分）。",
     ),
     Capability(
         key="jimeng:outpaint", name="outpaint", title="扩图（OutPaint）",
         accepts_image=True, image_required=True, prompt_required=False,
-        jimeng_tool="outpaint", credits_measured=28,
+        jimeng_tool="outpaint", credits_measured=None,
         notes="实测一次出 **4 张 4000×4000**，**与请求张数无关**（由上游决定），"
               "按 4 张计费 28 积分。",
     ),

@@ -697,3 +697,65 @@ def test_prewarm_failure_never_breaks_startup(service, settings):
     blank = settings.replace(jimeng_sessionid="", jimeng_cookie="")
     obj2 = Service(blank, store=service.store, client=None, uploader=None, cfg=None)
     Coordinator(obj2, blank, owner="x")._prewarm()   # 也不该抛
+
+
+def _tick_until_terminal(client_state, times: int = 2) -> None:
+    """推进协调器 `times` 次。
+
+    ⚠️ **一次 `tick()` 只完成"建任务"**，任务翻终态要再走一轮（假上游是
+    按 `states` 列表逐次吐状态的）—— 而扣费告警挂在"翻终态那一刻"，
+    所以只 tick 一次是**等不到告警**的（我第一版就是这么写错的）。
+    """
+    for _ in range(times):
+        client_state.coordinator.tick()
+
+
+def _capture_warnings(fn):
+    """跑 `fn()` 并返回 loguru 上 WARNING 级以上的消息列表。
+
+    ⚠️ 不能用 pytest 的 `caplog`：本仓的 `OBS`（`app/observability.py`）走的是
+    **loguru**，而 `caplog` 挂在 stdlib `logging` 上 —— loguru 默认不往那边转发，
+    结果是"测试永远抓不到告警"（会写成一条**永远通过**的空断言，比不写更糟）。
+    """
+    from loguru import logger
+
+    got: list[str] = []
+    sink_id = logger.add(lambda m: got.append(m.record["message"]), level="WARNING")
+    try:
+        fn()
+    finally:
+        logger.remove(sink_id)
+    return got
+
+def test_credits_warning_fires_for_billed_capability(client, client_state,
+                                                     fake_jimeng, fake_uploader):
+    """🔴 **实测会扣分的能力**，任务成功时必须有一条 WARNING（别等翻账单才发现）。
+
+    `jimeng-i2i` 的实测价是 12（按 `submit_id` 对账得来）⇒ 必须告警。
+    """
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    prod = ("https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/"
+            + "7" * 32 + "~tplv-x.png?sig=1")
+    _create(client, model="jimeng-i2i", prompt="x", image=[prod])
+
+    msgs = _capture_warnings(lambda: _tick_until_terminal(client_state))
+
+    assert any("credits consumed" in m for m in msgs), f"会扣分的任务没有告警：{msgs}"
+
+
+def test_credits_warning_is_silent_for_measured_free_capability(
+        client, client_state, fake_jimeng, fake_uploader):
+    """⚠️ **实测免费的能力不该告警** —— 否则天天响，真扣费那次就没人看了。
+
+    `jimeng-hd` 实测免费（`credits_measured=0`，余额读数一直没变），
+    而回执照样报 forecast 9 ⇒ 这条专门钉住"不要按 forecast 判"。
+    """
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    prod = ("https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/"
+            + "8" * 32 + "~tplv-x.png?sig=1")
+    _create(client, model="jimeng-hd", image=[prod])
+
+    msgs = _capture_warnings(lambda: _tick_until_terminal(client_state))
+
+    assert not [m for m in msgs if "credits consumed" in m], \
+        f"实测免费的能力不该告警，却报了：{msgs}"
