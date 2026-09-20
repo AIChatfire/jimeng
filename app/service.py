@@ -569,6 +569,9 @@ class Service:
         now = int(time.time())
         self.store.patch(rec.task_id, status="in_progress",
                          upstream_submit_id=sid, started_at=now,
+                         # 续生成（action=2）要求「原样再带一遍草稿」⇒ 必须存下来
+                         # ⚠️ 用 getattr 兜住测试替身（假客户端没有这个属性）
+                         draft_json=getattr(self.client, "last_draft", None) or None,
                          attempts=rec.attempts + 1)
         OBS.span("task.dispatched", **ctx)
         OBS.info("task submitted", upstream_submit_id=sid,
@@ -730,7 +733,9 @@ class Service:
         now = int(time.time())
         self.store.patch(
             rec.task_id, status="success", images=images,
-            credits=st.cost, finished_at=now, degradations=deg)
+            credits=st.cost, finished_at=now, degradations=deg,
+            # 续生成的必需字段（回执里本来就有，此前只解析不持久化）
+            upstream_history_id=getattr(st, "history_record_id", None))
         OBS.info("task succeeded", task_id=rec.task_id, model=rec.model,
                  image_count=len(images), credits=st.cost,
                  status_name=st.status_name,

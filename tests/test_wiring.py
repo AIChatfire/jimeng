@@ -462,3 +462,27 @@ def test_compose_required_env_vars_are_documented():
     assert not missing, (
         f"compose 强制要求但 .env.example 没列出的变量：{missing} —— "
         f"照文档首跑会失败在 compose 插值那一步。")
+
+
+def test_continue_task_requires_history_id_and_does_not_post_when_dry():
+    """续生成（`action=2`）的前置纪律。
+
+    ① 没有 `history_id` 就**必须报错** —— 拿不到原任务上下文，「续」出来的
+       可能是别的东西（那就成了静默做错事）。
+    ② `dry_run` **不许发上游请求** —— 否则"试一下"就变成一次真实计费生成。
+    """
+    import pytest
+
+    from app.upstream.jimeng.client import JimengClient
+    from app.upstream.jimeng import JimengParamError
+
+    c = JimengClient(sessionid="x" * 32, cookie="", base="https://jimeng.jianying.com",
+                     workspace_id="", poll_interval=2.0, capture_upstream=False)
+
+    with pytest.raises(JimengParamError):
+        c.continue_task("", '{"type":"draft"}', dry_run=True)
+
+    called = {}
+    c._post = lambda *a, **k: called.setdefault("hit", True)  # type: ignore[method-assign]
+    sid = c.continue_task("44853559987980", '{"type":"draft"}', dry_run=True)
+    assert sid and "hit" not in called, "dry_run 竟然发了上游请求"

@@ -832,6 +832,9 @@ class JimengClient:
         self._capture = capture_upstream
         #: 最近一次 submit 产生的降级告警（张数吸附等）—— 便于调用方取回并上报
         self.last_warnings: list[str] = []
+        #: 最近一次提交用的 `draft_content`（JSON 串）—— 续生成（`action=2`）
+        #: 要求**原样再带一遍草稿**（用户抓包确认），所以必须能取回。
+        self.last_draft: str = ""
         self.ua = user_agent or (
             "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
             "(KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36")
@@ -981,6 +984,7 @@ class JimengClient:
             "draft_content": draft,
             "http_common_info": {"aid": int(APPID)},
         }
+        self.last_draft = draft
         self._post(PATH_SUBMIT, body)
         return sid
 
@@ -1027,6 +1031,7 @@ class JimengClient:
             "draft_content": draft,
             "http_common_info": {"aid": int(APPID)},
         }
+        self.last_draft = draft
         self._post(PATH_SUBMIT, body)
         return sid
 
@@ -1086,6 +1091,55 @@ class JimengClient:
                           if self.workspace_id else {})},
             "submit_id": sid,
             "metrics_extra": json.dumps(metrics, separators=(",", ":")),
+            "draft_content": draft,
+            "http_common_info": {"aid": int(APPID)},
+        }
+        self.last_draft = draft
+        self._post(PATH_SUBMIT, body)
+        return sid
+
+    # ------------------------------------------------------ 续生成（action=2）
+
+    def continue_task(self, history_id: str, draft: str, *,
+                      count: int = 1, submit_id: str | None = None,
+                      dry_run: bool = False) -> str:
+        """**续生成** —— 让上游把原任务剩下的几张接着生成出来（`action=2`）。
+
+        形态**逐字来自**用户 2026-09-20 的实抓（网页端"继续生成"按钮）：
+
+        | 字段 | 值/含义 |
+        |---|---|
+        | `action` | **2** —— 首次提交**不带**它，它才是"续"的标记 |
+        | `history_id` | 原任务的 history id（= 回执里的 `history_record_id`） |
+        | `draft_content` | **原样再带一遍草稿**（所以草稿必须先持久化） |
+        | `metrics_extra.generateCount` | 一次续 1 张 |
+
+        ⚠️ **这是计费动作**（多一次真实生成）⇒ 调用方**必须有上限 + 每次留痕**，
+        不能静默循环。
+
+        `history_id` 缺了就直接报错：拿不到原任务上下文，"续"出来的可能是别的东西。
+        """
+        if not history_id:
+            raise JimengParamError(
+                "续生成需要 history_id（取回执里的 history_record_id）")
+        count, warn = resolve_count(DEFAULT_MODEL, count, None)
+        self.last_warnings = [warn] if warn else []
+        sid = submit_id or _uid()
+        self.last_draft = draft
+        if dry_run:
+            return sid
+        body = {
+            "extend": {"root_model": DEFAULT_MODEL,
+                       **({"workspace_id": self.workspace_id}
+                          if self.workspace_id else {})},
+            "action": 2,
+            "submit_id": sid,
+            "history_id": history_id,
+            "metrics_extra": json.dumps({
+                "promptSource": "custom", "generateCount": count,
+                "generateId": sid, "templateId": "0", "enterFrom": "click",
+                "isRegenerate": False, "isBoxSelect": False, "isCutout": False,
+            }, separators=(",", ":")),
             "draft_content": draft,
             "http_common_info": {"aid": int(APPID)},
         }
