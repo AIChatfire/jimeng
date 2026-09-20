@@ -69,17 +69,28 @@ def test_translate_seed_minus1_equals_random():
     assert "seed" not in our
 
 
-def test_translate_rejects_reference_roles():
-    """方舟 r2v/i2v 角色（参考图/视频/首帧）⇒ 400 说清楚，绝不静默丢。"""
-    for role in ("reference_image", "reference_video", "first_frame"):
-        with pytest.raises(InvalidParameterError, match="不支持"):
-            translate_ark_create({
-                "model": ARK_MODEL,
-                "content": [{"type": "text", "text": "x"},
-                            {"type": "image_url",
-                             "image_url": {"url": "https://x/a.png"},
-                             "role": role}],
-            })
+def test_translate_reference_roles_become_omni_materials():
+    """方舟 r2v/i2v 角色 → 即梦全能参考素材（image/video/audio 数组）。"""
+    our, deg = translate_ark_create({
+        "model": ARK_MODEL,
+        "content": [
+            {"type": "text", "text": "全程使用视频1的构图，音频1作为背景音乐"},
+            {"type": "image_url", "image_url": {"url": "https://x/a.png"},
+             "role": "first_frame"},
+            {"type": "image_url", "image_url": {"url": "https://x/b.png"},
+             "role": "reference_image"},
+            {"type": "video_url", "video_url": {"url": "https://x/v.mp4"},
+             "role": "reference_video"},
+            {"type": "audio_url", "audio_url": {"url": "https://x/a.mp3"},
+             "role": "reference_audio"},
+        ],
+    })
+    assert our["image"] == ["https://x/a.png", "https://x/b.png"]
+    assert our["video"] == ["https://x/v.mp4"]
+    assert our["audio"] == ["https://x/a.mp3"]
+    assert any("全能参考" in d and "2 图 / 1 视频 / 1 音频" in d for d in deg)
+    # 角色语义不逐一对应 —— 必须留痕
+    assert any("first_frame" in d or "参考图" in d for d in deg)
 
 
 def test_translate_unsupported_params_degrade_not_reject():

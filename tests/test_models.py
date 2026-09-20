@@ -98,8 +98,8 @@ def test_catalog_hides_deliberately_absent_capabilities():
     # 五个已端到端验证过的能力都在；jimeng-t2v / jimeng-vfi 是"已适配、
     # 未端到端实跑"（notes 里如实写明，见 test_video.py）
     assert ids == {c.api_id for c in CAPABILITIES}
-    assert len(ids) == 7
-    assert {"jimeng-t2v", "jimeng-vfi"} <= ids
+    assert len(ids) == 8
+    assert {"jimeng-t2v", "jimeng-vfi", "jimeng-omni-video"} <= ids
 
 
 def test_detail_fix_tool_description_is_kept_for_future_investigation():

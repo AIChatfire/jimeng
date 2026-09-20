@@ -51,6 +51,7 @@ from .client import (
     build_draft,
     build_post_edit_draft,
     build_video_draft,
+    build_video_omni_draft,
     build_video_vfi_draft,
     classify_reject,
     parse_size,
@@ -59,14 +60,15 @@ from .client import (
     ratio_for_size,
     resolve_video_commerce,
 )
-from .upload import ImageXError, ImageXUploader
+from .upload import ImageXError, ImageXUploader, VodUploader
 
 __all__ = [
     "JimengClient", "TaskState", "GeneratedImage", "ImageXUploader", "ImageXError",
+    "VodUploader",
     "JimengError", "JimengAuthError", "JimengRateLimitError", "JimengQuotaError",
     "JimengRiskError", "JimengContentError", "JimengParamError", "JimengTimeout",
     "build_draft", "build_blend_draft", "build_post_edit_draft", "build_video_draft",
-    "build_video_vfi_draft",
+    "build_video_omni_draft", "build_video_vfi_draft",
     "parse_task",
     "parse_size", "ratio_for_size", "raise_for_ret", "classify_reject",
     "POST_EDIT_TOOLS", "TASK_STATUS", "IMAGE_RATIOS", "ERR_NO",

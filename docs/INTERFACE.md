@@ -34,17 +34,38 @@
 翻译与降级规则（全部在 `degradations` 里可见，查询响应原样带回）：
 
 * `model`：任何 `doubao-seedance-*` → 映射到 `jimeng-t2v`（降级留痕）；
-* `content[]`：只接受 `text`；`image_url`/`video_url`/`audio_url`（r2v/i2v）
-  **不支持，400** —— 即梦 t2v 无参考能力（未抓包）；
+* `content[]`：`text` ⇒ 文生视频；带 `image_url`/`video_url`/`audio_url`
+  ⇒ 翻译成即梦**全能参考**（omni_reference，混合参考素材），
+  方舟的角色语义（first_frame 等）不逐一对应，降级留痕；
 * `ratio "adaptive"` → 默认 16:9（降级留痕）；`duration`/`resolution` 过
-  即梦计费档位白名单（当前 720p×4s）；
+  即梦计费档位白名单（720p×4s/5s）；
 * `watermark` / `generate_audio` / `callback_url` / `return_last_frame` 等
   方舟常规参数 → **降级留痕不挡人**；
 * 🔴 `usage`（completion_tokens/total_tokens）**不给** —— 即梦链路没有
   token 口径，伪造数字等于说谎；预估积分以扩展字段 `usage.forecast_credits`
   给出（仅成功任务）。
 
-### 0.3 视频补帧（jimeng-vfi，仅 /async/v1/videos 提供）
+### 0.3 全能参考 / 补帧（仅 /async/v1/videos 提供）
+
+**全能参考视频**（`jimeng-omni-video`，带素材即默认路由到它）：
+
+```json
+{
+  "prompt": "用参考视频的构图，图片做首帧",  // 必填（指令）
+  "image": ["https://…/a.png"],            // 可选，参考图（走 ImageX）
+  "video": ["https://…/v.mp4"],            // 可选，参考视频（走 VOD → vid）
+  "audio": ["https://…/a.mp3"],            // 可选，参考音频（走 VOD → vid）
+  "resolution": "720p", "duration": 5      // 已实抓档位：720p×4s/5s
+}
+```
+
+* 素材总数 ≤ 6（实抓样本 4：2 视频+1 图+1 音频）；
+* **计费口径（实抓解出）**：amount = 输出秒数 + Σ输入视频秒数（音频不计）；
+  ⚠️ 输入视频时长服务端暂探测不到 ⇒ 预扣只按输出时长计并留痕，
+  实扣以积分消耗记录为准；
+* 提交侧已按实抓逐字段适配，**端到端实跑未验证**（15.35 积分级）。
+
+**视频补帧**（`jimeng-vfi`）：
 
 ```json
 { "source_task_id": "jimeng_…", "target_fps": 60 }   // model/prompt 可省略

@@ -95,8 +95,13 @@ def aws4_sign(*, method: str, host: str, path: str, query: dict[str, str],
               access_key: str, secret_key: str, session_token: str,
               payload: bytes, signed_headers: tuple[str, ...],
               extra_headers: dict[str, str] | None = None,
+              service: str = SERVICE,
               now: _dt.datetime | None = None) -> dict[str, str]:
-    """按抓包的形态生成 AWS4 签名头。返回需要附加到请求上的头。"""
+    """按抓包的形态生成 AWS4 签名头。返回需要附加到请求上的头。
+
+    `service`：ImageX 是 `imagex`，VOD（视频/音频上传）是 `vod`
+    （2026-09-20 实抓：Credential=`.../cn-north-1/vod/aws4_request`）。
+    """
     now = now or _dt.datetime.now(_dt.timezone.utc)
     amz_date = now.strftime("%Y%m%dT%H%M%SZ")
     date = now.strftime("%Y%m%d")
@@ -117,13 +122,15 @@ def aws4_sign(*, method: str, host: str, path: str, query: dict[str, str],
         method, path, canonical_query, canonical_headers, signed,
         hdrs["x-amz-content-sha256"],
     ])
-    scope = f"{date}/{REGION}/{SERVICE}/aws4_request"
+    scope = f"{date}/{REGION}/{service}/aws4_request"
     string_to_sign = "\n".join([
         "AWS4-HMAC-SHA256", amz_date, scope, _sha256_hex(canonical_request.encode()),
     ])
+    # 🔴 密钥推导必须用**传入的 service**（不是模块常量 SERVICE）——
+    # 这里曾经踩过：scope 行改了 vod、推导还在用 imagex ⇒ 签名永远不匹配。
     k = _hmac(("AWS4" + secret_key).encode(), date)
     k = _hmac(k, REGION)
-    k = _hmac(k, SERVICE)
+    k = _hmac(k, service)
     k = _hmac(k, "aws4_request")
     sig = hmac.new(k, string_to_sign.encode(), hashlib.sha256).hexdigest()
 
@@ -382,7 +389,247 @@ def _find_uri(obj) -> str | None:
     return None
 
 
+# ---------------------------------------------------------------------------
+# VOD 上传（视频 / 音频 → `vid`）
+# ---------------------------------------------------------------------------
+# 取证：2026-09-20 三条实抓（ApplyUploadInner / 上传 / CommitUploadInner）。
+# 与 ImageX 同一把 STS（policy 里 vod:* 与 ImageX:* 同授），但端点、签名、
+# 产物形态都不同：
+#
+# | 维度 | ImageX（图片） | **VOD（视频/音频）** |
+# |---|---|---|
+# | host | token 下发的 upload_domain | **固定 `vod.bytedanceapi.com`** |
+# | Apply | ApplyImageUpload（ServiceId=space） | **ApplyUploadInner**（SpaceName/ FileType=video/IsInner=1/FileSize/s=<随机串>） |
+# | 签名 service | imagex | **vod** |
+# | Commit 签名 | 含 host+content-type | **只有 x-amz-content-sha256;x-amz-date;x-amz-security-token**（content-type 发但不签） |
+# | Commit body | {"SessionKey": ...} | **{"SessionKey": ..., "Functions": []}**，content-type `text/plain;charset=UTF-8` |
+# | 产物 | `image_uri`（tos-cn-i-...） | **`vid`（v0xxxx...）** —— 正是全能参考草稿里 video_info/audio_info.vid 的形态 |
+#
+# ⚠️ Apply/Commit 的**响应体没有抓包**（用户只给了请求侧）—— 解析按
+# VOD 通用形态做多键兜底，并已用真实小文件探测过（见 scripts/probe_vod_upload.py）。
+
+VOD_HOST = "vod.bytedanceapi.com"
+VOD_API_VERSION = "2020-11-19"
+VOD_SPACE = "dreamina"
+
+
+class VodUploader:
+    """把视频/音频字节传成即梦可引用的 `vid`。**不产生生成、不扣积分。**"""
+
+    def __init__(self, client: JimengClient, *,
+                 imagex: ImageXUploader | None = None,
+                 timeout: float = 120.0,
+                 transport: httpx.BaseTransport | None = None) -> None:
+        self.c = client
+        #: 与 ImageXUploader **共享同一把 STS**（同一个 get_upload_token）
+        self._imagex = imagex
+        self.timeout = timeout
+        # 🔴 trust_env=False：本机系统代理（scutil --proxy）会拦
+        # `*.snssdk.com` 的上传节点（实测 502 ProxyError）—— 上传 host 是
+        # 国内 CDN，直连即可；imagex 域名不受影响所以旧链路没暴露。
+        self._client = httpx.Client(timeout=timeout, transport=transport,
+                                    trust_env=False)
+
+    def close(self) -> None:
+        self._client.close()
+
+    def _token(self, *, force: bool = False) -> dict:
+        if force and self._imagex is not None:
+            return self._imagex.token(force=True)
+        if self._imagex is not None:
+            return self._imagex.token()
+        t = self.c._post(PATH_TOKEN, {"scene": 2})  # noqa: SLF001
+        d = t.get("data") or {}
+        if not d.get("access_key_id"):
+            raise ImageXError("get_upload_token 返回缺少 STS 字段")
+        return d
+
+    # ------------------------------------------------------------------ Apply
+
+    def apply(self, file_size: int, *, max_wait_s: float = 150.0) -> dict:
+        """ApplyUploadInner，**签名被拒时退避重试直至穿过服务端同步窗口**。
+
+        实测（2026-09-20，~30 次对照）：同一把 STS、同一算法，签名验证存在
+        **约 2 分钟周期的间歇性失败**（SignatureDoesNotMatch），与请求路径/
+        头部/scene/IP 均无关 —— 疑似 VOD 侧 STS 同步批处理。签名算法本身
+        已按抓包形态逐字段实现并在窗口内稳定成功。
+        ⇒ 策略：免费动作 + 后台协调器执行 ⇒ 允许最长 ~150s 的重试环
+        （5s 间隔，每 3 次强制刷新 STS）。生成类动作绝不能这么等。
+        """
+        import time  # noqa: PLC0415
+        deadline = time.monotonic() + max_wait_s
+        attempt = 0
+        while True:
+            t = self._token(force=(attempt % 3 == 2))
+            import random  # noqa: PLC0415
+            query = {"Action": "ApplyUploadInner", "Version": VOD_API_VERSION,
+                     "SpaceName": VOD_SPACE, "FileType": "video",
+                     "IsInner": "1", "FileSize": str(file_size),
+                     "s": "".join(random.choices(
+                         "abcdefghijklmnopqrstuvwxyz0123456789", k=12))}
+            signed = ("x-amz-date", "x-amz-security-token")  # 照抄抓包：不含 host
+            h = aws4_sign(method="GET", host=VOD_HOST, path="/", query=query,
+                          access_key=t["access_key_id"],
+                          secret_key=t["secret_access_key"],
+                          session_token=t["session_token"], payload=b"",
+                          signed_headers=signed, service="vod")
+            url = f"https://{VOD_HOST}/?" + "&".join(
+                f"{k}={v}" for k, v in query.items())
+            try:
+                r = self._client.get(url, headers=h)
+            except httpx.HTTPError as e:
+                raise ImageXError(
+                    f"ApplyUploadInner 请求失败：{e}", retryable=True) from e
+            try:
+                res = _unwrap_vod(r, "ApplyUploadInner")
+            except ImageXError as e:
+                if ("SignatureDoesNotMatch" not in str(e)
+                        or time.monotonic() >= deadline):
+                    raise
+                attempt += 1
+                time.sleep(5.0)
+                continue
+            addr = (res.get("UploadAddress")
+                    if isinstance(res.get("UploadAddress"), dict) else res)
+            if not isinstance(addr, dict) or not (
+                    addr.get("InnerUploadAddress") or addr.get("UploadNodes")
+                    or addr.get("StoreInfos")):
+                raise ImageXError(
+                    f"ApplyUploadInner 响应形态不认识：{str(res)[:300]}")
+            return addr
+
+    # ------------------------------------------------------------------ PUT
+
+    def put(self, node: dict, data: bytes) -> None:
+        """把字节传到 VOD 指定的存储位。
+
+        实测（2026-09-20 探针）：VOD 的 UploadHost 走的是 **TOS 上传网关**
+        （与 ImageX 同款协议）：POST https://{UploadHost}/upload/v1/{StoreUri}
+        + `content-crc32` 头；PUT 直连 StoreUri 反而不通（且 UploadHost 的
+        CNAME 在系统解析器下可能失败 ⇒ 统一走 /upload/v1 网关路径）。
+        """
+        si = (node.get("StoreInfos") or node.get("storeInfos") or [{}])[0]
+        uri = si.get("StoreUri") or si.get("storeUri")
+        auth = si.get("Auth") or si.get("auth")
+        hosts = (node.get("UploadHosts") or node.get("uploadHosts")
+                 or ([node["UploadHost"]] if node.get("UploadHost") else []))
+        if not (uri and auth and hosts):
+            raise ImageXError(
+                f"UploadNode 缺字段（uri={bool(uri)} auth={bool(auth)} "
+                f"hosts={hosts}）：{sorted(node)}")
+        headers = {"authorization": auth,
+                   "content-type": "application/octet-stream",
+                   "content-crc32": f"{zlib.crc32(data) & 0xFFFFFFFF:08x}"}
+        url = f"https://{hosts[0]}/upload/v1/{uri}"
+        try:
+            r = self._client.post(url, headers=headers, content=data)
+        except httpx.HTTPError as e:
+            raise ImageXError(f"VOD 上传字节失败：{e}", retryable=True) from e
+        if r.status_code >= 400:
+            raise ImageXError(
+                f"VOD 上传字节被拒：HTTP {r.status_code} {r.text[:200]!r}",
+                retryable=r.status_code >= 500)
+
+    # ------------------------------------------------------------------ Commit
+
+    def commit(self, session_key: str) -> dict:
+        t = self._token()
+        body = json.dumps({"SessionKey": session_key, "Functions": []},
+                          ensure_ascii=False, separators=(",", ":")).encode()
+        query = {"Action": "CommitUploadInner", "Version": VOD_API_VERSION,
+                 "SpaceName": VOD_SPACE}
+        # 照抄抓包：只有 sha256/date/security-token 三个签名头，
+        # content-type 是 text/plain 且**不参与签名**
+        signed = ("x-amz-content-sha256", "x-amz-date", "x-amz-security-token")
+        h = aws4_sign(method="POST", host=VOD_HOST, path="/", query=query,
+                      access_key=t["access_key_id"],
+                      secret_key=t["secret_access_key"],
+                      session_token=t["session_token"], payload=body,
+                      signed_headers=signed, service="vod",
+                      extra_headers={"content-type": "text/plain;charset=UTF-8"})
+        url = f"https://{VOD_HOST}/?" + "&".join(f"{k}={v}" for k, v in query.items())
+        try:
+            r = self._client.post(url, headers=h, content=body)
+        except httpx.HTTPError as e:
+            raise ImageXError(f"CommitUploadInner 请求失败：{e}", retryable=True) from e
+        return _unwrap_vod(r, "CommitUploadInner")
+
+    # ------------------------------------------------------------------ 一步到位
+
+    def upload(self, data: bytes, *, dry_run: bool = False) -> dict:
+        """上传视频/音频字节，返回 `{"vid": …, "store_uri": …, "commit": …}`。
+
+        **不产生生成、不扣积分。** `vid` 是全能参考草稿里
+        `video_info.vid` / `audio_info.vid` 需要的值。
+        """
+        self._token()
+        if dry_run:
+            return {"vid": "dry-run", "store_uri": None, "commit": None}
+        addr = self.apply(len(data))
+        node = addr
+        inner = (addr.get("InnerUploadAddress")
+                 if isinstance(addr.get("InnerUploadAddress"), dict) else None)
+        if inner:
+            nodes = inner.get("UploadNodes") or []
+            if nodes:
+                node = nodes[0]
+        session_key = (node.get("SessionKey") or node.get("sessionKey")
+                       or addr.get("SessionKey"))
+        si = (node.get("StoreInfos") or node.get("storeInfos") or [{}])[0]
+        store_uri = si.get("StoreUri") or si.get("storeUri")
+        if not session_key:
+            session_key = base64.b64encode(
+                json.dumps(node, ensure_ascii=False,
+                           separators=(",", ":")).encode()).decode()
+        self.put(node, data)
+        out = self.commit(session_key)
+        vid = _find_vid(out)
+        if not vid:
+            raise ImageXError(
+                f"CommitUploadInner 成功但拿不到 vid：{json.dumps(out, default=str)[:400]}")
+        return {"vid": vid, "store_uri": store_uri, "commit": out}
+
+
+def _unwrap_vod(r: httpx.Response, what: str) -> dict:
+    """VOD 响应解包：`Result` / `Response.Data` 两种形态都认。"""
+    try:
+        d = r.json()
+    except Exception as e:
+        raise ImageXError(
+            f"{what} 返回非 JSON（HTTP {r.status_code}）：{r.text[:200]!r}",
+            retryable=r.status_code >= 500) from e
+    if r.status_code >= 400 or (d.get("ResponseMetadata") or {}).get("Error"):
+        err = (d.get("ResponseMetadata") or {}).get("Error") or {}
+        raise ImageXError(
+            f"{what} 失败：HTTP {r.status_code} "
+            f"code={err.get('Code')} msg={err.get('Message')}",
+            retryable=False)
+    if isinstance(d.get("Result"), dict):
+        return d["Result"]
+    data = (d.get("Response") or {}).get("Data")
+    return data if isinstance(data, dict) else d
+
+
+def _find_vid(obj) -> str | None:
+    """从 commit 结果里挖出 `v0xxxx…` 形态的 vid。"""
+    if isinstance(obj, dict):
+        for k in ("Vid", "vid", "VID"):
+            v = obj.get(k)
+            if isinstance(v, str) and v.startswith("v0"):
+                return v
+        for v in obj.values():
+            got = _find_vid(v)
+            if got:
+                return got
+    if isinstance(obj, list):
+        for v in obj:
+            got = _find_vid(v)
+            if got:
+                return got
+    return None
+
+
 __all__ = [
-    "ImageXUploader", "ImageXError", "aws4_sign",
-    "URI_CACHE_TTL", "STS_REUSE_SECONDS",
+    "ImageXUploader", "ImageXError", "VodUploader", "aws4_sign",
+    "URI_CACHE_TTL", "STS_REUSE_SECONDS", "VOD_HOST", "VOD_SPACE",
 ]

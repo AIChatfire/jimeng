@@ -832,9 +832,11 @@ def build_blend_draft(*, prompt: str, image_uris: Sequence[str] | None = None,
 
 #: 抓包实测的视频模型（网页端 Seedance 4.0 Mini，t2v）。
 DEFAULT_VIDEO_MODEL = "dreamina_seedance_40_mini"
-#: (分辨率, 时长秒) → (benefit_type, 预扣积分 amount)。**只有实抓过的才登记。**
-VIDEO_COMMERCE: dict[tuple[str, int], tuple[str, int]] = {
-    ("720p", 4): ("seedance_20_mini_720p_output_5s", 4),
+#: 分辨率 → (benefit_type, 已实抓的输出时长秒集合)。
+#: 🔴 计费口径（两条实抓联立解出）：amount = 输出秒数 + Σ输入视频秒数
+#: （4s 无输入 ⇒ 4；5s + 10.35s 输入 ⇒ **15.35**）。benefit_type 只按分辨率定。
+VIDEO_COMMERCE: dict[str, tuple[str, tuple[int, ...]]] = {
+    "720p": ("seedance_20_mini_720p_output_5s", (4, 5)),
 }
 #: 分辨率取值（抓包见 720p；1080p 是站点枚举但**无抓包样本**，登记仅供报错提示）。
 VIDEO_RESOLUTIONS: tuple[str, ...] = ("720p", "1080p")
@@ -845,17 +847,29 @@ DEFAULT_VIDEO_ASPECT_RATIO = "16:9"
 DEFAULT_VIDEO_FPS = 24
 
 
-def resolve_video_commerce(resolution: str, duration_s: int) -> tuple[str, int]:
-    """查 (分辨率, 时长) 对应的计费档位。**白名单外一律拒绝**，绝不猜。"""
-    hit = VIDEO_COMMERCE.get((resolution, int(duration_s)))
-    if hit is None:
-        known = ", ".join(f"{r}×{d}s" for r, d in sorted(VIDEO_COMMERCE))
+def resolve_video_commerce(resolution: str, duration_s: int,
+                           input_video_s: float = 0.0) -> tuple[str, float]:
+    """查视频计费档位：返回 (benefit_type, 预扣 amount)。
+
+    🔴 计费口径（两条实抓联立解出）：
+    · 4s 无输入 ⇒ amount 4；5s + 10.35s 输入视频 ⇒ amount **15.35**
+      ⇒ **amount = 输出秒数 + Σ输入视频秒数**（音频不计入；1 积分/秒）；
+    · `benefit_type` 只按分辨率定，档位名里的 "output_5s" 与实际时长无关
+      （4s 的抓包也叫 output_5s）—— 照抄别"纠正"。
+
+    白名单外（1080p、>5s 等）没有抓包依据 ⇒ 拒绝，绝不猜计费字段。
+    """
+    hit = VIDEO_COMMERCE.get(resolution)
+    if hit is None or int(duration_s) not in hit[1]:
+        known = ", ".join(f"{r}×{d}s" for r, durs in sorted(VIDEO_COMMERCE.items())
+                          for d in durs)
         raise JimengParamError(
             f"视频档位 {resolution} × {duration_s}s 没有抓包依据，"
             f"本服务拒绝构造计费字段（benefit_type/amount 写错 = 按错档位扣积分）。"
             f"当前已实抓的档位：{known}。要放开新档位请先补抓对应请求包。",
             code=1001)
-    return hit
+    amount = round(int(duration_s) + float(input_video_s), 2)
+    return hit[0], amount
 
 
 def build_video_draft(*, prompt: str,
@@ -1056,6 +1070,150 @@ def build_video_vfi_draft(source_draft: str, *, prompt: str, vid: str,
         "version": DA_VERSION,
         "main_component_id": child_id,
         "component_list": [parent, child],   # 父组件**原样**重放
+    }
+    return json.dumps(draft, ensure_ascii=False, separators=(",", ":"))
+
+
+def build_video_omni_draft(*, instruction: str,
+                           materials: list[dict[str, Any]],
+                           model: str = DEFAULT_VIDEO_MODEL,
+                           resolution: str = DEFAULT_VIDEO_RESOLUTION,
+                           duration_ms: int = 4000,
+                           aspect_ratio: str = DEFAULT_VIDEO_ASPECT_RATIO,
+                           fps: int = DEFAULT_VIDEO_FPS,
+                           seed: int | None = None,
+                           metrics: dict[str, Any] | None = None) -> str:
+    """构造**全能参考视频**（omni_reference / unified_edit）的 `draft_content`。
+
+    结构逐字段照抄 2026-09-20 实抓（2 视频 + 1 图 + 1 音频的混合参考）。
+    与 t2v 草稿的差异：
+
+    · `min_version "3.3.9"` + `min_features ["AIGC_Video_UnifiedEdit"]`；
+    · `prompt` 字段为 **""**，指令放在 `unified_edit_input.meta_list` 的
+      text 条目里（照抄抓包形态）；
+    · 素材在 `material_list`：video→`video_info.vid`、image→`image_info.image_uri`
+      （走 ImageX 上传，与图生图同一链路）、audio→`audio_info.vid`
+      （走 VOD 上传，产物 `vid`）；
+    · **引用结构**：meta_list 用 `material_ref.material_idx` 指向素材下标 ——
+      照抄抓包：**视频素材不进 meta_list**，图片/音频各一条，指令文本一条。
+
+    `materials` 每项：`{"kind": "image"|"video"|"audio", "uri": <image_uri|vid>,
+    "width"?, "height"?, "duration_ms"?, "name"?}`（已由服务层上传完成）。
+    """
+    if not instruction or not instruction.strip():
+        raise JimengParamError("全能参考需要指令文本（prompt）", code=1001)
+    if not materials:
+        raise JimengParamError(
+            "全能参考至少要一个参考素材（图/视频/音频）；纯文字请走 jimeng-t2v",
+            code=1001)
+    video_task_extra = json.dumps(metrics or {}, ensure_ascii=False,
+                                  separators=(",", ":"))
+    comp_id = _uid()
+    material_list: list[dict[str, Any]] = []
+    meta_list: list[dict[str, Any]] = []
+    material_types: list[int] = []
+    for idx, m in enumerate(materials):
+        kind = m.get("kind")
+        uid = _uid()
+        if kind == "video":
+            material_list.append({
+                "type": "", "id": uid, "material_type": "video",
+                "video_info": {"type": "video", "id": _uid(),
+                               "source_from": "upload", "name": "",
+                               "vid": m["uri"],
+                               "fps": 0,
+                               "width": int(m.get("width") or 0),
+                               "height": int(m.get("height") or 0),
+                               "duration": int(m.get("duration_ms") or 0),
+                               "cover_image_url": ""}})
+            # 🔴 照抄抓包：视频素材**不进 meta_list**
+            material_types.append(2)
+        elif kind == "image":
+            material_list.append({
+                "type": "", "id": uid, "material_type": "image",
+                "image_info": {"type": "image", "id": _uid(),
+                               "source_from": "upload", "platform_type": 1,
+                               "name": "", "image_uri": m["uri"],
+                               "aigc_image": {"type": "", "id": _uid()},
+                               "width": int(m.get("width") or 0),
+                               "height": int(m.get("height") or 0),
+                               "format": "", "title": m.get("name") or "",
+                               "uri": m["uri"]}})
+            meta_list.append({"type": "", "id": _uid(), "meta_type": "image",
+                              "text": "",
+                              "material_ref": {"type": "", "id": _uid(),
+                                               "material_idx": idx}})
+            material_types.append(1)
+        elif kind == "audio":
+            material_list.append({
+                "type": "", "id": uid, "material_type": "audio",
+                "audio_info": {"type": "audio", "id": _uid(),
+                               "source_from": "upload",
+                               "vid": m["uri"],
+                               "duration": int(m.get("duration_ms") or 0),
+                               "name": m.get("name") or ""}})
+            meta_list.append({"type": "", "id": _uid(), "meta_type": "audio",
+                              "text": "",
+                              "material_ref": {"type": "", "id": _uid(),
+                                               "material_idx": idx}})
+            material_types.append(3)
+        else:
+            raise JimengParamError(
+                f"素材[{idx}] 的 kind {kind!r} 不认识（image/video/audio）",
+                code=1001)
+    meta_list.append({"type": "", "id": _uid(), "meta_type": "text",
+                      "text": instruction})
+    draft = {
+        "type": "draft",
+        "id": _uid(),
+        "min_version": "3.3.9",
+        "min_features": ["AIGC_Video_UnifiedEdit"],
+        "is_from_tsn": True,
+        "version": DA_VERSION,
+        "main_component_id": comp_id,
+        "component_list": [{
+            "type": "video_base_component",
+            "id": comp_id,
+            "min_version": "1.0.0",
+            "aigc_mode": "workbench",
+            "metadata": {
+                "type": "", "id": _uid(), "created_platform": 3,
+                "created_platform_version": "",
+                "created_time_in_ms": str(_now_ms()), "created_did": "",
+            },
+            "generate_type": "gen_video",
+            "abilities": {
+                "type": "", "id": _uid(),
+                "gen_video": {
+                    "type": "", "id": _uid(),
+                    "text_to_video_params": {
+                        "type": "", "id": _uid(),
+                        "video_gen_inputs": [{
+                            "type": "", "id": _uid(),
+                            "min_version": "3.3.9",
+                            "prompt": "",                    # 照抄抓包：空
+                            "video_mode": 2,
+                            "fps": fps,
+                            "duration_ms": duration_ms,
+                            "resolution": resolution,
+                            "idip_meta_list": [],
+                            "unified_edit_input": {
+                                "type": "", "id": _uid(),
+                                "material_list": material_list,
+                                "meta_list": meta_list,
+                            },
+                        }],
+                        "video_aspect_ratio": aspect_ratio,
+                        "seed": seed if seed is not None
+                                else random.randint(1, 2 ** 32 - 1),
+                        "model_req_key": model,
+                        "priority": 0,
+                    },
+                    "video_task_extra": video_task_extra,
+                },
+            },
+            "process_type": 1,
+        }],
     }
     return json.dumps(draft, ensure_ascii=False, separators=(",", ":"))
 
@@ -1469,6 +1627,93 @@ class JimengClient:
         if dry_run:
             return sid
         commerce = {"amount": VFI_AMOUNT, "benefit_type": VFI_BENEFIT_TYPE,
+                    "resource_id": "generate_video", "resource_id_type": "str",
+                    "resource_sub_type": "aigc"}
+        body = {
+            "extend": {"root_model": DEFAULT_VIDEO_MODEL,
+                       "m_video_commerce_info": commerce,
+                       **({"workspace_id": self.workspace_id}
+                          if self.workspace_id else {}),
+                       "m_video_commerce_info_list": [dict(commerce)]},
+            "submit_id": sid,
+            "metrics_extra": json.dumps(metrics, ensure_ascii=False,
+                                        separators=(",", ":")),
+            "draft_content": draft,
+            "http_common_info": {"aid": int(APPID)},
+        }
+        self._post(PATH_SUBMIT, body)
+        return sid
+
+    # ------------------------------------------------------------ 全能参考视频
+
+    def submit_video_omni(self, instruction: str, *,
+                          materials: list[dict[str, Any]],
+                          resolution: str = DEFAULT_VIDEO_RESOLUTION,
+                          duration_ms: int = 4000,
+                          aspect_ratio: str = DEFAULT_VIDEO_ASPECT_RATIO,
+                          seed: int | None = None,
+                          input_video_s: float = 0.0,
+                          submit_id: str | None = None,
+                          dry_run: bool = False) -> str:
+        """提交一个**全能参考视频**任务，返回 `submit_id`（**计费动作**）。
+
+        形态照抄 2026-09-20 实抓（omni_reference，混合参考 2 视频+1 图+1 音频）。
+        `materials` 每项 `{"kind", "uri", ...}` —— 素材**必须已上传**
+        （image→image_uri 走 ImageX；video/audio→vid 走 VOD，见 VodUploader）。
+
+        计费：amount = 输出秒数 + Σ输入视频秒数（音频不计），见
+        `resolve_video_commerce`；输入视频时长服务层探测不到时按 0 计并留痕。
+        `dry_run=True` 不发请求。
+        """
+        duration_s = int(duration_ms // 1000)
+        if duration_ms <= 0 or duration_ms % 1000:
+            raise JimengParamError(
+                f"duration_ms 必须是正的整秒（毫秒），实得 {duration_ms}", code=1001)
+        if resolution not in VIDEO_RESOLUTIONS:
+            raise JimengParamError(
+                f"resolution 只接受 {list(VIDEO_RESOLUTIONS)}，实得 {resolution!r}",
+                code=1001)
+        if aspect_ratio not in VIDEO_ASPECT_RATIOS:
+            raise JimengParamError(
+                f"aspect_ratio 只接受 {list(VIDEO_ASPECT_RATIOS)}，"
+                f"实得 {aspect_ratio!r}", code=1001)
+        benefit, amount = resolve_video_commerce(resolution, duration_s,
+                                                 input_video_s=input_video_s)
+        sid = submit_id or _uid()
+        type_code = {"video": 2, "image": 1, "audio": 3}
+        material_types = [type_code.get(m.get("kind"), 0) for m in materials]
+        input_video = any(m.get("kind") == "video" for m in materials)
+        metrics: dict[str, Any] = {
+            "isDefaultSeed": 1, "originSubmitId": sid, "isRegenerate": False,
+            "enterFrom": "click", "position": "page_bottom_box",
+            "promptType": "original_prompt",
+            "functionMode": "omni_reference", "generatorFeature": "omniReference",
+            "sceneOptions": json.dumps([{
+                "type": "video", "scene": "BasicVideoGenerateButton",
+                "resolution": resolution, "modelReqKey": DEFAULT_VIDEO_MODEL,
+                "videoDuration": duration_s, "batchNumber": 1,
+                "inputVideoDuration": round(float(input_video_s), 2),
+                "chargeInputVideoDuration": True,
+                "isLongVideo": False,
+                "hasInputVideo": input_video,
+                "useSeedanceFast5sFreeTrial": False,
+                "reportParams": {
+                    "enterSource": "generate", "vipSource": "generate",
+                    "extraVipFunctionKey": f"{DEFAULT_VIDEO_MODEL}-{resolution}",
+                    "useVipFunctionDetailsReporterHoc": True},
+                "materialTypes": material_types,
+            }], separators=(",", ":")),
+            "batchNumber": 1, "submitGroupId": _uid(), "hasRejectedAudit": 0,
+        }
+        draft = build_video_omni_draft(
+            instruction=instruction, materials=materials,
+            resolution=resolution, duration_ms=duration_ms,
+            aspect_ratio=aspect_ratio, seed=seed, metrics=metrics)
+        self.last_warnings = []
+        self.last_draft = draft
+        if dry_run:
+            return sid
+        commerce = {"amount": amount, "benefit_type": benefit,
                     "resource_id": "generate_video", "resource_id_type": "str",
                     "resource_sub_type": "aigc"}
         body = {

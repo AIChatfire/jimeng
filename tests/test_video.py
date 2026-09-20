@@ -77,16 +77,19 @@ def test_build_video_draft_requires_prompt():
 
 
 def test_resolve_video_commerce_whitelist():
+    # amount = 输出秒数 + 输入视频秒数（两条实抓联立解出的口径）
     assert resolve_video_commerce("720p", 4) == \
         ("seedance_20_mini_720p_output_5s", 4)
+    assert resolve_video_commerce("720p", 5, input_video_s=10.35) == \
+        ("seedance_20_mini_720p_output_5s", 15.35)
 
 
 def test_resolve_video_commerce_rejects_unverified_tier():
-    # 1080p / 5s 没有抓包依据 —— 拒绝构造计费字段，绝不猜
+    # 1080p / 8s 没有抓包依据 —— 拒绝构造计费字段，绝不猜
     with pytest.raises(JimengParamError):
         resolve_video_commerce("1080p", 4)
     with pytest.raises(JimengParamError):
-        resolve_video_commerce("720p", 5)
+        resolve_video_commerce("720p", 8)
 
 
 def test_submit_video_dry_run_never_sends():
@@ -522,3 +525,119 @@ def test_vfi_requires_source(app_and_client, client):
                      json={"source_task_id": src_id})
     assert r.status_code == 400
     assert "已成功" in r.json()["error"]["message"]
+
+
+# ---------------------------------------------------------------------------
+# 全能参考视频（omni_reference / unified_edit_input：图+视频+音频混合参考）
+# ---------------------------------------------------------------------------
+
+from app.upstream.jimeng import build_video_omni_draft  # noqa: E402
+
+# 1x1 PNG（走 ImageX 链路的图片素材）
+PNG_1PX = bytes.fromhex(
+    "89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c489"
+    "0000000d4944415478da63fcffff3f030005fe02fea72d1e480000000049454e44"
+    "ae426082")
+IMG_REF = "data:image/png;base64," + __import__("base64").b64encode(
+    PNG_1PX).decode()
+VID_REF = "data:video/mp4;base64," + __import__("base64").b64encode(
+    b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64).decode()
+
+
+def _omni_metrics() -> dict:
+    return {"enterFrom": "click"}
+
+
+def test_build_omni_draft_matches_capture():
+    """全能参考草稿逐字段对 2026-09-20 实抓（unified_edit_input）。"""
+    materials = [
+        {"kind": "video", "uri": "v0d870fake", "width": 864, "height": 480,
+         "duration_ms": 5175},
+        {"kind": "image", "uri": "tos-cn-i-x/abc", "width": 2048,
+         "height": 2048, "name": "first_frame"},
+        {"kind": "audio", "uri": "v02870fake", "duration_ms": 5976,
+         "name": "bgm"},
+    ]
+    draft = json.loads(build_video_omni_draft(
+        instruction="首帧，艾特音频", materials=materials,
+        resolution="720p", duration_ms=5000, aspect_ratio="16:9",
+        seed=2225192095, metrics=_omni_metrics()))
+    assert draft["min_version"] == "3.3.9"
+    assert draft["min_features"] == ["AIGC_Video_UnifiedEdit"]
+    comp = draft["component_list"][0]
+    inp = (comp["abilities"]["gen_video"]["text_to_video_params"]
+           ["video_gen_inputs"][0])
+    assert inp["prompt"] == ""                       # 🔴 照抄抓包：空
+    assert inp["duration_ms"] == 5000 and inp["resolution"] == "720p"
+    ue = inp["unified_edit_input"]
+    ml = ue["material_list"]
+    assert [m["material_type"] for m in ml] == ["video", "image", "audio"]
+    assert ml[0]["video_info"]["vid"] == "v0d870fake"
+    assert ml[1]["image_info"]["image_uri"] == "tos-cn-i-x/abc"
+    assert ml[2]["audio_info"]["vid"] == "v02870fake"
+    meta = ue["meta_list"]
+    # 🔴 照抄抓包：视频素材不进 meta_list；图/音各一条 + 指令文本一条
+    assert [m["meta_type"] for m in meta] == ["image", "audio", "text"]
+    assert meta[0]["material_ref"]["material_idx"] == 1
+    assert meta[1]["material_ref"]["material_idx"] == 2
+    assert meta[2]["text"] == "首帧，艾特音频"
+
+
+def test_build_omni_draft_requires_instruction_and_materials():
+    with pytest.raises(JimengParamError):
+        build_video_omni_draft(instruction="  ", materials=[
+            {"kind": "image", "uri": "x"}])
+    with pytest.raises(JimengParamError):
+        build_video_omni_draft(instruction="x", materials=[])
+
+
+def test_submit_omni_commerce_amount():
+    """计费口径：amount = 输出秒数 + 输入视频秒数（实抓 5s+10.35s ⇒ 15.35）。"""
+    captured: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured["body"] = json.loads(request.content)
+        return httpx.Response(200, json={"ret": 0, "data": {}})
+
+    materials = [{"kind": "video", "uri": "v1"}, {"kind": "video", "uri": "v2"},
+                 {"kind": "image", "uri": "tos-cn-i-x/abc"},
+                 {"kind": "audio", "uri": "a1"}]
+    with JimengClient(sessionid="s", workspace_id=1,
+                      transport=httpx.MockTransport(handler)) as c:
+        c.submit_video_omni("指令", materials=materials, resolution="720p",
+                            duration_ms=5000, seed=1, input_video_s=10.35)
+    commerce = captured["body"]["extend"]["m_video_commerce_info"]
+    assert commerce["amount"] == 15.35
+    assert commerce["benefit_type"] == "seedance_20_mini_720p_output_5s"
+    metrics = json.loads(captured["body"]["metrics_extra"])
+    scene = json.loads(metrics["sceneOptions"])[0]
+    assert scene["hasInputVideo"] is True
+    assert scene["inputVideoDuration"] == 10.35
+    assert scene["materialTypes"] == [2, 2, 1, 3]    # 实抓同款顺序编码
+    assert metrics["functionMode"] == "omni_reference"
+
+
+def test_omni_end_to_end(app_and_client, fake_jimeng, fake_uploader,
+                         fake_vod, client_state):
+    """视频端点带 video/audio/image 素材 → 路由到全能参考 → 假上传器接线。"""
+    _, client, _ = app_and_client
+    fake_jimeng.states = [_video_ok_state()]
+    r = client.post("/async/v1/videos/generations", headers=AUTH,
+                    json={"prompt": "用参考视频的构图，图片做首帧",
+                          "image": [IMG_REF], "video": [VID_REF],
+                          "audio": [VID_REF], "duration": 5})
+    assert r.status_code == 202, r.text
+    task_id = r.json()["task_id"]
+    rec = client_state.service.store.get(task_id)
+    assert rec.model == "jimeng-omni-video"
+    client_state.coordinator.tick()
+    call = fake_jimeng.of("submit_video_omni")[0]
+    mats = call["materials"]
+    assert [m["kind"] for m in mats] == ["image", "video", "audio"]
+    assert mats[0]["uri"].startswith("tos-cn-i-")     # 图片走 ImageX（假上传器）
+    assert fake_uploader.uploads and fake_vod.uploads  # 两条上传链都走到了
+    assert mats[1]["uri"].startswith("v0")            # VOD vid
+    assert call["duration_ms"] == 5000
+    # 输入视频时长探测不到 ⇒ 降级留痕（计费口径偏差必须可见）
+    rec = client_state.service.store.get(task_id)
+    assert any("输入视频时长" in d for d in rec.degradations)

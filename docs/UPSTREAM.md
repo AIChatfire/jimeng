@@ -409,3 +409,46 @@ body: {"count": 20, "cursor": "0", "history_type": 2}     # 2 = 消耗
 我们拿不到实际时长，默认取请求时长，语义差异未验证。
 ⚠️ 引用三件套（vid/item_id/origin_history_id）只有走我们自己的产物链才拿得到
 ⇒ 补帧入口必须给本服务的 `source_task_id`（跨凭证引用已拦）。
+
+### 13.2 全能参考视频（omni_reference / unified_edit_input，2026-09-20 实抓）
+
+`min_version "3.3.9"` + `min_features ["AIGC_Video_UnifiedEdit"]`。
+**混合参考素材**（实抓样本：2 视频 + 1 图 + 1 音频）：
+
+* `prompt` 字段为 **""**，指令在 `unified_edit_input.meta_list` 的 text 条目里；
+* `material_list`：video→`video_info.vid`（fps:0/duration/cover 空）·
+  image→`image_info.image_uri`（**与图生图同一 ImageX 上传链路**）·
+  audio→`audio_info.vid`+duration+name；
+* 🔴 **引用结构**：meta_list 用 `material_ref.material_idx` 引用素材 ——
+  **视频素材不进 meta_list**，图片/音频各一条，指令文本一条（照抄抓包）；
+* `sceneOptions.materialTypes` 顺序编码：**2=video 1=image 3=audio**。
+
+### 13.3 计费口径（两条实抓联立解出）
+
+| 样本 | 时长 | 输入视频 | amount |
+|---|---|---|---|
+| t2v | 4s | 无 | **4** |
+| 全能参考 | 5s | 10.35s（两段合计） | **15.35** |
+
+⇒ **amount = 输出秒数 + Σ输入视频秒数**（≈1 积分/秒；音频不计入）。
+`benefit_type` 只按分辨率定（都是 `seedance_20_mini_720p_output_5s`，
+名字里的 output_5s 与实际时长无关 —— 4s 的也叫它，照抄别纠正）。
+⚠️ 服务端暂探测不到输入视频时长（VOD CommitUploadInner 只回宽高/大小，
+无 duration）⇒ 本服务预扣只按输出时长计并留痕，实扣以积分记录为准。
+
+### 13.4 视频/音频上传（VOD，与图片的 ImageX 并列的第二条上传链）
+
+`ApplyUploadInner` → POST `https://{UploadHost}/upload/v1/{StoreUri}`
+（**与 ImageX 同款 TOS 上传网关**，带 `content-crc32`）→ `CommitUploadInner`
+（body `{"SessionKey":…,"Functions":[]}`，content-type text/plain）→ **`vid`**。
+
+* 端点固定 `vod.bytedanceapi.com`；AWS4 签名 service=**vod**（不是 imagex）；
+* Apply 响应形态：`Result.InnerUploadAddress.UploadNodes[0]`，**Vid 在 Apply
+  阶段就已分配**（与 SessionKey 解码内容一致）；
+* Commit 响应：`Results[0]` = `{Vid, VideoMeta{Uri,Width,Height,Size}}`；
+* STS 与图片同一把（`get_upload_token`，policy 同时授 vod:*/ImageX:*）；
+  ⚠️ **AWS4 密钥推导的 service 必须跟请求一致** —— 曾因 scope 行改成 vod、
+  推导仍用 imagex 常量而全量 SignatureDoesNotMatch；
+* ⚠️ 上传 host（`*.snssdk.com`）**不能走系统代理**（502 ProxyError）——
+  客户端 `trust_env=False` 直连；
+* 全链路**免费**（不产生生成、不扣积分），已用真实小文件端到端验证。

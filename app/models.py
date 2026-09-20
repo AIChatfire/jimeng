@@ -186,6 +186,20 @@ CAPABILITIES: tuple[Capability, ...] = (
               "父组件为源任务草稿原样重放（实抓里连组件 id 都没变）。"
               "Ark 方舟契约没有补帧概念 —— 该能力只在 /async/v1/videos 提供。",
     ),
+    Capability(
+        key="jimeng:omni-video", name="omni-video", title="全能参考视频（图/视频/音频）",
+        accepts_image=True, image_required=False, prompt_required=True,
+        credits_measured=None, media="video", max_images=4,
+        notes="上游模型同 seedance，unified_edit_input（全能参考）："
+              "**混合参考素材** —— 图片走 ImageX 上传（与图生图同链路）、"
+              "视频/音频走 VOD 上传（ApplyUploadInner/CommitUploadInner → vid）。"
+              "**计费口径（实抓解出）**：amount = 输出秒数 + Σ输入视频秒数"
+              "（4s⇒4；5s+10.35s 输入⇒15.35；音频不计）。"
+              "⚠️ 输入视频时长服务端暂探测不到 ⇒ 预扣只按输出时长计并留痕，"
+              "实扣以上游结算为准。已实抓档位 720p×4s/5s。"
+              "提交侧已按实抓逐字段适配；**端到端实跑未验证**（15.35 积分级）。"
+              "Ark 门面的 image_url/video_url/audio_url 角色翻译到本能力。",
+    ),
 )
 
 REGISTRY: dict[str, Capability] = {c.key: c for c in CAPABILITIES}

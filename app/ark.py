@@ -13,10 +13,11 @@
 
 · 模型名 `doubao-seedance-*` → 映射到 `jimeng-t2v`（即梦 Seedance 4.0 Mini），
   **降级留痕**（请求的模型 ≠ 实际服务的模型，必须让调用方看见）；
-· `content[]` 只接受 `text` —— 即梦 t2v 无参考图/参考视频/首帧能力
-  （未抓包），见到一律 400 说清楚，绝不静默丢弃；
-· `duration`/`resolution` 过即梦计费档位白名单（当前仅 720p×4s）；
+· `content[]`：`text` ⇒ 文生视频（t2v）；带 `image_url`/`video_url`/`audio_url`
+  ⇒ 翻译成即梦**全能参考**（omni_reference，material_list+meta_list）——
+  方舟的角色语义（first_frame 等）不逐一对应，降级留痕；
 · `ratio "adaptive"` → 16:9 降级留痕；
+· `duration`/`resolution` 过即梦计费档位白名单（720p×4s/5s）；
 · `watermark` / `generate_audio` / `return_last_frame` / `callback_url` /
   `camera_fixed` / `output_format` / `frames` / `draft` / `service_tier` /
   `omni_reference_task_type` 等 → **认得但做不到**，降级留痕不报错
@@ -104,6 +105,9 @@ def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str
             f"模型 {model} 已映射到 {ARK_TARGET_MODEL}"
             f"（即梦 Seedance 4.0 Mini，t2v）—— 实际服务的模型以本说明为准。")
     prompt_parts: list[str] = []
+    images: list[str] = []
+    videos: list[str] = []
+    audios: list[str] = []
     for i, item in enumerate(content):
         if not isinstance(item, dict):
             raise InvalidParameterError(f"content[{i}] 必须是对象", param="content")
@@ -113,13 +117,30 @@ def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str
             if txt:
                 prompt_parts.append(txt)
             continue
-        if t in ("image_url", "video_url", "audio_url", "image", "video"):
-            raise InvalidParameterError(
-                f"content[{i}] 的 {t}（role={item.get('role')!r}）本服务不支持："
-                f"即梦 t2v 无参考图/参考视频/首帧/音频能力（未抓包）。"
-                f"文生视频请只传 [{{type: text, text: ...}}]；"
-                f"补帧（插帧）走 /async/v1/videos + model=jimeng-vfi + source_task_id。",
-                param=f"content[{i}]")
+        if t in ("image_url", "video_url", "audio_url"):
+            url = ((item.get(t) or {}) or {}).get("url")
+            if not isinstance(url, str) or not url.strip():
+                raise InvalidParameterError(
+                    f"content[{i}] 的 {t} 缺少 url", param=f"content[{i}]")
+            role = item.get("role") or ""
+            if t == "image_url":
+                images.append(url.strip())
+                if role == "reference_image":
+                    degradations.append(
+                        f"content[{i}] role=reference_image：即梦全能参考没有"
+                        f"『参考图』与『首帧』的角色区分，已按普通参考图处理。")
+                elif role not in ("first_frame", "last_frame", ""):
+                    degradations.append(
+                        f"content[{i}] role={role!r} 不是方舟图片角色的标准取值，"
+                        f"已按普通参考图处理。")
+            elif t == "video_url":
+                videos.append(url.strip())
+                if role != "reference_video":
+                    degradations.append(
+                        f"content[{i}] role={role!r} 已按参考视频处理。")
+            else:
+                audios.append(url.strip())
+            continue
         raise InvalidParameterError(
             f"content[{i}] 的 type {t!r} 不是方舟视频生成契约的取值。",
             param=f"content[{i}]")
@@ -129,6 +150,17 @@ def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str
 
     our: dict[str, Any] = {"model": ARK_TARGET_MODEL,
                            "prompt": "\n".join(prompt_parts)}
+    if images:
+        our["image"] = images
+    if videos:
+        our["video"] = videos
+    if audios:
+        our["audio"] = audios
+    if images or videos or audios:
+        degradations.append(
+            f"参考素材已翻译为即梦**全能参考**（{len(images)} 图 / {len(videos)} 视频 / "
+            f"{len(audios)} 音频）：方舟的角色语义（first_frame 等）不逐一对应，"
+            f"素材以 material_list+meta_list 整体提交，效果以即梦实际生成为准。")
     for k in ("resolution", "duration", "aspect_ratio", "seed"):
         if body.get(k) is not None:
             our[k] = body[k]

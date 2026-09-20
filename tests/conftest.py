@@ -182,6 +182,14 @@ class FakeJimeng:
             raise self.fail_submit
         return self._new_submit_id()
 
+    def submit_video_omni(self, instruction: str, **kw: Any) -> str:
+        """全能参考视频 —— 记录指令与已上传素材。"""
+        self._record("submit_video_omni", prompt=instruction, **kw)
+        self.last_draft = self._VIDEO_DRAFT
+        if self.fail_submit:
+            raise self.fail_submit
+        return self._new_submit_id()
+
     # ---- 取任务 ----
     def fetch_many(self, submit_ids: list[str]) -> dict[str, TaskState]:
         """批量查询 —— **一次调用 = 一轮上游查询**（与服务侧的真实实现同构）。
@@ -274,6 +282,24 @@ class FakeUploader:
         pass
 
 
+@dataclass
+class FakeVod:
+    """假 VOD 上传器：记录字节，返回固定 vid（含 VideoMeta 形态）。"""
+
+    vid: str = "v02870fake0001vid0000000000"
+    uploads: list[bytes] = field(default_factory=list)
+
+    def upload(self, data: bytes, **kw: Any) -> dict:
+        self.uploads.append(data)
+        return {"vid": self.vid, "store_uri": "tos-cn-v-fake/x",
+                "commit": {"Results": [{"Vid": self.vid,
+                                        "VideoMeta": {"Width": 480,
+                                                      "Height": 360}}]}}
+
+    def close(self) -> None:
+        pass
+
+
 class FakeConfigCache:
     """假的能力表缓存：默认给 v50 服务端声明的 1..8。"""
 
@@ -360,10 +386,16 @@ def fake_uploader() -> FakeUploader:
 
 
 @pytest.fixture
+def fake_vod() -> FakeVod:
+    return FakeVod()
+
+
+@pytest.fixture
 def service(settings: Settings, store: TaskStore, fake_jimeng: FakeJimeng,
-            fake_uploader: FakeUploader) -> Service:
+            fake_uploader: FakeUploader, fake_vod: FakeVod) -> Service:
     return Service(settings, store=store, client=fake_jimeng,
-                   uploader=fake_uploader, cfg=FakeConfigCache())
+                   uploader=fake_uploader, vod=fake_vod,
+                   cfg=FakeConfigCache())
 
 
 @pytest.fixture
@@ -400,7 +432,7 @@ def app_and_client(service: Service, settings: Settings, fake_jimeng: FakeJimeng
         if settings_ is settings:
             return service          # 基础 app：复用同一实例（同一 gate / 同一 store）
         return RealService(settings_, client=fake_jimeng, uploader=fake_uploader,
-                           cfg=FakeConfigCache())
+                           vod=fake_vod, cfg=FakeConfigCache())
 
     opened: list[Any] = []
 

@@ -43,7 +43,7 @@ from .errors import (
     UpstreamUnavailableError,
 )
 from .gate import UpstreamGate, build_gate
-from .media import load_images, normalize, reuse_image_uri
+from .media import Blob, load_images, load_one, normalize, reuse_image_uri
 from .observability import OBS
 from .store import TaskRecord, TaskStore
 from .upstream.jimeng import (
@@ -63,6 +63,7 @@ from .upstream.jimeng import (
     JimengRiskError,
     JimengTimeout,
     ImageXUploader,
+    VodUploader,
     parse_size,
     resolve_video_commerce,
 )
@@ -77,7 +78,8 @@ ACCEPTED_FIELDS = frozenset({
 })
 #: **视频接口额外**允许的字段（图片接口见到它们 = 传错了地方，400 说清楚）。
 VIDEO_FIELDS = frozenset({"resolution", "duration", "aspect_ratio",
-                          "source_task_id", "target_fps"})
+                          "source_task_id", "target_fps",
+                          "video", "audio"})
 #: **认得但本服务做不到**的字段 —— 见到就进 `degradations`（响亮降级），
 #: 而不是当"未知字段"报错。它们来自 OpenAI/方舟图片接口的习惯写法。
 KNOWN_UNSUPPORTED_FIELDS = frozenset({
@@ -267,6 +269,7 @@ class Service:
     def __init__(self, settings: Settings, *, store: TaskStore | None = None,
                  client: JimengClient | None = None,
                  uploader: ImageXUploader | None = None,
+                 vod: VodUploader | None = None,
                  gate: UpstreamGate | None = None,
                  cfg: ModelConfigCache | None = None) -> None:
         self.settings = settings
@@ -295,11 +298,17 @@ class Service:
             self.cfg = ModelConfigCache(self.client)
         if self.client is not None and self.uploader is None:
             self.uploader = ImageXUploader(self.client)
+        #: VOD 上传（视频/音频 → vid），与 ImageX **共享同一把 STS**。
+        #: 测试可注入假上传器；生产自动构建。
+        self.vod = vod
+        if self.vod is None and self.client is not None \
+                and self.uploader is not None:
+            self.vod = VodUploader(self.client, imagex=self.uploader)
 
     # ------------------------------------------------------------------ 生命周期
 
     def close(self) -> None:
-        for obj in (self.uploader, self.client):
+        for obj in (self.vod, self.uploader, self.client):
             closer = getattr(obj, "close", None)
             if callable(closer):
                 try:
@@ -363,9 +372,9 @@ class Service:
                 param=sorted(unknown)[0])
         if video:
             # 视频端点**不收**图片族字段：size（视频用 resolution 档位）、
-            # negative_prompt（视频草稿没有该字段，实抓确认）、image（t2v 不吃垫图；
-            # i2v 未适配）。静默忽略 = 调用方以为生效了 —— 必须当场说清。
-            banned = sorted(set(body) & {"size", "image", "negative_prompt"})
+            # negative_prompt（视频草稿没有该字段，实抓确认）。
+            # `image` 已放行（全能参考吃图片素材）。
+            banned = sorted(set(body) & {"size", "negative_prompt"})
             if banned:
                 raise InvalidParameterError(
                     f"字段 {banned} 不属于视频接口：视频用 resolution/duration/"
@@ -399,12 +408,18 @@ class Service:
         prompt = (prompt or "").strip()
 
         #: 🔴 视频端点的默认推导在**这里**定死（resolve 只负责形态校验）：
-        #: 给了 `source_task_id` ⇒ jimeng-vfi（补帧离开源任务没有意义）；
-        #: 否则 ⇒ jimeng-t2v。不留给"两个候选挑不出"的歧义报错 ——
-        #: 那会让上一版"留空即 t2v"的调用方突然全部 400。
+        #: 带参考素材（video/audio/图片）⇒ 全能参考；给了 `source_task_id` ⇒ 补帧；
+        #: 否则 ⇒ t2v。不留给"多个候选挑不出"的歧义报错。
+        has_materials = bool(body.get("video") or body.get("audio")
+                             or image)
         eff_model = body.get("model")
         if video and not eff_model:
-            eff_model = "jimeng-vfi" if body.get("source_task_id") else "jimeng-t2v"
+            if has_materials:
+                eff_model = "jimeng-omni-video"
+            elif body.get("source_task_id"):
+                eff_model = "jimeng-vfi"
+            else:
+                eff_model = "jimeng-t2v"
         cap, upstream_model = models.resolve(eff_model, has_image=bool(image),
                                             n_images=len(image), video=video)
         if cap.prompt_required and not prompt:
@@ -465,6 +480,23 @@ class Service:
                     "补帧草稿没有 seed 字段（实抓确认）⇒ seed 已忽略。")
 
         extra_info: dict[str, Any] | None = None
+        if cap.name == "omni-video":
+            # 全能参考素材清单（引用原样落库，派发时才下载/上传 —— 受理零上游往返）。
+            omni: list[dict[str, str]] = (
+                [{"kind": "image", "ref": r} for r in image]
+                + [{"kind": "video", "ref": r}
+                   for r in self._validate_refs(body.get("video"), "video")]
+                + [{"kind": "audio", "ref": r}
+                   for r in self._validate_refs(body.get("audio"), "audio")])
+            if not omni:
+                raise InvalidParameterError(
+                    "全能参考至少要一个参考素材（image/video/audio）；"
+                    "纯文字请走 jimeng-t2v。", param="video")
+            if len(omni) > 6:
+                raise InvalidParameterError(
+                    f"参考素材最多 6 个（实抓样本 4 个：2 视频+1 图+1 音频），"
+                    f"本次 {len(omni)} 个。", param="video")
+            extra_info = {"omni": omni}
         if cap.name == "vfi":
             assert src_rec is not None
             extra_info = {
@@ -485,7 +517,9 @@ class Service:
             # 分辨率/时长的默认值：补帧**沿用源任务**（实抓形态），
             # t2v 用实抓档位（720p × 4s）。
             resolution = body.get("resolution") or (
-                (src_rec.size if src_rec else None) or DEFAULT_VIDEO_RESOLUTION)
+                (src_rec.size if src_rec else None)
+                or ("720p" if cap.name == "omni-video"
+                    else DEFAULT_VIDEO_RESOLUTION))
             if not isinstance(resolution, str) or resolution not in VIDEO_RESOLUTIONS:
                 raise InvalidParameterError(
                     f"resolution 只接受 {list(VIDEO_RESOLUTIONS)}，实得 {resolution!r}。",
@@ -494,7 +528,9 @@ class Service:
             duration = body.get("duration")
             if duration is None:
                 duration = ((src_rec.duration_ms or 4000) // 1000
-                            if src_rec else 4)     # 实抓档位：720p × 4s
+                            if src_rec
+                            else (5 if cap.name == "omni-video" else 4))
+                # omni 实抓档位 5s；t2v 实抓档位 4s
             if isinstance(duration, bool) or not isinstance(duration, int) \
                     or duration < 1:
                 raise InvalidParameterError(
@@ -632,6 +668,26 @@ class Service:
                  size=rec.size, n=rec.n,
                  degradations=len(degradations), dry_run=dry_run)
         return rec
+
+    @staticmethod
+    def _validate_refs(raw: Any, field: str) -> list[str]:
+        """校验 video/audio 素材引用数组（形态同 image：非空字符串数组）。"""
+        if raw is None:
+            return []
+        if isinstance(raw, str):
+            raise InvalidParameterError(
+                f"{field} 必须是**数组**；单条请写 `{field}: [\"https://…\"]`。",
+                param=field)
+        if not isinstance(raw, list):
+            raise InvalidParameterError(f"{field} 必须是数组", param=field)
+        out: list[str] = []
+        for i, item in enumerate(raw):
+            if not isinstance(item, str) or not item.strip():
+                raise InvalidParameterError(
+                    f"{field}[{i}] 必须是非空字符串（http(s) URL / data URI）",
+                    param=field)
+            out.append(item.strip())
+        return out
 
     @staticmethod
     def _validate_image(raw: Any) -> list[str]:
@@ -1021,6 +1077,16 @@ class Service:
 
     # ------------------------------------------------------------------ 内部
 
+    def _load_media_ref(self, ref: str) -> Blob:
+        """加载任意参考素材（URL / data URI / base64）—— 不做图片嗅探校验
+        （视频/音频不是图片；大小上限复用 MAX_INPUT_BYTES 的语义）。"""
+        blob = load_one(ref, self.settings)
+        if blob.size > self.settings.max_input_bytes:
+            raise InvalidParameterError(
+                f"参考素材超过上限 {self.settings.max_input_bytes} 字节",
+                param="video")
+        return blob
+
     def _transfer_one(self, blob: Any) -> tuple[str, list[str], int]:
         """归一化 + 上传**一张**，返回 (uri, 降级说明, 字节数)。
 
@@ -1136,6 +1202,45 @@ class Service:
                 duration_ms=rec.duration_ms or 4000,
                 aspect_ratio=rec.aspect_ratio or DEFAULT_VIDEO_ASPECT_RATIO,
                 seed=rec.seed)
+        elif cap.name == "omni-video":
+            # 全能参考：素材**现在**才下载/上传（受理时只落库引用）。
+            # 图片走 ImageX（复用图生图链路）；视频/音频走 VOD → vid。
+            # ⚠️ 输入视频时长暂探测不到 ⇒ 计费 amount 只按输出时长计并留痕。
+            info = json.loads(rec.extra_json or "{}")
+            materials: list[dict[str, Any]] = []
+            input_video_s = 0.0
+            for m in info.get("omni", []):
+                blob = self._load_media_ref(m["ref"])
+                if m["kind"] == "image":
+                    uri, _, _ = self._transfer_one(blob)
+                    materials.append({"kind": "image", "uri": uri})
+                else:
+                    if self.vod is None:
+                        raise CapabilityUnavailableError(
+                            "服务未配置 VOD 上传器", upstream="jimeng")
+                    out = self.vod.upload(blob.data)
+                    materials.append({
+                        "kind": m["kind"], "uri": out["vid"],
+                        "width": ((out.get("commit") or {}).get("Results")
+                                  or [{}])[0].get("VideoMeta", {}).get("Width"),
+                        "height": ((out.get("commit") or {}).get("Results")
+                                   or [{}])[0].get("VideoMeta", {}).get("Height"),
+                    })
+                    if m["kind"] == "video":
+                        # ⚠️ 探测不到时长：留痕 + 计费按 0 输入计
+                        materials[-1]["duration_ms"] = 0
+            input_video_s = 0.0      # 见上：时长探测不到，预扣只按输出时长
+            sid = self.client.submit_video_omni(
+                rec.prompt, materials=materials,
+                resolution=rec.size or DEFAULT_VIDEO_RESOLUTION,
+                duration_ms=rec.duration_ms or 5000,
+                aspect_ratio=rec.aspect_ratio or DEFAULT_VIDEO_ASPECT_RATIO,
+                seed=rec.seed, input_video_s=input_video_s)
+            if any(m.get("kind") == "video" for m in materials):
+                self.store.patch(rec.task_id, degradations=list(rec.degradations) + [
+                    "⚠️ 输入视频时长无法在服务端探测 ⇒ 计费字段 amount "
+                    "只按输出时长预扣；上游可能按总时长（输出+输入视频秒数）计费，"
+                    "**实扣以积分消耗记录为准**。"])
         elif cap.name == "vfi":
             # 补帧：从 extra_json 取源引用三件套；源草稿**现读现用**
             # （父组件要原样重放，`draft_json` 在受理时就随源任务落库了）。
