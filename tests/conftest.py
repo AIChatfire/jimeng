@@ -256,14 +256,21 @@ class FakeConfigCache:
     """假的能力表缓存：默认给 v50 服务端声明的 1..8。"""
 
     def __init__(self, options: tuple[int, ...] = (1, 2, 3, 4, 5, 6, 7, 8),
-                 note: str | None = None) -> None:
+                 note: str | None = None,
+                 declared: tuple[int, ...] | None = None) -> None:
         self.options = options
         self.note = note
+        #: **服务端声明值**（不做兜底的那个）。默认与 `options` 一致 = 已声明。
+        #: 设成 None 可模拟"该模型就是不声明张数选项"（实测真实存在这种模型）。
+        self.declared = options if declared is None else declared
         self.calls = 0
 
     def count_options(self, model: str) -> tuple[int, ...]:
         self.calls += 1
         return self.options
+
+    def count_options_declared(self, model: str) -> tuple[int, ...] | None:
+        return self.declared
 
     def input_image_limit(self, model: str) -> int | None:
         return None

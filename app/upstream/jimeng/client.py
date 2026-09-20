@@ -575,7 +575,8 @@ def build_post_edit_draft(*, tool: str, image_uri: str = "", image_url: str = ""
                           width: int = 2048, height: int = 2048,
                           resolution_type: str = "2k",
                           up_scale: dict[str, Any] | None = None,
-                          parent_id: str | None = None) -> str:
+                          parent_id: str | None = None,
+                          count: int = 1) -> str:
     """构造**后编辑**任务的 `draft_content`（返回 JSON 字符串）。
 
     `source_from`：`upload` = 引用即梦存储里的 `image_uri`（抓包实测形态）；
@@ -643,7 +644,18 @@ def build_post_edit_draft(*, tool: str, image_uri: str = "", image_url: str = ""
                         "created_platform_version": "",
                         "created_time_in_ms": str(_now_ms()), "created_did": ""}
     comp["generate_type"] = spec["generate_type"]
-    comp["abilities"] = {"type": "", "id": _uid(), spec["ability"]: ability}
+    # 🔴 `gen_option` 是**组件级**字段：它挂在组件的 `abilities` 下、与具体 ability
+    # **平级**。文生图与 blend 都写在这里（参考仓自检原文：
+    # `component_list[0]["abilities"]["gen_option"]["gen_count"] == 2`），
+    # 后编辑族同属 `image_base_component` ⇒ 同一个位置也吃它。
+    #
+    # ⚠️ 这里原先**漏了**，于是"扩图固定出 4 张"看起来像上游的硬约束 ——
+    # 其实是我们没传张数、上游才用了默认值。**同一个坑在 blend 上已经踩过一次。**
+    comp["abilities"] = {
+        "type": "", "id": _uid(), spec["ability"]: ability,
+        "gen_option": {"type": "", "id": _uid(),
+                       "gen_count": count, "generate_all": False},
+    }
 
     draft = {
         "type": "draft", "id": _uid(), "min_version": "3.2.9", "min_features": [],
@@ -1011,26 +1023,36 @@ class JimengClient:
              source_from: str = "upload", size: str = DEFAULT_SIZE,
              resolution_type: str = "2k",
              up_scale: dict | None = None,
-             submit_id: str | None = None, dry_run: bool = False) -> str:
+             submit_id: str | None = None, dry_run: bool = False,
+             count: int = 1,
+             count_options: tuple[int, ...] | None = None) -> str:
         """提交一个**后编辑**任务（智能超清/超清/扩图/细节修复），返回 `submit_id`。
 
         **计费动作**（与 `submit` 同级）。工具清单见 `POST_EDIT_TOOLS`。
         输入图必须是即梦存储里的 `image_uri`（`source_from="upload"`）。
+
+        `count` 出图张数，**与文生图/blend 走同一套吸附**（`generate_count_options`）：
+        草稿里同样是 `abilities.gen_option.gen_count`（组件级字段）。
+        ⚠️ 原先没传它，所以"扩图固定出 4 张"其实是**上游默认值**、不是硬约束。
         """
         width, height = parse_size(size)
+        # 后编辑族提交时 `extend.root_model` 用的就是 `DEFAULT_MODEL`（见下方 body），
+        # 所以张数选项也要按它查，否则查的是另一个模型的合法区间。
+        count, warn = resolve_count(DEFAULT_MODEL, count, count_options)
+        # ⚠️ 在 dry_run 早退**之前**设好，否则 dry 路径会把告警漏掉
+        self.last_warnings = [warn] if warn else []
         draft = build_post_edit_draft(
             tool=tool, image_uri=image_uri, image_url=image_url,
             item_id=item_id, origin_history_id=origin_history_id,
             source_from=source_from, width=width, height=height,
-            resolution_type=resolution_type, up_scale=up_scale)
+            resolution_type=resolution_type, up_scale=up_scale, count=count)
         sid = submit_id or _uid()
         spec = POST_EDIT_TOOLS[tool]
-        self.last_warnings = []
         if dry_run:
             return sid
 
         metrics: dict[str, Any] = {
-            "promptSource": "custom", "generateCount": 1,
+            "promptSource": "custom", "generateCount": count,
             "generateId": sid, "templateId": "0", "enterFrom": "click",
             "isRegenerate": False, "isBoxSelect": False, "isCutout": False,
         }

@@ -123,6 +123,24 @@ class ModelConfigCache:
             return spec.count_options
         return COUNT_OPTIONS_BY_MODEL.get(model, DEFAULT_COUNT_OPTIONS)
 
+    def count_options_declared(self, model: str) -> tuple[int, ...] | None:
+        """**服务端到底声明了没有** —— 刻意**不兜底**。
+
+        与 `count_options()` 的区别很关键：那个为了"尽量给个值"会退回冻结快照，
+        所以**永远非空**；而这里要回答的是另一个问题 ——
+        「**这个模型的张数，我们到底能不能控**」。
+
+        实测确实有模型**不声明**（如
+        `high_aes_general_v30l_art_fangzhou:general_v3.0_18b` 的
+        `generate_count_options` 为 `null`）。那种模型上我们传 `gen_count` 是**无效**的：
+        上游会忽略它、按自己的默认值出图。
+
+        ⇒ **拿兜底值去"吸附"会把"不可控"伪装成"可控"**（我们报 n=4、上游出了别的张数，
+        而调用方看不到任何异常）。调用方必须能用这个返回值把这种情况**留痕**。
+        """
+        spec = self._spec(model)
+        return spec.count_options if spec and spec.count_options else None
+
     def input_image_limit(self, model: str) -> int | None:
         spec = self._spec(model)
         return spec.input_image_limit if spec else None

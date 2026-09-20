@@ -317,6 +317,66 @@ def test_explicit_n_is_still_snapped_onto_the_model_options(
     assert any("吸附" in d for d in rec.degradations), "吸附必须留痕"
 
 
+def test_post_edit_family_also_carries_the_count():
+    """🔴 后编辑族（hd / pro-hd / outpaint / detail）**同样**吃 `gen_option.gen_count`。
+
+    `gen_option` 是**组件级**字段（挂在组件的 `abilities` 下、与具体 ability 平级），
+    后编辑族也属 `image_base_component` ⇒ 同一个位置。
+
+    原先这里没传，于是"**扩图固定出 4 张**"看起来像上游的硬约束 ——
+    其实是我们没传张数、上游用了自己的默认值。
+    这与 blend 上踩过的坑**完全同型**：把"我们没传"误读成"上游不支持"。
+    """
+    from app.upstream.jimeng.client import build_post_edit_draft
+
+    for tool in ("normal_hd", "pro_hd", "outpaint", "detail"):
+        d = json.loads(build_post_edit_draft(tool=tool, image_uri="tos-cn-i-x/a",
+                                             count=2))
+        ab = d["component_list"][0]["abilities"]
+        assert "gen_option" in ab and len(ab) >= 3, f"{tool} 缺 gen_option"
+        assert ab["gen_option"]["gen_count"] == 2, tool
+        assert ab["gen_option"]["generate_all"] is False, tool
+
+
+def test_hd_passes_the_requested_count_to_edit(client, client_state,
+                                               fake_jimeng, fake_uploader):
+    """`n` 对后编辑族也要**真的流到上游** —— 不再"只接受 1"。"""
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    prod = ("https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/"
+            + "5" * 32 + "~tplv-x.png?sig=1")
+
+    _create(client, model="jimeng-hd", image=[prod], n=2)
+    client_state.coordinator.tick()
+
+    call = fake_jimeng.of("edit")[0]
+    assert call["count"] == 2, "请求的 n 没有传到 edit"
+    assert call["tool"] == "normal_hd"
+
+
+def test_model_without_declared_count_options_is_flagged(
+        client, client_state, fake_jimeng, fake_uploader, service):
+    """🔴 模型**不声明**张数选项时，必须留痕 —— 不能拿兜底值把"不可控"伪装成"可控"。
+
+    实测真实存在这种模型（`..._v30l_art_fangzhou:general_v3.0_18b` 的
+    `generate_count_options` 为 `null`）。这种模型上 `gen_count` 传了也白传。
+
+    关键点（也是这条用例存在的理由）：`count_options()` 会**退回冻结快照、永远非空**，
+    所以**看它根本发现不了**这种情况；只有不做兜底的 `count_options_declared()`
+    才答得上"能不能控"。下面两个断言一起把这件事钉死。
+    """
+    service.cfg.declared = None            # 服务端没声明……
+    assert service.cfg.count_options("x")  # ……但兜底查询仍会给出值（这就是陷阱）
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=4)
+    client_state.coordinator.tick()
+
+    rec = service.store.get(tid)
+    assert any("未声明张数选项" in d for d in rec.degradations), \
+        f"不声明张数却没留痕：{rec.degradations}"
+    assert any("可能不生效" in d for d in rec.degradations), "要把后果说清楚"
+
+
 def test_image_count_has_a_global_ceiling(client, service):
     """全局合理性上限：一次塞 6 张直接拒（真正的额度由能力声明决定）。
 

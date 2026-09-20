@@ -372,14 +372,16 @@ class Service:
             raise InvalidParameterError("seed 必须是整数", param="seed")
 
         n = n_raw or 1
-        if cap.name in ("t2i", "i2i") and self.cfg is not None:
-            # 🔴 blend 的**张数与文生图同源**：草稿里同样写
-            # `abilities.gen_option.gen_count`（参考仓自检原文可见该字段）。
-            # 早先这里只放行 t2i，理由是"blend 的 metrics 里 generateCount 恒为 1"——
-            # 那是把**埋点计数**误当成控制字段了：实测请求 n=1 仍出 4 张、按 4 张计费。
+        if self.cfg is not None:
+            # 🔴 **所有能力**的张数都走同一条路：草稿里写的都是
+            # `abilities.gen_option.gen_count`（**组件级**字段，与具体 ability 平级）。
+            # 早先只放行 t2i（后来才加上 i2i），后编辑族则写着"只接受 1" ——
+            # 而那句"扩图固定出 4 张"其实是**我们没传张数、上游用了默认值**。
+            # 同一个坑（把"我们没传"误读成"上游不支持"）已经踩过两次，别再犯。
             model_key = (upstream_model or DEFAULT_MODEL) if cap.name == "t2i" \
                 else DEFAULT_MODEL
             opts = self.cfg.count_options(model_key)
+            declared = self.cfg.count_options_declared(model_key)
             note = self.cfg.degradation_note(model_key)
             if note:
                 degradations.append(note)
@@ -390,14 +392,18 @@ class Service:
                 n, warn = resolve_count(model_key, n_raw, opts)
                 if warn:
                     degradations.append(warn)
-        elif cap.name not in ("t2i", "i2i") and n_raw not in (None, 1):
-            # 后编辑族（hd / pro-hd / outpaint）的张数控制**未取证**：
-            # 它们用单个 `origin_image` + `postedit_param`，与 blend 的 `gen_option`
-            # 不是同一条路径 ⇒ 仍然只接受 1，其余**留痕**（不静默）。
-            degradations.append(
-                f"model {cap.api_id} 不支持指定张数（实测由上游决定出图数量，"
-                f"如扩图固定出 4 张），请求的 n={n_raw} 已忽略。")
-            n = 1
+            if declared is None:
+                # 🔴 **有些模型就是不声明张数选项**（实测 `..._v30l_art_fangzhou:...`
+                # 的 `generate_count_options` 为 null）。这种模型上 `gen_count`
+                # 传了也是**白传**（上游忽略、按自己的默认值出图）。
+                # `count_options()` 会退回冻结快照、所以**永远非空** ——
+                # 用它做判断会把"不可控"伪装成"可控"。必须用不做兜底的
+                # `count_options_declared()` 才能发现，并且**留痕**。
+                degradations.append(
+                    f"模型 {model_key} **未声明张数选项**"
+                    f"（服务端 generate_count_options 为空）⇒ 该模型的张数不可控，"
+                    f"上游按自己的默认值出图；本服务请求的 n={n} 可能不生效。"
+                    f"要控张数请换一个声明了张数选项的模型。")
 
         now = int(time.time())
         rec = TaskRecord(
@@ -754,12 +760,14 @@ class Service:
             sid = self.client.blend(rec.prompt, image_uris=image_uris, size=size,
                                     count=rec.n or 1, count_options=opts)
         else:
-            # 后编辑三族（hd / pro-hd / outpaint）：上游用单个 `origin_image` 承载，
-            # 张数已被 `Capability.max_images`（=1）在受理时钉死，这里取第 0 张即可
+            # 后编辑族（hd / pro-hd / outpaint）：上游用单个 `origin_image` 承载输入图，
+            # 但**张数同样是 `abilities.gen_option.gen_count`**（组件级字段）⇒ 一并传。
             assert cap.jimeng_tool
-            assert len(image_uris) == 1, "后编辑族只接受 1 张（受理时已校验）"
+            assert len(image_uris) == 1, "后编辑族只接受 1 张输入图（受理时已校验）"
+            opts = self.cfg.count_options(DEFAULT_MODEL) if self.cfg else None
             sid = self.client.edit(cap.jimeng_tool, image_uri=image_uris[0],
-                                   size=size)
+                                   size=size, count=rec.n or 1,
+                                   count_options=opts)
         # 客户端侧还可能产生吸附告警（如 t2i 的张数），一并留痕
         extra = [w for w in (self.client.last_warnings or []) if w]
         if extra:
