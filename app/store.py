@@ -113,6 +113,12 @@ class TaskRecord(SQLModel, table=True):
     # ---- 上游与结果 ----
     #: 即梦的 `submit_id`。**绝不对外暴露**（对外只有本地 task_id）。
     upstream_submit_id: Optional[str] = None
+    #: 🔴 续生成（action=2）的**必需字段** —— 上游回执里本来就有（history_record_id），
+    #: 我们原先**只解析不持久化** ⇒ 异步/重启之后就没法续。
+    upstream_history_id: Optional[str] = None
+    #: 首次提交的那份 draft_content（JSON 串）。用户抓包确认：续生成要**重新带一遍草稿**；
+    #: 不存就只能重建，而重建容易与首次提交不一致（那会续错对象）。
+    draft_json: Optional[str] = None
     images: list = Field(default_factory=list,
                          sa_column=Column(JSON_COL, nullable=False))
     #: 上游 `forecast_generate_cost` 给出的积分（真值，不编造）
@@ -168,6 +174,7 @@ class Meta(SQLModel, table=True):
 _PATCHABLE = {
     "credential_id", "model", "cap_key", "upstream_model", "status", "prompt",
     "image_refs", "size", "n", "seed", "negative_prompt", "upstream_submit_id",
+    "upstream_history_id", "draft_json",
     "images", "credits", "error", "degradations", "created_at", "updated_at",
     "started_at", "finished_at", "attempts", "lease_owner", "lease_until",
 }
