@@ -107,6 +107,11 @@ class Settings:
 
     # ------------------------------------------------------------ 协调器
     coordinator_enabled: bool = True
+    #: 🔴 **默认关**：自动续生成（`action=2`）的判据**尚未确定** ——
+    #: 实测「有的 history 能续、有的不能」，而区分它们的条件**还没找到**
+    #: （排除清单见项目记忆）。判据确定前**不要开**，否则就是按一个错判据
+    #: 去花真实的生成额度。关掉时行为 = 退回「用成功的图补齐」。
+    continue_enabled: bool = False
     coordinator_tick: float = 1.0
     coordinator_lease: float = 30.0
 
@@ -196,6 +201,7 @@ class Settings:
             poll_grace=_f("POLL_GRACE", 0.2),
             task_timeout=_f("TASK_TIMEOUT", 1800.0),
             coordinator_enabled=_b("COORDINATOR_ENABLED", True),
+            continue_enabled=_b("CONTINUE_ENABLED", False),
             coordinator_tick=_f("COORDINATOR_TICK", 1.0),
             coordinator_lease=_f("COORDINATOR_LEASE", 30.0),
             task_db=_s("TASK_DB",

@@ -724,7 +724,8 @@ class Service:
             # 实测 `action=2` **只在这个状态被接受**（拿已完成的任务去续一律 1002）；
             # 所以要**在这里就续**，而不是干等到 `TASK_TIMEOUT`（30 分钟）——
             # 那正是"4 张垫图卡 30 分钟"的成因。
-            if (st.status == 45 and st.images
+            if (self.settings.continue_enabled      # 🔴 开关，默认关
+                    and st.status == 45 and st.images
                     and (rec.continuations or 0) < CONTINUE_MAX):
                 self._continue_partial(rec, st)
                 return

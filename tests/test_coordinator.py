@@ -1085,6 +1085,7 @@ def test_continued_batch_is_merged_without_duplicates(client, client_state,
     """
     calls: list = []
     _arm(fake_jimeng, monkeypatch, calls)
+    object.__setattr__(service.settings, "continue_enabled", True)
     fake_jimeng.states = [submitted_state(),
                           _partial(["https://cdn/a.png"], n_total=2),   # 45 ⇒ 触发续
                           _done(["https://cdn/b.png"])]                 # 续回来的第二批
@@ -1137,6 +1138,8 @@ def test_partial_45_triggers_continue_instead_of_waiting(client, client_state,
 
     calls: list = []
     _arm(fake_jimeng, monkeypatch, calls)
+    # 🔴 开关**默认关**（判据未定）⇒ 要测行为必须显式打开
+    object.__setattr__(service.settings, "continue_enabled", True)
     partial = TaskState(submit_id="upstream-submit-id", status=45,
                         status_name="partial_success", finished=False, failed=False,
                         history_record_id="44853559987980",
@@ -1181,3 +1184,33 @@ def test_partial_45_without_material_still_waits(client, client_state,
     assert not calls, f"没原料还硬发续生成请求：{calls}"
     rec = service.store.get(tid)
     assert rec.status in ("in_progress", "queued"), rec.status
+
+
+def test_partial_45_does_nothing_when_switch_is_off(client, client_state,
+                                                    fake_jimeng, fake_uploader,
+                                                    service, monkeypatch):
+    """🔴 **开关默认关**：45（部分成功）时**不许**自动续生成。
+
+    原因：`action=2` 的触发判据**尚未确定**（实测「有的 history 能续、有的不能」，
+    而区分条件还没找到）。判据确定前开着它 = 按一个错判据去花真实生成额度。
+    关掉时的行为必须回到原样：**只等**（后续由终态补齐/看门狗收口）。
+    """
+    from app.upstream.jimeng.client import GeneratedImage, TaskState
+
+    calls: list = []
+    monkeypatch.setattr(
+        fake_jimeng, "continue_task",
+        lambda *a, **k: (calls.append(a), "cont-sid")[1], raising=False)
+    partial = TaskState(submit_id="upstream-submit-id", status=45,
+                        status_name="partial_success", finished=False, failed=False,
+                        history_record_id="44853559987980")
+    partial.images = [GeneratedImage(url="https://cdn/a.png", width=1024, height=1024)]
+    fake_jimeng.states = [submitted_state(), partial]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=4)
+    _tick_until_terminal(client_state)
+
+    assert not calls, f"开关是关的，竟然续生成了：{calls}"
+    rec = service.store.get(tid)
+    assert rec.status in ("in_progress", "queued"), rec.status
+    assert (rec.continuations or 0) == 0
