@@ -203,6 +203,33 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 **代码里那份快照只作探测失败时的兜底，且会如实标注降级**。
 教训：曾按"用户经验 1–4"写死上界 4，对默认模型直接是错的。
 
+## 11.4 凭据：**只有 `sessionid` 是硬前提**（2026-09-20 实测）
+
+拿一份**完整的浏览器 cookie jar（27 个键、2281 字符）**做过对照实测：
+
+| 传入 | 结果（`POST /mweb/v1/get_user_info`） |
+|---|---|
+| 完整 cookie 串 | `ret=0`，`name='BettermeTry'` |
+| **只给 `sessionid`** | `ret=0`，`name='BettermeTry'` |
+| **只给 `sessionid`、完全不传 cookie** | `ret=0`，`name='BettermeTry'` |
+| 什么都不给 | ✗ `JimengAuthError: 缺少 sessionid —— 即梦唯一的硬前提凭据` |
+
+⇒ **27 个键里只有 `sessionid` 起作用**，其余（`sid_guard` / `ttwid` / `odin_tt` /
+`passport_csrf_token` / `uifid` / …）在我们用的 `/mweb/v1/*` 路径上**都不是必需**。
+**不需要保存整串 jar** —— `JIMENG_SESSIONID` 一个值就够（本仓现在就是这么做的）。
+
+### 从 `sid_guard` 能读出**到期时间**（运营要看）
+
+```
+sid_guard = <sessionid>|<签发时间戳>|<有效秒数>|<到期 GMT 字符串>
+示例      = a419…fda9|1789021926|31536000|Fri, 10-Sep-2027 06:32:06 GMT
+```
+⇒ 这一份凭据**有效期一年、到期 2027-09-10**。到期时整个服务会开始 401，
+**运营应提前轮换**（这是个纯字符串解析，零成本可做巡检）。
+
+⚠️ `passport_csrf_token` 存在说明**写操作**可能有 CSRF 校验；我们走 `/mweb/v1/*`
+（生成/上传）实测不受影响。
+
 ## 11.5 积分余额 / 消耗记录（**只读、不计费**，2026-09-20 实测）
 
 ```
