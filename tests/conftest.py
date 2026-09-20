@@ -13,7 +13,9 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
+import time
 import uuid
 from dataclasses import dataclass, field
 from typing import Any
@@ -209,13 +211,42 @@ class FakeUploader:
     uri: str = "tos-cn-i-testbucket/abc123"
     last_cached: bool = False
     uploads: list[bytes] = field(default_factory=list)
+    #: 每次上传**返回不同的 uri**（`<base>-<序号>`）。真实上传器同样不是内容寻址
+    #: （`UPSTREAM.md`：同一份字节传两次得到两个**不同**的 uri），所以这里也不按内容去重。
+    uris: list[str] = field(default_factory=list)
+    #: `(字节, 返回的 uri)` 配对 —— 并发下 append 顺序**不确定**，
+    #: 想断言"哪张图换到了哪个 uri"必须靠这张映射表，而不是靠列表顺序。
+    pairs: list[tuple[bytes, str]] = field(default_factory=list)
     fail: Exception | None = None
+    #: 每次上传的模拟耗时基数（秒）。默认 0：普通用例不该为了测并发而变慢。
+    delay_s: float = 0.0
+
+    def _delay(self, data: bytes) -> float:
+        """按**内容**派生的耗时 —— 完成顺序因此与提交顺序**不同**。
+
+        这样"结果仍按输入顺序返回"才成为一个真实的检验：
+        若实现按"谁先完成谁先排"，顺序断言就会翻车。
+        """
+        if not self.delay_s:
+            return 0.0
+        return self.delay_s * (1 + hashlib.sha256(data).digest()[0] % 3)
 
     def upload(self, data: bytes, **kw: Any) -> str:
         if self.fail:
             raise self.fail
+        time.sleep(self._delay(data))
         self.uploads.append(data)
-        return self.uri
+        uri = f"{self.uri}-{len(self.uploads) - 1}"
+        self.uris.append(uri)
+        self.pairs.append((data, uri))
+        return uri
+
+    def uri_for(self, data: bytes) -> str:
+        """这张字节最终换到的 uri（用于断言顺序与映射）。"""
+        for blob, uri in self.pairs:
+            if blob == data:
+                return uri
+        raise AssertionError("这份字节没有被上传过")
 
     def close(self) -> None:
         pass

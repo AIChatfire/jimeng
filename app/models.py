@@ -70,6 +70,13 @@ class Capability:
     jimeng_tool: str | None = None
     #: 本部署**已实测**的积分单价（张）。None = 未测，不报数。
     credits_measured: int | None = None
+    #: 本次请求最多接受几张输入图（垫图）。
+    #:
+    #: 🔴 默认 **1**，且**超出必须响亮 400** —— 绝不许静默丢掉多余的图。
+    #: 原先的行为是：`image` 收下 N 个 URL、全部下载，然后只用第 0 张，
+    #: **既不报错也不留痕**；调用方以为用了 4 张、实际只用 1 张。
+    #: 现在能力没声明支持几张，就只允许 1 张，多给的当场说清楚。
+    max_images: int = 1
     notes: str = ""
 
     @property
@@ -90,8 +97,17 @@ CAPABILITIES: tuple[Capability, ...] = (
         key="jimeng:i2i", name="i2i", title="图生图（blend）",
         accepts_image=True, image_required=True, prompt_required=True,
         jimeng_tool="blend", credits_measured=40,
+        #: blend 是**唯一**原生用「列表」承载输入图的能力：
+        #: 草稿里是 `abilities.blend.ability_list[0].image_uri_list`（列表）
+        #: 与 `image_list`（列表）—— 所以多张垫图就是往这两个列表里多放元素，
+        #: 不需要额外的组件串链（后编辑那三族才需要）。
+        #: ⚠️ 4 是保守默认：上游的 `input_image_limit` 原生形态是
+        #: `[{max_image_num, ability_name}]`（按 ability 分），当前解析拿到的是
+        #: None ⇒ **真实上限未取得**，等一次 2 张的实测再校准。
+        max_images=4,
         notes="输入图由本服务自动上传成即梦资产 uri；**必须给 prompt**"
-              "（描述要怎么改）——这是它与后编辑三工具的关键区别。",
+              "（描述要怎么改）——这是它与后编辑三工具的关键区别。"
+              "支持**多张垫图**（最多 4 张，超出会明确报错）。",
     ),
     Capability(
         key="jimeng:hd", name="hd", title="超清（SuperDefinition）",
@@ -166,11 +182,15 @@ def _hint() -> str:
             f"完整清单见 GET /async/v1/models")
 
 
-def resolve(model: str | None, *, has_image: bool) -> tuple[Capability, str | None]:
+def resolve(model: str | None, *, has_image: bool,
+            n_images: int = 1) -> tuple[Capability, str | None]:
     """解析 `model`，返回 (能力, 上游模型 key 或 None)。
 
     `has_image` 参与两件事：① 默认能力推导；② **能力与请求形态的一致性校验**
     （没给图却指定了吃图的能力 → 400，而不是跑到上游才发现）。
+
+    `n_images` 参与**张数**校验：每个能力声明自己最多接受几张垫图
+    （`Capability.max_images`），**超出当场 400** —— 绝不静默丢掉多余的图。
 
     上游模型 key 只在文生图族有意义；其余能力返回 None（草稿构造里不带 `model`）。
     """
@@ -194,13 +214,16 @@ def resolve(model: str | None, *, has_image: bool) -> tuple[Capability, str | No
             raise InvalidParameterError(
                 f"未知 model {raw!r}。{_hint()}", param="model")
         assert cap is not None
-        _check_shape(cap, raw=raw, has_image=has_image)
+        _check_shape(cap, raw=raw, has_image=has_image, n_images=n_images)
         return cap, upstream_model
 
     # ---- 默认能力：只在无歧义时给 ----
     cands = [c for c in CAPABILITIES
              if c.accepts_image is has_image and not (has_image and not c.image_required)]
     if len(cands) == 1:
+        # 默认分支同样要过形态校验（含张数上限）—— 否则"省掉 model"就成了绕过校验的口子
+        _check_shape(cands[0], raw=cands[0].api_id, has_image=has_image,
+                     n_images=n_images)
         return cands[0], (DEFAULT_UPSTREAM_MODEL if cands[0].name == "t2i" else None)
 
     kind = "带输入图" if has_image else "无输入图"
@@ -215,7 +238,8 @@ def resolve(model: str | None, *, has_image: bool) -> tuple[Capability, str | No
         param="model")
 
 
-def _check_shape(cap: Capability, *, raw: str, has_image: bool) -> None:
+def _check_shape(cap: Capability, *, raw: str, has_image: bool,
+                 n_images: int = 1) -> None:
     """能力与请求形态必须自洽 —— 不自洽就在**发出上游请求之前**报 400。"""
     if cap.image_required and not has_image:
         raise InvalidParameterError(
@@ -226,6 +250,16 @@ def _check_shape(cap: Capability, *, raw: str, has_image: bool) -> None:
         raise InvalidParameterError(
             f"model {raw!r}（{cap.title}）不接受输入图，但本次请求带了 image。"
             f"请改用 jimeng-i2i / jimeng-hd / jimeng-pro-hd / jimeng-outpaint。",
+            param="image")
+    if n_images > cap.max_images:
+        multi = ("支持多张垫图，但" if cap.max_images > 1 else "")
+        raise InvalidParameterError(
+            f"model {raw!r}（{cap.title}）{multi}最多接受 {cap.max_images} 张输入图，"
+            f"本次给了 {n_images} 张。"
+            f"（本服务**不会静默忽略多余的图** —— 那会让你以为用了 {n_images} 张、"
+            f"实际只用了 {cap.max_images} 张。"
+            + ("要多张垫图请用 jimeng-i2i。" if cap.max_images == 1 else "")
+            + "）",
             param="image")
 
 

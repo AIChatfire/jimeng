@@ -66,13 +66,32 @@ def test_image_must_be_an_array_with_actionable_message(client):
     assert "[]" in msg, "报错要给出正确写法，而不是只说「错了」"
 
 
-def test_multiple_input_images_rejected_not_silently_truncated(client):
-    """静默丢掉多余的图 = 调用方以为用了 3 张参考图、实际只用了 1 张。"""
+def test_multiple_input_images_are_never_silently_truncated(client):
+    """核心纪律不变：**绝不许**"收下 N 张、却只用 1 张"。
+
+    契约按能力分（2026-09-20 起）：
+      · `jimeng-i2i`（图生图）—— 上游草稿里 `image_uri_list` / `image_list`
+        本来就是**列表**，所以**支持多张垫图**：全部上传、全部进草稿；
+      · 后编辑三族（hd / pro-hd / outpaint）—— 上游用单个 `origin_image` 承载，
+        多给必须**响亮 400**，不许静默丢；
+      · 全局另有一道 4 张的合理性上限（挡住"一次塞几百个 URL"）。
+
+    换句话说：**"支持"与"拒绝"必须是明确的两种行为，不允许有第三种（忽略）**。
+    """
+    # ① i2i：2 张是合法的（多张垫图）
     r = client.post(BASE, json={"model": "jimeng-i2i", "prompt": "改海边",
                                 "image": ["https://a/1.png", "https://a/2.png"]},
                     headers=AUTH)
-    assert r.status_code == 400
-    assert "只支持单张输入图" in r.json()["error"]["message"]
+    assert r.status_code == 202, r.text
+
+    # ② 后编辑族：多给仍然明确报错
+    r = client.post(BASE, json={"model": "jimeng-hd",
+                                "image": ["https://a/1.png", "https://a/2.png"]},
+                    headers=AUTH)
+    assert r.status_code == 400, r.text
+    msg = r.json()["error"]["message"]
+    assert "最多接受 1 张" in msg
+    assert "不会静默忽略" in msg, "报错要说清为什么拒绝"
 
 
 def test_unknown_field_is_rejected(client):

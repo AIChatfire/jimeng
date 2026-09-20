@@ -6,9 +6,14 @@
 """
 from __future__ import annotations
 
+import base64
+import time
+
 import pytest
 
 from app.errors import RiskControlError
+from app.service import Service
+from app.store import TaskRecord
 from app.upstream.jimeng import JimengQuotaError, JimengRateLimitError, JimengRiskError
 from tests.conftest import AUTH, failed_state, ok_state, submitted_state
 
@@ -89,10 +94,133 @@ def test_i2i_uploads_the_input_image_before_submitting(client, client_state,
     client_state.coordinator.tick()
 
     assert fake_uploader.uploads, "输入图没有被上传"
+    assert len(fake_uploader.uploads) == 1, "单张请求只该上传一次"
     calls = fake_jimeng.kinds()
     assert calls.index("blend") >= 0
-    assert fake_jimeng.of("blend")[0]["image_uri"] == fake_uploader.uri
+    # blend 现在收的是**列表**（`image_uris`）—— 单张就是只含一个元素的列表
+    assert fake_jimeng.of("blend")[0]["image_uris"] == fake_uploader.uris
     assert service.store.get(tid).status == "in_progress"
+
+
+# ---------------------------------------------------------------------------
+# 多张垫图
+# ---------------------------------------------------------------------------
+
+#: 三张**内容各不相同**的合法 PNG（2×2，红/绿/蓝）。
+#: 内容不同才能验证"哪张换到了哪个 uri"。
+#: ⚠️ 这三串是**程序生成并当场解回来验过**的 —— 手改 base64 会得到
+#: "broken data stream" 的坏数据（我第一版就是手改的，三条用例一起挂在解码上）。
+_PNGS = [
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEElEQVR4nGP8zwACTGCSAQANHQEDgslx/wAAAABJRU5ErkJggg==",
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAE0lEQVR4nGNk+M/AwMDABCIYGAAMHgEDrNiLpwAAAABJRU5ErkJggg==",
+    "iVBORw0KGgoAAAANSUhEUgAAAAIAAAACCAIAAAD91JpzAAAAEklEQVR4nGNkYPjPwMDAxAAGAAsfAQMU4wsAAAAAAElFTkSuQmCC",
+]
+
+
+def _data_uri(b64: str) -> str:
+    return "data:image/png;base64," + b64
+
+
+def test_i2i_multi_reference_images_are_all_uploaded(client, client_state,
+                                                     fake_jimeng, fake_uploader,
+                                                     service):
+    """🔴 i2i 的多张垫图必须**全部上传**（原先只上传第 1 张，其余静默丢掉）。"""
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    refs = [_data_uri(b) for b in _PNGS[:3]]
+
+    tid = _create(client, model="jimeng-i2i", prompt="合成这三张", image=refs)
+    client_state.coordinator.tick()
+
+    assert len(fake_uploader.uploads) == 3, "三张垫图都该被上传"
+    sent = fake_jimeng.of("blend")[0]["image_uris"]
+    assert len(sent) == 3, "三张 uri 都要进草稿"
+    assert len(set(sent)) == 3, "三张各自换到不同的 uri"
+    assert set(sent) == set(fake_uploader.uris), "返回的 uri 都出自本次上传"
+    assert service.store.get(tid).status == "in_progress"
+
+
+def test_prepare_input_images_preserves_order_despite_out_of_order_completion(
+        service, store, fake_uploader, settings):
+    """🔴 并发上传但**保序** —— 返回的 uri 顺序必须与 `image_refs` 一一对应。
+
+    顺序不是细节：草稿里 `image_uri_list` 的先后对生成语义有影响。
+
+    做法：**关掉归一化**，这样"上传的字节"就等于"输入图的字节"，
+    于是"哪张图换到哪个 uri"可以精确断言（`FakeUploader.pairs` 是字节→uri 的映射，
+    与完成顺序无关）。再让 `delay_s` 按内容派生 ⇒ 完成顺序与提交顺序**不同**，
+    所以"谁先传完谁排前面"的实现会在这条翻车。
+    """
+    fake_uploader.delay_s = 0.05
+    svc = Service(settings.replace(normalize_uploads=False), store=store,
+                  client=service.client, uploader=fake_uploader, cfg=None)
+    refs = [_data_uri(b) for b in _PNGS[:3]]
+    rec = store.put(TaskRecord(
+        task_id="jimeng_order_test", credential_id="cred-a", model="jimeng-i2i",
+        cap_key="jimeng:i2i", status="queued", prompt="p", image_refs=refs,
+        size="2048x2048", n=1, created_at=0, updated_at=0))
+
+    uris = svc._prepare_input_images(rec)
+
+    expected = [fake_uploader.uri_for(base64.b64decode(b)) for b in _PNGS[:3]]
+    assert uris == expected, f"顺序没保住：实得 {uris}，应为 {expected}"
+
+
+def test_multi_image_uploads_run_in_parallel(
+        client, client_state, fake_jimeng, fake_uploader, service):
+    """多张垫图的上传**并发**跑 —— 3 张的耗时应远小于"串行 3 次"。
+
+    每张按内容派生 1~3 倍 `delay_s`：串行下 3 张至少 3×0.05s；
+    并发下接近"最慢的那一张"。门限给得宽松（只区分"并发"与"串行"两个量级），
+    避免变成偶发用例。
+    """
+    fake_uploader.delay_s = 0.05
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+    tid = _create(client, model="jimeng-i2i", prompt="并行",
+                  image=[_data_uri(b) for b in _PNGS[:3]])
+
+    t0 = time.time()
+    client_state.coordinator.tick()
+    elapsed = time.time() - t0
+
+    assert len(fake_uploader.uploads) == 3
+    assert elapsed < 0.28, f"3 张上传用了 {elapsed:.2f}s，看起来是串行的"
+    assert service.store.get(tid).status == "in_progress"
+
+
+def test_single_image_capabilities_reject_extra_images_instead_of_dropping_them(
+        client, service):
+    """🔴 只吃 1 张图的能力，多给必须**响亮 400**，不许静默丢图。
+
+    原先的行为：`image` 收下 N 个 URL、全部下载、然后只用第 0 张，
+    **既不报错也不留痕** —— 调用方以为用了 4 张、实际只用 1 张。
+    这正是本仓一贯在防的"静默降级"。
+    """
+    r = client.post(BASE, json={"model": "jimeng-hd", "prompt": "x",
+                                "image": [_data_uri(_PNGS[0]), _data_uri(_PNGS[1])]},
+                    headers=AUTH)
+    assert r.status_code == 400, r.text
+    err = r.json()["error"]
+    assert err["param"] == "image"
+    assert "最多接受 1 张" in err["message"]
+    assert "不会静默忽略" in err["message"], "错误信息要说清为什么拒绝"
+    assert "jimeng-i2i" in err["message"], "要指路：要多张垫图请用 i2i"
+
+
+def test_image_count_has_a_global_ceiling(client, service):
+    """全局合理性上限：一次塞 6 张直接拒（真正额度由能力声明决定）。
+
+    ⚠️ `jimeng-i2i` 的按能力上限（4）与这里的全局上限相等，
+    所以"i2i 超限"这条**不可单独到达** —— 全局那道先拦。
+    两道并存的用意是：全局那道挡住"一次塞几百个 URL"，免得在解析出能力之前
+    就先去做昂贵的图片校验；能力那道负责精确额度（如后编辑族只许 1 张）。
+    """
+    r = client.post(BASE, json={"model": "jimeng-i2i", "prompt": "x",
+                                "image": [_data_uri(b) for b in _PNGS] * 2},
+                    headers=AUTH)
+    assert r.status_code == 400, r.text
+    msg = r.json()["error"]["message"]
+    assert "最多 4 张" in msg
+    assert "jimeng-i2i" in msg, "要指路：只有 i2i 支持多张垫图"
 
 
 @pytest.mark.parametrize("model,expect_tool", [

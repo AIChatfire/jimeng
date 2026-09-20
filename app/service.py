@@ -24,6 +24,7 @@ import hmac
 import logging
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import models
@@ -219,6 +220,16 @@ def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
 # 服务
 # ---------------------------------------------------------------------------
 
+#: 多张垫图时**同时上传**几张。与 `Capability.max_images`（blend 上限 4）同量级；
+#: 再高没有收益 —— 每次上传要走 apply/put/commit 三段，而且并发取 STS 本来就有双检锁
+#: （不会退化成每张各签一次），瓶颈在上游侧的往返，不在我们开几个线程。
+MAX_UPLOAD_PARALLELISM = 4
+
+#: `image` 数组的**全局**合理性上限。真正的额度由各能力声明
+#: （`Capability.max_images`）决定；这里只拦"一次塞几百个 URL"这种明显不合理的请求，
+#: 免得在还没解析出能力之前就先去做昂贵的图片校验。
+MAX_INPUT_IMAGES = 4
+
 
 class Service:
     """服务组件集合 + 编排逻辑。请求线程与协调器线程共用同一实例。"""
@@ -327,7 +338,8 @@ class Service:
             raise InvalidParameterError("prompt 必须是字符串", param="prompt")
         prompt = (prompt or "").strip()
 
-        cap, upstream_model = models.resolve(body.get("model"), has_image=bool(image))
+        cap, upstream_model = models.resolve(body.get("model"), has_image=bool(image),
+                                            n_images=len(image))
         if cap.prompt_required and not prompt:
             raise InvalidParameterError(
                 f"model {cap.api_id}（{cap.title}）需要 prompt，但本次没给或为空。",
@@ -409,11 +421,12 @@ class Service:
                     f"image[{i}] 必须是非空字符串（http(s) URL / data URI / base64）",
                     param="image")
             out.append(item.strip())
-        if len(out) > 1:
+        if len(out) > MAX_INPUT_IMAGES:
             raise InvalidParameterError(
-                f"本服务这条链路**只支持单张输入图**（收到 {len(out)} 张）。"
-                f"即梦的图生图/后编辑草稿结构实测都只带一张输入图；"
-                f"多图形态未取证，故不做——按「不制造假能力」，宁可不接受也不静默丢掉多余的图。",
+                f"image 最多 {MAX_INPUT_IMAGES} 张（收到 {len(out)} 张）。"
+                f"⚠️ 各能力的上限可能更小：只有 `jimeng-i2i`（图生图）支持多张垫图，"
+                f"后编辑三族（hd / pro-hd / outpaint）只接受 1 张 —— "
+                f"给多了会在能力校验那一步明确报错。",
                 param="image")
         return out
 
@@ -483,11 +496,11 @@ class Service:
 
         ctx = {"task_id": rec.task_id, "model": rec.model, "capability": rec.cap_key}
         try:
-            image_uri = ""
+            image_uris: list[str] = []
             if cap.image_required:
-                image_uri = self._prepare_input_image(rec)
+                image_uris = self._prepare_input_images(rec)
 
-            sid = self._submit(rec, cap, image_uri)
+            sid = self._submit(rec, cap, image_uris)
         except AdapterError as e:
             self._on_dispatch_error(rec, e)
             return
@@ -629,22 +642,64 @@ class Service:
 
     # ------------------------------------------------------------------ 内部
 
-    def _prepare_input_image(self, rec: TaskRecord) -> str:
-        """下载 → 归一化 → 上传，返回即梦可引用的 `image_uri`。**不计费。**"""
+    def _transfer_one(self, blob: Any) -> tuple[str, list[str], int]:
+        """归一化 + 上传**一张**，返回 (uri, 降级说明, 字节数)。
+
+        可被多线程并发调用。安全性依据（两处都已在别处钉过）：
+          · `JimengUploader.token()` 是**双检锁** —— 并发 N 张只会取一次 STS，
+            不会退化成"每张各签一次"（`upload.py` 的模块注释里记着实测）；
+          · 上传走 `httpx.Client`，它对并发请求是线程安全的。
+        """
+        norm = normalize(blob, self.settings)
+        uri = self.uploader.upload(norm.data)   # type: ignore[union-attr]
+        return uri, list(norm.notes), norm.size
+
+    def _prepare_input_images(self, rec: TaskRecord) -> list[str]:
+        """下载 → 归一化 → 上传，**每张垫图各一次**，返回 `image_uri` 列表。**不计费。**
+
+        🔴 **顺序必须与调用方给的 `image` 数组一致** —— 垫图的先后对生成语义有影响。
+        多张时用线程池并发，但用 `Executor.map`（**保序**），
+        绝不是"谁先传完谁排前面"。
+
+        张数上限已在受理时校验（`Capability.max_images`），所以这里可以放心地
+        "来几张传几张"；不会出现"下载了 N 张只用第 1 张"那种静默浪费。
+        """
         assert self.uploader is not None
         blobs = load_images(rec.image_refs, self.settings)
-        blob = normalize(blobs[0], self.settings)
-        if blob.notes:
+        started = time.monotonic()
+        parallel = 1
+
+        if len(blobs) <= 1:
+            # 单张：不值得为一次调用付线程池的钱；顺带 `last_cached` 此时是准确的
+            results = [self._transfer_one(b) for b in blobs]
+            cached: bool | None = self.uploader.last_cached
+        else:
+            # 🔴 多张**并发** —— 这是"支持多张垫图"顺手拿到的收益：
+            # 原先这段是串行的（而且只用第 0 张），4 张垫图要等 4 次归一化 + 4 次上传。
+            # 这里没有把并发开到 `len(blobs)`：上游每次上传都要走一遍
+            # apply/put/commit 三段，张数上限本身只有 4，再高没有收益。
+            parallel = min(len(blobs), MAX_UPLOAD_PARALLELISM)
+            with ThreadPoolExecutor(max_workers=parallel) as pool:
+                results = list(pool.map(self._transfer_one, blobs))
+            # ⚠️ 并发下 `last_cached` 是**共享字段**（谁最后写就是谁的值）⇒ 不报它。
+            # 在观测里报一个可能错的值，比不报更糟。
+            cached = None
+
+        uris = [uri for uri, _, _ in results]
+        notes = [n for _, ns, _ in results for n in ns]
+        if notes:
+            # 一次写完：N 张的降级说明合起来只 patch 一次，别每张都写库
             self.store.patch(rec.task_id,
-                             degradations=list(rec.degradations) + blob.notes)
-        uri = self.uploader.upload(blob.data)
-        OBS.info("input image uploaded", task_id=rec.task_id,
-                 bytes=blob.size, mime=blob.mime, cached=self.uploader.last_cached,
-                 normalized=blob.normalized)
-        return uri
+                             degradations=list(rec.degradations) + notes)
+        OBS.info("input images uploaded", task_id=rec.task_id,
+                 count=len(uris), parallel=parallel,
+                 bytes=sum(s for _, _, s in results),
+                 elapsed_ms=round((time.monotonic() - started) * 1000, 1),
+                 cached=cached)
+        return uris
 
     def _submit(self, rec: TaskRecord, cap: models.Capability,
-                image_uri: str) -> str:
+                image_uris: list[str]) -> str:
         assert self.client is not None
         size = rec.size or _default_size()
         if cap.name == "t2i":
@@ -655,10 +710,15 @@ class Service:
                 negative_prompt=rec.negative_prompt, seed=rec.seed,
                 count_options=opts)
         elif cap.name == "i2i":
-            sid = self.client.blend(rec.prompt, image_uri=image_uri, size=size)
+            # blend 原生吃**列表** ⇒ 多张垫图一次带上
+            sid = self.client.blend(rec.prompt, image_uris=image_uris, size=size)
         else:
+            # 后编辑三族（hd / pro-hd / outpaint）：上游用单个 `origin_image` 承载，
+            # 张数已被 `Capability.max_images`（=1）在受理时钉死，这里取第 0 张即可
             assert cap.jimeng_tool
-            sid = self.client.edit(cap.jimeng_tool, image_uri=image_uri, size=size)
+            assert len(image_uris) == 1, "后编辑族只接受 1 张（受理时已校验）"
+            sid = self.client.edit(cap.jimeng_tool, image_uri=image_uris[0],
+                                   size=size)
         # 客户端侧还可能产生吸附告警（如 t2i 的张数），一并留痕
         extra = [w for w in (self.client.last_warnings or []) if w]
         if extra:

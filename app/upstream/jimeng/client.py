@@ -44,7 +44,7 @@ import random
 import time
 import uuid
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 
@@ -672,7 +672,8 @@ def build_post_edit_draft(*, tool: str, image_uri: str = "", image_url: str = ""
 BLEND_ABILITY_NAME = "byte_edit"
 
 
-def build_blend_draft(*, prompt: str, image_uri: str = "", image_url: str = "",
+def build_blend_draft(*, prompt: str, image_uris: Sequence[str] | None = None,
+                      image_uri: str = "", image_url: str = "",
                       source_from: str = "upload", model: str = DEFAULT_MODEL,
                       strength: float = 0.5, width: int = 2048, height: int = 2048,
                       resolution_type: str = "2k") -> str:
@@ -680,22 +681,36 @@ def build_blend_draft(*, prompt: str, image_uri: str = "", image_url: str = "",
 
     `source_from`：`upload` = 即梦存储里的 `image_uri`（**样本实测形态**）；
     `link` = 直接给外链（枚举里存在该取值，但**未被验证**）。
+
+    ## 多张垫图
+
+    blend 是唯一**原生用列表**承载输入图的能力：`ability_list[0]` 里的
+    `image_uri_list`（uri 列表）与 `image_list`（图片对象列表）都是列表，
+    所以多张就是往里多放元素 —— **不需要**组件串链（后编辑那三族才需要）。
+
+    ⚠️ `image_uri`（单数）与 `image_uris`（复数）二选一；两个都给时以**复数**为准，
+    这是为了不破坏既有单图调用点。每张图各拿一个独立 `id`（抓样里
+    `image_list` 的元素都带 `id`，多个元素时应各自独立）。
     """
+    uris = [u for u in (image_uris or ()) if u]
+    if not uris and image_uri:
+        uris = [image_uri]
+
     if not prompt or not prompt.strip():
         raise JimengParamError("blend 需要 prompt（描述要怎么改）", code=1001)
-    if source_from == "upload" and not image_uri:
-        raise JimengParamError("source_from=upload 时必须给 image_uri", code=1001)
+    if source_from == "upload" and not uris:
+        raise JimengParamError("source_from=upload 时必须给 image_uri(s)", code=1001)
     if source_from != "upload" and not image_url:
         raise JimengParamError(f"source_from={source_from} 时必须给 image_url", code=1001)
 
     if source_from == "upload":
-        img = {"type": "image", "id": _uid(), "source_from": "upload",
-               "platform_type": 1, "name": "", "image_uri": image_uri,
-               "width": 0, "height": 0, "format": "", "uri": image_uri}
+        imgs = [{"type": "image", "id": _uid(), "source_from": "upload",
+                 "platform_type": 1, "name": "", "image_uri": u,
+                 "width": 0, "height": 0, "format": "", "uri": u} for u in uris]
     else:
-        img = {"type": "image", "id": _uid(), "source_from": source_from,
-               "platform_type": 1, "name": "", "image_url": image_url,
-               "width": 0, "height": 0, "format": "", "uri": image_url}
+        imgs = [{"type": "image", "id": _uid(), "source_from": source_from,
+                 "platform_type": 1, "name": "", "image_url": image_url,
+                 "width": 0, "height": 0, "format": "", "uri": image_url}]
 
     comp_id = _uid()
     draft = {
@@ -719,9 +734,9 @@ def build_blend_draft(*, prompt: str, image_uri: str = "", image_url: str = "",
                     },
                     "ability_list": [{
                         "type": "", "id": _uid(), "name": BLEND_ABILITY_NAME,
-                        "image_uri_list": ([image_uri] if source_from == "upload"
+                        "image_uri_list": (list(uris) if source_from == "upload"
                                            else []),
-                        "image_list": [img],
+                        "image_list": imgs,
                         "strength": strength,
                     }],
                     "history_option": {"type": "", "id": _uid()},
@@ -938,15 +953,19 @@ class JimengClient:
     def blend(self, prompt: str, *, image_uri: str = "", image_url: str = "",
               source_from: str = "upload", model: str = DEFAULT_MODEL,
               strength: float = 0.5, size: str = DEFAULT_SIZE,
-              submit_id: str | None = None, dry_run: bool = False) -> str:
+              submit_id: str | None = None, dry_run: bool = False,
+              image_uris: Sequence[str] | None = None) -> str:
         """提交一个**图生图（blend）**任务，返回 `submit_id`（**计费动作**）。
 
         结构照抄账号历史里的真实 blend 样本。
         `metrics_extra` 用 blend 专用形态（**没有** `generateId`/`isRegenerate`，
         与文生图不同）—— 照抄样本，不拼凑。
+
+        `image_uris` 多张垫图；与 `image_uri`（单张）二选一，复数优先。
         """
         width, height = parse_size(size)
-        draft = build_blend_draft(prompt=prompt, image_uri=image_uri,
+        draft = build_blend_draft(prompt=prompt, image_uris=image_uris,
+                                  image_uri=image_uri,
                                   image_url=image_url, source_from=source_from,
                                   model=model, strength=strength,
                                   width=width, height=height)
