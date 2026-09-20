@@ -914,3 +914,40 @@ def test_generic_generation_failure_is_not_mislabelled_as_policy(
 
     body = client.get(f"{BASE}/{tid}").json()
     assert body["error"]["type"] != ContentPolicyError.err_type, body["error"]
+
+
+def test_short_delivery_is_declared_not_silent(client, client_state,
+                                               fake_jimeng, fake_uploader):
+    """🔴 上游**少出图**时必须写进 `degradations` —— 不许静默按少的交付。
+
+    上游自己维护 `total_image_count` / `finished_image_count`
+    （实测 4 张那条是 `total=4, finished=1`，排在队列里慢慢出）。
+    终态若两者对不上，调用方会以为"要的 n 张都在里面" ⇒ 必须如实标注。
+    """
+    from app.upstream.jimeng.client import TaskState
+
+    short = TaskState(submit_id="upstream-submit-id", status=50,
+                      status_name="success", finished=True, failed=False,
+                      total=3, finished_count=1)
+    short.images = []          # 走假的 ok_state 太绕，这里直接断言降级文案
+    fake_jimeng.states = [submitted_state(), short]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=3)
+    _tick_until_terminal(client_state)
+
+    body = client.get(f"{BASE}/{tid}").json()
+    degs = body.get("degradations") or []
+    assert any("1/3" in d for d in degs), f"少给图没留痕：{degs}"
+
+
+def test_full_delivery_has_no_shortfall_note(client, client_state,
+                                             fake_jimeng, fake_uploader):
+    """⚠️ 反向：`finished == total` 时**不许**冒出这条降级（否则就成了噪音）。"""
+    fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x")
+    _tick_until_terminal(client_state)
+
+    body = client.get(f"{BASE}/{tid}").json()
+    degs = body.get("degradations") or []
+    assert not [d for d in degs if "只完成" in d], f"不该有的少给降级：{degs}"

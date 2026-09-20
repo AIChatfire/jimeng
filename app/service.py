@@ -684,6 +684,20 @@ class Service:
                    "format": im.format, "note": im.note} for im in st.images]
         notes = [im.note for im in st.images if im.note]
         deg = list(rec.degradations) + [f"产物提示：{n}" for n in notes]
+
+        # 🔴 **上游少出图时不许静默按少的交付。**
+        # 上游自己维护 `total_image_count` / `finished_image_count`
+        # （实测：4 张那条是 `total=4, finished=1, status=45`，排在队列里慢慢出）。
+        # 终态时两者若对不上，调用方会以为"我要的 n 张都在里面" ——
+        # 必须如实写在 `degradations` 里（与我们"降级必须可见"的一贯口径一致）。
+        if (st.total is not None and st.finished_count is not None
+                and st.finished_count < st.total):
+            deg.append(
+                f"⚠️ 上游只完成 {st.finished_count}/{st.total} 张"
+                f"（本服务交付 {len(images)} 张；请求 n={rec.n}）。"
+                f"上游任务可能仍在生成"
+                f"（`finished_image_count < total_image_count`）—— "
+                f"本服务按**已完成的**交付并如实标注，不补齐也不静默。")
         now = int(time.time())
         self.store.patch(
             rec.task_id, status="success", images=images,
