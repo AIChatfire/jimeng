@@ -780,33 +780,11 @@ class Service:
 
         want = rec.n or len(images)
         if want > len(images):
-            # 🔴 **先真续、再退重复**（用户口径 2026-09-20）：
-            # 缺口优先用 `action=2` 去拿**真图**；续不动了才退回「用成功的图补齐」。
-            # ⚠️ 续生成本身就是一次新提交（要重新排队/生成）⇒ **必须异步**：
-            # 这里只提交、把记录放回 `in_progress`，让协调器照常轮询，
-            # **绝不在这里同步等** —— 单并发下那会把协调器堵死几分钟。
-            # ⚠️ history_id **当次回执里就有**；不能只读 `rec.upstream_history_id` ——
-            # 它是在**下面那次成功 patch** 才落库的，首次终态时还是 None（踩过）。
-            hist = getattr(st, "history_record_id", None) or rec.upstream_history_id
-            if (rec.continuations or 0) < CONTINUE_MAX and hist and rec.draft_json:
-                try:
-                    sid = self.client.continue_task(hist, rec.draft_json)
-                except AdapterError as e:
-                    deg.append(f"⚠️ 自动续生成失败（{e.err_type}）：{e.message} —— "
-                               f"退回用成功的图补齐。")
-                else:
-                    n_used = (rec.continuations or 0) + 1
-                    deg.append(
-                        f"⚠️ 上游只出了 {len(images)} 张、请求 n={want} —— "
-                        f"已自动续生成（第 {n_used}/{CONTINUE_MAX} 次，`action=2`）"
-                        f"去取剩余的真图。")
-                    self.store.patch(
-                        rec.task_id, status="in_progress",
-                        upstream_submit_id=sid, images=images,
-                        continuations=n_used, degradations=deg)
-                    OBS.info("task continued", task_id=rec.task_id, model=rec.model,
-                             continuations=n_used, have=len(images), want=want)
-                    return
+            # ⚠️ **这里刻意不再试续生成**：`action=2` 只在「待补生成」态
+            # （`status=45`）被接受，那一支已经由 `_continue_partial` 接管；
+            # 走到"终态成功（50）但少给"这条路时再试，**必然 `ret=1002`**
+            # （白花一次请求，还会在降级里塞一条无用的失败说明）。
+            # 所以这里**只做退路**：用成功的图补齐。
 
             uniq = len(images)
             if uniq:

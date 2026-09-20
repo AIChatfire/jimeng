@@ -1033,6 +1033,17 @@ def _done(urls, *, history_id="44853559987980"):
     return st
 
 
+def _partial(urls, *, n_total=4, history_id="44853559987980"):
+    """`status=45`（部分成功）—— 上游在问"要不要继续"的那个态。"""
+    from app.upstream.jimeng.client import TaskState
+    st = TaskState(submit_id="upstream-submit-id", status=45,
+                   status_name="partial_success", finished=False, failed=False,
+                   history_record_id=history_id, total=n_total,
+                   finished_count=len(urls))
+    st.images = [_img(u) for u in urls]
+    return st
+
+
 def _arm(fake_jimeng, monkeypatch, calls, draft='{"type":"draft","probe":1}'):
     fake_jimeng.last_draft = draft
     # 假客户端本来没有这个方法 ⇒ 必须 raising=False（否则 setattr 直接报错）
@@ -1044,11 +1055,10 @@ def _arm(fake_jimeng, monkeypatch, calls, draft='{"type":"draft","probe":1}'):
 
 def test_short_delivery_triggers_auto_continue(client, client_state, fake_jimeng,
                                                fake_uploader, service, monkeypatch):
-    """🔴 交付 < n 时**先真续**（`action=2`），而不是直接拿重复图凑数。
+    """⚠️ 终态成功（50）但少给时：**只补齐，不再试续生成**。
 
-    断言三件事：① 真的发起了续生成（带对 history_id 与**落盘的草稿**）；
-    ② 记录**回到 `in_progress`** —— 证明是异步、没有在 `_advance` 里同步等；
-    ③ 计数 +1（有封顶就不可能无限续）。
+    `action=2` 只在「待补生成」态（45）被接受（那一支已由 `_continue_partial` 接管）；
+    在 50 再试必然 `ret=1002`。这条锁住"删掉的那个尾巴"不回来。
     """
     calls: list = []
     _arm(fake_jimeng, monkeypatch, calls)
@@ -1057,13 +1067,13 @@ def test_short_delivery_triggers_auto_continue(client, client_state, fake_jimeng
     tid = _create(client, model="jimeng-t2i", prompt="x", n=3)
     _tick_until_terminal(client_state)
 
-    assert calls, "应该发起续生成"
-    assert calls[0][0] == "44853559987980", "必须带原任务的 history_id"
-    assert calls[0][1] == '{"type":"draft","probe":1}', "必须原样带回落盘的草稿"
+    # 45 分支已接管续生成 ⇒ 走到「终态成功但少给」这条路时**只补齐、不再试续**：
+    # 在 50 调 `action=2` 必然 `ret=1002`（白花一次请求）。
+    assert not calls, f"50 时不该再试续生成（必然 1002）：{calls}"
+    body = client.get(f"{BASE}/{tid}").json()
+    assert len(body["data"]) == 3, f"该补齐到 n=3，实得 {len(body['data'])}"
     rec = service.store.get(tid)
-    assert rec.status == "in_progress", f"续生成后应回 in_progress（异步），实得 {rec.status}"
-    assert rec.continuations == 1, "计数要 +1（用于封顶）"
-    assert rec.upstream_submit_id == "cont-sid", "要换成续生成的新 submit_id"
+    assert rec.status == "success", rec.status
 
 
 def test_continued_batch_is_merged_without_duplicates(client, client_state,
@@ -1076,8 +1086,8 @@ def test_continued_batch_is_merged_without_duplicates(client, client_state,
     calls: list = []
     _arm(fake_jimeng, monkeypatch, calls)
     fake_jimeng.states = [submitted_state(),
-                          _done(["https://cdn/a.png"]),
-                          _done(["https://cdn/b.png"])]
+                          _partial(["https://cdn/a.png"], n_total=2),   # 45 ⇒ 触发续
+                          _done(["https://cdn/b.png"])]                 # 续回来的第二批
 
     tid = _create(client, model="jimeng-t2i", prompt="x", n=2)
     _tick_until_terminal(client_state, times=3)
