@@ -149,9 +149,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             OBS.flush()
             logger.info("jimeng-service 已停止")
 
+    # 版本号**单一事实源**在 app/__init__.py 的 __version__（发版流程只改那里）；
+    # 这里曾经硬编码 "0.1.0"，与 __version__ 形成两处漂移 —— openapi.json 报旧版本就是它。
+    from . import __version__  # noqa: PLC0415
+
     app = FastAPI(
         title="jimeng-service",
-        version="0.1.0",
+        version=__version__,
         description="即梦（jimeng.jianying.com）图片生成的**异步**出口。",
         lifespan=lifespan,
     )

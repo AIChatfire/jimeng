@@ -182,23 +182,24 @@ Authorization: Bearer <key>
 
 **上游模型 key —— 已登记的 7 个**（可直接当 `model` 传，等价于 `jimeng-t2i` + 该模型）：
 
-| `model` 传这个 key | 上游名字 | 张数选项 |
-|---|---|---|
-| `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | 1..8 |
-| `high_aes_general_v50p_large` | **Seedream 5.0 Pro** | **1..4** |
-| `high_aes_general_v43` | Seedream 4.7 | 1..8 |
-| `high_aes_general_v42` | Seedream 4.6 | 1..8 |
-| `high_aes_general_v40l` | Seedream 4.5 | 1..8 |
-| `high_aes_general_v41` | Seedream 4.1 | 1..8 |
-| `high_aes_general_v40` | Seedream 4.0 | 1..8 |
+| `model` 传这个 key | 上游名字 | 张数选项 | 实测单价 |
+|---|---|---|---|
+| `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | 1..8 | **0（免费）** |
+| `high_aes_general_v50p_large` | **Seedream 5.0 Pro** | **1..4** | **8/张** |
+| `high_aes_general_v43` | Seedream 4.7 | 1..8 | 未测 |
+| `high_aes_general_v42` | Seedream 4.6 | 1..8 | 未测 |
+| `high_aes_general_v40l` | Seedream 4.5 | 1..8 | 未测 |
+| `high_aes_general_v41` | Seedream 4.1 | 1..8 | 未测 |
+| `high_aes_general_v40` | Seedream 4.0 | 1..8 | 未测 |
 
 ⚠️ **传上游 key 时的三条纪律**：
 
 1. **精确匹配、必须全小写** —— 该分支**不做小写化**（与别名不同）：
    `HIGH_AES_GENERAL_V50P_LARGE` 会被判「未知 model」。
 2. **只会落成 `jimeng-t2i`（文生图）** ⇒ **上游 key 不能用来选 i2i 的模型**（不能垫图）。
-3. **`v50p_large`（5.0 Pro）不在免费档**：Lite 下 t2i/i2i/hd 实测实扣 0，
-   而 **Pro 的实扣从未测过** —— 发它之前请把它当**收费**看待。
+3. **`v50p_large`（5.0 Pro）是收费档**：实测 **8 积分/张**（2026-09-20，
+   1:1 与 3:4 两种尺寸同价；账单按 `submit_id` 对上、余额差分吻合）。
+   Lite 下 t2i/i2i/hd 实测实扣 0。
 
 上游实际有 **9 个**模型：上表 7 个之外还有 **Seedream 3.0 / 3.1**
 （key 带冒号：`high_aes_general_v30l:general_v3.0_18b` 等）—— **本服务未登记**，

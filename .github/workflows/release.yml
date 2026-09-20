@@ -1,0 +1,380 @@
+name: Release
+
+# push main  → patch 自增 → 跑测试 → 构建镜像推 GHCR → 打 tag 建 Release
+# 人工 tag（v*.*.*）→ 以该 tag 发版（版本不自增；要求代码里 __version__ 一致）
+# [skip release] 出现在提交标题/正文 → 跳过镜像与发版（测试照跑）
+#
+# 设计取舍（详见 .workbuddy/skills/gh-release-automation）：
+# - 单架构（amd64）直推，无多架构 merge 段。
+# - 镜像先推、git tag 后打：构建失败不留"有 tag、没镜像"的半成品。
+# - 版本单一事实源 = app/__init__.py 的 __version__（bump 段改写并提交）。
+# - 不搬 git `latest` tag：`latest` 只存在于 GHCR 镜像 tag 上。
+# - changelog 由 git log 生成（直推仓库没有 PR，--generate-notes 会产出空正文）。
+
+on:
+  push:
+    branches: [main]
+    tags: ['v[0-9]*.[0-9]*.[0-9]*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '要发布的 tag（必须已存在；留空 = 对当前 main 自增 patch 发新版）'
+        required: false
+        type: string
+
+permissions:
+  contents: write   # 打 tag / 建 Release
+  packages: write   # 推 ghcr.io 镜像
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # --------------------------------------------------------------- resolve
+  resolve:
+    # actor 守卫是兜底：GITHUB_TOKEN 推的提交本就不触发 workflow，换 PAT 时用得上
+    if: ${{ github.actor != 'github-actions[bot]' }}
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.decide.outputs.mode }}       # auto | tag | skip
+      tag: ${{ steps.ver.outputs.tag }}            # v0.1.1
+      version: ${{ steps.ver.outputs.version }}    # 0.1.1（镜像 tag，无 v 前缀）
+      prev: ${{ steps.ver.outputs.prev }}
+      commit: ${{ steps.decide.outputs.commit }}
+      changelog: ${{ steps.log.outputs.body }}
+    steps:
+      # 按入口取 ref：派发用 inputs.tag、tag 推送用 github.ref、push main 用 github.sha。
+      # 🔴 分支 push 不能用 github.ref（移动指针）—— build/release 要等几分钟，
+      #    期间再有 push，tag 会打到别人的提交上（实测踩过）。
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}
+          fetch-depth: 0
+
+      - name: Decide mode
+        id: decide
+        env:
+          IN_TAG: ${{ inputs.tag }}
+          REF: ${{ github.ref }}
+          HEAD_MSG: ${{ github.event.head_commit.message || '' }}
+        run: |
+          set -euo pipefail
+          COMMIT='${{ inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref || github.sha) }}'
+          echo "commit=${COMMIT}" >> "$GITHUB_OUTPUT"
+          if [ -n "$IN_TAG" ]; then
+            echo "mode=tag" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [ "$REF" != 'refs/heads/main' ]; then
+            echo "mode=tag" >> "$GITHUB_OUTPUT"; exit 0   # tag 推送
+          fi
+          # 提交信息是自由文本 ⇒ 经 env 进来，别内插进 bash 引号里（注入面）
+          if printf '%s' "$HEAD_MSG" | grep -qF '[skip release]'; then
+            echo "mode=skip" >> "$GITHUB_OUTPUT"
+            echo "提交含 [skip release] ⇒ 镜像与 Release 跳过（测试照跑）"
+            exit 0
+          fi
+          echo "mode=auto" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve version
+        id: ver
+        run: |
+          set -euo pipefail
+          MODE='${{ steps.decide.outputs.mode }}'
+          if [ "$MODE" = 'tag' ]; then
+            if [ -n '${{ inputs.tag }}' ]; then TAG='${{ inputs.tag }}'
+            else TAG='${{ github.ref_name }}'; fi
+            echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+            echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+            echo "prev=" >> "$GITHUB_OUTPUT"
+            echo "发布既有人工 tag：${TAG}"
+            exit 0
+          fi
+          # 🔴 排序必须 -v:refname：字典序会把 v1.9.0 判为新于 v1.10.0
+          PREV=$(git tag --list 'v[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -n1 || true)
+          BASE=${PREV:-v0.0.0}
+          IFS=. read -r MA MI PA <<< "${BASE#v}"
+          PA="${PA%%[-+]*}"            # 剥预发布/构建后缀，保护算术
+          NEW="v${MA}.${MI}.$((PA + 1))"
+          echo "prev=${PREV}" >> "$GITHUB_OUTPUT"
+          echo "tag=${NEW}" >> "$GITHUB_OUTPUT"
+          echo "version=${NEW#v}" >> "$GITHUB_OUTPUT"
+          echo "Previous: ${PREV:-<none>} -> Next: ${NEW}"
+
+      - name: Build changelog
+        id: log
+        run: |
+          set -euo pipefail
+          MODE='${{ steps.decide.outputs.mode }}'
+          if [ "$MODE" = 'tag' ]; then
+            TAG='${{ steps.ver.outputs.tag }}'
+            if PREV="$(git describe --tags --abbrev=0 --match 'v*.*.*' "${TAG}^" 2>/dev/null)"; then
+              RANGE="${PREV}..${TAG}"
+            else
+              RANGE="${TAG}"           # 首版：全量可达提交，限长
+            fi
+          else
+            PREV='${{ steps.ver.outputs.prev }}'
+            if [ -z "$PREV" ]; then RANGE='HEAD'
+            else RANGE="${PREV}..HEAD"; fi
+          fi
+          {
+            echo 'body<<CHANGELOG_EOF'
+            echo '## Changes'
+            # bump 提交是流程噪音，从 notes 里滤掉
+            git log "$RANGE" --pretty='- %s (%h)' --no-merges --max-count=50 \
+              | grep -v '^- chore(release)' || echo '- Initial release'
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------- bump
+  # 只在 auto 模式跑：改写 __version__ 并提交。GITHUB_TOKEN 推的提交不会再触发本
+  # workflow（消息里的 [skip release] 只是双保险）。
+  bump:
+    needs: resolve
+    if: ${{ needs.resolve.outputs.mode == 'auto' }}
+    runs-on: ubuntu-latest
+    outputs:
+      bumped_sha: ${{ steps.push.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Bump __version__
+        run: |
+          set -euo pipefail
+          python3 - "$VERSION" <<'PY'
+          import re, sys
+          new = sys.argv[1]
+          p = "app/__init__.py"
+          src = open(p, encoding="utf-8").read()
+          pat = re.compile(r'^__version__\s*=\s*"[^"]*"', re.M)
+          assert len(pat.findall(src)) == 1, f"__version__ 定义应恰好 1 处，实得 {len(pat.findall(src))}"
+          out = pat.sub(f'__version__ = "{new}"', src, count=1)
+          assert out != src, "bump 未产生变化"
+          open(p, "w", encoding="utf-8").write(out)
+          print(f"__version__ -> {new}")
+          PY
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+
+      - name: Commit and push
+        id: push
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add app/__init__.py
+          TAG='${{ needs.resolve.outputs.tag }}'
+          git commit -m "chore(release): ${TAG} [skip release]"
+          # 并发 push 兜底：rebase 后再推，sha 以 rebase 后为准
+          git pull --rebase origin main
+          git push origin main
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  # --------------------------------------------------------------- test
+  # 逃生阀只跳过镜像与 Release，**测试照跑**（纯文档提交也要保证树是绿的）。
+  test:
+    needs: [resolve, bump]
+    if: ${{ always() && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: jimeng
+          POSTGRES_PASSWORD: jimeng
+          POSTGRES_DB: jimeng_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U jimeng"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      TEST_DATABASE_URL: postgresql+psycopg2://jimeng:jimeng@127.0.0.1:5432/jimeng_test
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # 优先 bump 后的提交：测的就是要发布的树
+          ref: ${{ needs.bump.outputs.bumped_sha || needs.resolve.outputs.commit }}
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Install deps
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run tests
+        run: python -m pytest -q
+
+  # ----------------------------------------------------- build-and-push
+  build-and-push:
+    needs: [resolve, bump, test]
+    if: ${{ needs.resolve.outputs.mode != 'skip' && needs.test.result == 'success' }}
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.bumped_sha || needs.resolve.outputs.commit }}
+
+      - name: Resolve image name (must be lowercase)
+        id: img
+        run: |
+          set -euo pipefail
+          # GHCR 镜像名必须全小写；${VAR,,} 是 bash4 特性，用 tr 消除版本依赖
+          IMAGE=$(printf '%s' "ghcr.io/${{ github.repository }}" | tr '[:upper:]' '[:lower:]')
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          echo "IMAGE=${IMAGE}  VERSION=${VERSION}"
+
+      - name: Login to GHCR
+        run: |
+          set -euo pipefail
+          echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io \
+            -u '${{ github.actor }}' --password-stdin
+
+      - name: Build (three tags, one image)
+        run: |
+          set -euo pipefail
+          IMAGE='${{ steps.img.outputs.image }}'
+          SHA=$(git rev-parse --short=7 HEAD)
+          echo "SHA=${SHA}" >> "$GITHUB_ENV"
+          # source label 把包挂到仓库上：PUBLIC 仓库的包据此继承公开可见性
+          docker build \
+            --label "org.opencontainers.image.source=https://github.com/${{ github.repository }}" \
+            -t "${IMAGE}:${VERSION}" -t "${IMAGE}:latest" -t "${IMAGE}:sha-${SHA}" .
+
+      - name: Verify three tags are one image
+        run: |
+          set -euo pipefail
+          IMAGE='${{ steps.img.outputs.image }}'
+          ID1=$(docker image inspect --format '{{.Id}}' "${IMAGE}:${VERSION}")
+          ID2=$(docker image inspect --format '{{.Id}}' "${IMAGE}:latest")
+          ID3=$(docker image inspect --format '{{.Id}}' "${IMAGE}:sha-${SHA}")
+          [ "$ID1" = "$ID2" ] && [ "$ID2" = "$ID3" ] \
+            || { echo "::error::三个 tag 不是同一镜像"; exit 1; }
+          echo "three tags = one image: ${ID1}"
+
+      - name: Push
+        run: |
+          set -euo pipefail
+          IMAGE='${{ steps.img.outputs.image }}'
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+          docker push "${IMAGE}:sha-${SHA}"
+
+      # ------- 冒烟：镜像要能起、要连得上库、鉴权要真的接线 -------
+      - name: Smoke test
+        run: |
+          set -euo pipefail
+          IMAGE='${{ steps.img.outputs.image }}'
+          cleanup() {
+            rc=$?
+            if [ $rc -ne 0 ]; then
+              echo "::error::冒烟失败，svc 日志："; docker logs svc 2>&1 | tail -60 || true
+              echo "--- pg 日志 ---"; docker logs pgsmoke 2>&1 | tail -20 || true
+            fi
+            docker rm -f svc pgsmoke >/dev/null 2>&1 || true
+            docker network rm smoke >/dev/null 2>&1 || true
+            exit $rc
+          }
+          trap cleanup EXIT
+
+          # 镜像里带的版本号必须等于本次发布的版本（bump 是否生效的硬证据）
+          GOT=$(docker run --rm "${IMAGE}:latest" python -c "from app import __version__; print(__version__)")
+          [ "$GOT" = "${VERSION}" ] || { echo "::error::镜像版本 ${GOT} != ${VERSION}"; exit 1; }
+
+          docker network create smoke
+          docker run -d --name pgsmoke --network smoke \
+            -e POSTGRES_USER=jimeng -e POSTGRES_PASSWORD=jimeng -e POSTGRES_DB=jimeng \
+            postgres:16-alpine
+          for i in $(seq 1 30); do
+            docker exec pgsmoke pg_isready -U jimeng -d jimeng >/dev/null 2>&1 && break
+            [ "$i" = 30 ] && { echo "::error::PG 起不来"; exit 1; }
+            sleep 2
+          done
+
+          # 凭据用"合法但不真"的占位：启动期校验只要非空即可（不触上游、零消耗）
+          docker run -d --name svc --network smoke -p 8200:8200 \
+            -e TASK_DB=postgresql+psycopg2://jimeng:jimeng@pgsmoke:5432/jimeng \
+            -e API_KEYS=sk-smoke-key-000000000000 \
+            -e JIMENG_SESSIONID=smoke-dummy-not-real \
+            -e COORDINATOR_ENABLED=1 \
+            "${IMAGE}:latest"
+          for i in $(seq 1 45); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8200/healthz || true)
+            [ "$code" = 200 ] && break
+            [ "$i" = 45 ] && { echo "::error::90s 内 /healthz 未就绪"; exit 1; }
+            sleep 2
+          done
+
+          # ① 存活；② 就绪（任务库可连 + 凭据已配 —— 深过 /healthz）
+          curl -fsS http://127.0.0.1:8200/healthz | grep -q '"status":"ok"'
+          rcode=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8200/readyz)
+          [ "$rcode" = 200 ] || { echo "::error::readyz=${rcode}（库或凭据没接通）"; exit 1; }
+          # ③ 鉴权真的接线：无 key → 401（本地拦截，不发上游）
+          nocode=$(curl -s -o /dev/null -w '%{http_code}' \
+            http://127.0.0.1:8200/async/v1/images/generations/smoke-nonexistent)
+          [ "$nocode" = 401 ] || { echo "::error::无 key 竟得 ${nocode}，鉴权没接线"; exit 1; }
+          # ④ 有 key + 不存在的任务 → 404 task_not_found（同样本地完成）
+          kcode=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Authorization: Bearer sk-smoke-key-000000000000' \
+            http://127.0.0.1:8200/async/v1/images/generations/smoke-nonexistent)
+          [ "$kcode" = 404 ] || { echo "::error::带 key 查不存在任务得 ${kcode}（期望 404）"; exit 1; }
+          # ⑤ openapi 版本 = 发布版本（run 期证据，与镜像内常量双确认）
+          OV=$(curl -fsS http://127.0.0.1:8200/openapi.json | python3 -c "import sys,json;print(json.load(sys.stdin)['info']['version'])")
+          [ "$OV" = "${VERSION}" ] || { echo "::error::openapi 版本 ${OV} != ${VERSION}"; exit 1; }
+          echo "smoke OK: healthz/readyz/401/404/version=${VERSION}"
+
+  # --------------------------------------------------------------- release
+  # 镜像已在手上 ⇒ 现在才打 tag / 建 Release（顺序换过来会有"有 tag、没镜像"半成品）。
+  release:
+    needs: [resolve, bump, build-and-push]
+    if: ${{ needs.resolve.outputs.mode != 'skip' && needs.build-and-push.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.bump.outputs.bumped_sha || needs.resolve.outputs.commit }}
+          fetch-depth: 0
+
+      - name: Tag release (auto mode only)
+        if: ${{ needs.resolve.outputs.mode == 'auto' }}
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          TAG='${{ needs.resolve.outputs.tag }}'
+          # tag 已存在 ⇒ 并发竞争或有人手打了同名版本 ⇒ 报错退出，不静默覆盖
+          if git rev-parse -q --verify "refs/tags/${TAG}" >/dev/null; then
+            echo "::error::tag ${TAG} 已存在（并发竞争？）"; exit 1
+          fi
+          git tag -a "$TAG" -m "Release ${TAG}" "$(git rev-parse HEAD)"
+          git push origin "$TAG"
+
+      - name: Create GitHub Release (idempotent)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BODY: ${{ needs.resolve.outputs.changelog }}
+          TAG: ${{ needs.resolve.outputs.tag }}
+          IMAGE: ghcr.io/${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # 幂等：补跑/重跑同 tag 不再报 already exists 变红
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release ${TAG} already exists -- skipping creation"; exit 0
+          fi
+          printf '%s\n' "$BODY" > notes.md
+          printf '\n## Docker\n\n```bash\ndocker pull %s:%s\n```\n' \
+            "$(printf '%s' "$IMAGE" | tr '[:upper:]' '[:lower:]')" \
+            '${{ needs.resolve.outputs.version }}' >> notes.md
+          gh release create "$TAG" --title "${TAG}" --notes-file notes.md
+          echo "Release ${TAG} 已创建"
