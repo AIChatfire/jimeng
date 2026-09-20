@@ -116,6 +116,8 @@ class TaskRecord(SQLModel, table=True):
     #: 🔴 续生成（action=2）的**必需字段** —— 上游回执里本来就有（history_record_id），
     #: 我们原先**只解析不持久化** ⇒ 异步/重启之后就没法续。
     upstream_history_id: Optional[str] = None
+    #: 已自动续生成（action=2）的次数 —— 用来**封顶**，避免无限续（那会变成无底洞）。
+    continuations: int = 0
     #: 首次提交的那份 draft_content（JSON 串）。用户抓包确认：续生成要**重新带一遍草稿**；
     #: 不存就只能重建，而重建容易与首次提交不一致（那会续错对象）。
     draft_json: Optional[str] = None
@@ -174,7 +176,7 @@ class Meta(SQLModel, table=True):
 _PATCHABLE = {
     "credential_id", "model", "cap_key", "upstream_model", "status", "prompt",
     "image_refs", "size", "n", "seed", "negative_prompt", "upstream_submit_id",
-    "upstream_history_id", "draft_json",
+    "upstream_history_id", "draft_json", "continuations",
     "images", "credits", "error", "degradations", "created_at", "updated_at",
     "started_at", "finished_at", "attempts", "lease_owner", "lease_until",
 }

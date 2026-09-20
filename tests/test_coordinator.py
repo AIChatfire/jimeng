@@ -1017,3 +1017,98 @@ def test_total_image_count_tracks_refs_not_outputs(client, client_state,
     assert urls == ["https://cdn/a.png", "https://cdn/b.png"], "不该被改写/补齐"
     degs = body.get("degradations") or []
     assert not [d for d in degs if "只出了" in d], f"误报了少给：{degs}"
+
+
+def _img(url):
+    from app.upstream.jimeng.client import GeneratedImage
+    return GeneratedImage(url=url, width=1024, height=1024)
+
+
+def _done(urls, *, history_id="44853559987980"):
+    from app.upstream.jimeng.client import TaskState
+    st = TaskState(submit_id="upstream-submit-id", status=50,
+                   status_name="success", finished=True, failed=False,
+                   history_record_id=history_id)
+    st.images = [_img(u) for u in urls]
+    return st
+
+
+def _arm(fake_jimeng, monkeypatch, calls, draft='{"type":"draft","probe":1}'):
+    fake_jimeng.last_draft = draft
+    # 假客户端本来没有这个方法 ⇒ 必须 raising=False（否则 setattr 直接报错）
+    monkeypatch.setattr(
+        fake_jimeng, "continue_task",
+        lambda history_id, d, *a, **k: (calls.append((history_id, d)), "cont-sid")[1],
+        raising=False)
+
+
+def test_short_delivery_triggers_auto_continue(client, client_state, fake_jimeng,
+                                               fake_uploader, service, monkeypatch):
+    """🔴 交付 < n 时**先真续**（`action=2`），而不是直接拿重复图凑数。
+
+    断言三件事：① 真的发起了续生成（带对 history_id 与**落盘的草稿**）；
+    ② 记录**回到 `in_progress`** —— 证明是异步、没有在 `_advance` 里同步等；
+    ③ 计数 +1（有封顶就不可能无限续）。
+    """
+    calls: list = []
+    _arm(fake_jimeng, monkeypatch, calls)
+    fake_jimeng.states = [submitted_state(), _done(["https://cdn/a.png"])]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=3)
+    _tick_until_terminal(client_state)
+
+    assert calls, "应该发起续生成"
+    assert calls[0][0] == "44853559987980", "必须带原任务的 history_id"
+    assert calls[0][1] == '{"type":"draft","probe":1}', "必须原样带回落盘的草稿"
+    rec = service.store.get(tid)
+    assert rec.status == "in_progress", f"续生成后应回 in_progress（异步），实得 {rec.status}"
+    assert rec.continuations == 1, "计数要 +1（用于封顶）"
+    assert rec.upstream_submit_id == "cont-sid", "要换成续生成的新 submit_id"
+
+
+def test_continued_batch_is_merged_without_duplicates(client, client_state,
+                                                      fake_jimeng, fake_uploader,
+                                                      service, monkeypatch):
+    """两批产物要**合并去重** —— 续回来的图不能覆盖或重复第一批。
+
+    n=2：第一批 1 张 ⇒ 触发续生成 ⇒ 第二批 1 张 ⇒ 凑齐 2 张、正常终态。
+    """
+    calls: list = []
+    _arm(fake_jimeng, monkeypatch, calls)
+    fake_jimeng.states = [submitted_state(),
+                          _done(["https://cdn/a.png"]),
+                          _done(["https://cdn/b.png"])]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=2)
+    _tick_until_terminal(client_state, times=3)
+
+    body = client.get(f"{BASE}/{tid}").json()
+    urls = [x["url"] for x in body["data"]]
+    assert urls == ["https://cdn/a.png", "https://cdn/b.png"], f"两批没合并对：{urls}"
+    rec = service.store.get(tid)
+    assert rec.status == "success", f"凑齐后应终态成功，实得 {rec.status}"
+
+
+def test_continue_is_capped_and_falls_back_to_repeats(client, client_state,
+                                                      fake_jimeng, fake_uploader,
+                                                      service, monkeypatch):
+    """⚠️ 封顶：续不动了就**退回「用成功的图补齐」**，并写明续了几次。
+
+    把上限打到顶（`continuations` 已是 `CONTINUE_MAX`）⇒ 这次**不许再续**，
+    直接补齐 + 如实标注。**没有这条，续生成就能变成无底洞**（每次都计费）。
+    """
+    from app.service import CONTINUE_MAX
+
+    calls: list = []
+    _arm(fake_jimeng, monkeypatch, calls)
+    fake_jimeng.states = [submitted_state(), _done(["https://cdn/a.png"])]
+
+    tid = _create(client, model="jimeng-t2i", prompt="x", n=3)
+    service.store.patch(tid, continuations=CONTINUE_MAX)   # 先打到顶
+    _tick_until_terminal(client_state)
+
+    assert not calls, f"到顶了还续生成（会无限计费）：{calls}"
+    body = client.get(f"{BASE}/{tid}").json()
+    assert len(body["data"]) == 3, "到顶后要退回补齐"
+    degs = body.get("degradations") or []
+    assert any("已续生成" in d and "重复" in d for d in degs), f"没写清续了几次：{degs}"

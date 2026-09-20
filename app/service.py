@@ -243,6 +243,10 @@ MAX_INPUT_IMAGES = 4
 #: 上限 3 是刻意小的：3 次都还在限流，说明不该继续打（与 `DISPATCH_MAX_ATTEMPTS` 同一理由）。
 UPLOAD_MAX_ATTEMPTS = 3
 
+#: 一个任务最多**自动续生成**几次（action=2）。硬封顶：续生成是计费动作，
+#: 不能让它变成无底洞；到顶就退回「用成功的图补齐」并如实写明。
+CONTINUE_MAX = 3
+
 
 class Service:
     """服务组件集合 + 编排逻辑。请求线程与协调器线程共用同一实例。"""
@@ -718,16 +722,53 @@ class Service:
         # ⇒ 拿 `finished < total` 判"少给"会在"3 垫图 + n=2"上**误报**
         #   （2 < 3，可是我们要的正好就是 2 张，一张没少）。
         # 所以那两个计数**只当排查上下文**，判据用"交付 vs 请求"。
+        # 续生成回来的批次要和已有产物**合并**（同一任务分几次出图）
+        if (rec.continuations or 0) > 0 and rec.images:
+            seen = {im.get("url") for im in rec.images}
+            images = list(rec.images) + [im for im in images if im.get("url") not in seen]
+
         want = rec.n or len(images)
         if want > len(images):
+            # 🔴 **先真续、再退重复**（用户口径 2026-09-20）：
+            # 缺口优先用 `action=2` 去拿**真图**；续不动了才退回「用成功的图补齐」。
+            # ⚠️ 续生成本身就是一次新提交（要重新排队/生成）⇒ **必须异步**：
+            # 这里只提交、把记录放回 `in_progress`，让协调器照常轮询，
+            # **绝不在这里同步等** —— 单并发下那会把协调器堵死几分钟。
+            # ⚠️ history_id **当次回执里就有**；不能只读 `rec.upstream_history_id` ——
+            # 它是在**下面那次成功 patch** 才落库的，首次终态时还是 None（踩过）。
+            hist = getattr(st, "history_record_id", None) or rec.upstream_history_id
+            if (rec.continuations or 0) < CONTINUE_MAX and hist and rec.draft_json:
+                try:
+                    sid = self.client.continue_task(hist, rec.draft_json)
+                except AdapterError as e:
+                    deg.append(f"⚠️ 自动续生成失败（{e.err_type}）：{e.message} —— "
+                               f"退回用成功的图补齐。")
+                else:
+                    n_used = (rec.continuations or 0) + 1
+                    deg.append(
+                        f"⚠️ 上游只出了 {len(images)} 张、请求 n={want} —— "
+                        f"已自动续生成（第 {n_used}/{CONTINUE_MAX} 次，`action=2`）"
+                        f"去取剩余的真图。")
+                    self.store.patch(
+                        rec.task_id, status="in_progress",
+                        upstream_submit_id=sid, images=images,
+                        continuations=n_used, degradations=deg)
+                    OBS.info("task continued", task_id=rec.task_id, model=rec.model,
+                             continuations=n_used, have=len(images), want=want)
+                    return
+
             uniq = len(images)
-            images = [images[i % uniq] for i in range(want)]
+            if uniq:
+                images = [images[i % uniq] for i in range(want)]
             ctx = (f"（上游计数 finished={st.finished_count}/total={st.total}，"
                    f"**仅供排查**：该 total 跟的是垫图数、不是出图张数）"
                    if st.total is not None and st.finished_count is not None else "")
+            why = (f"已续生成 {rec.continuations} 次仍未凑齐，"
+                   if (rec.continuations or 0) >= CONTINUE_MAX
+                   else "无续生成原料（缺 history_id 或 draft）")
             deg.append(
-                f"⚠️ 上游只出了 {uniq} 张、请求 n={want}{ctx} —— "
-                f"已按口径**用成功的图补齐**到 {want} 个 url："
+                f"⚠️ 上游只出了 {uniq} 张、请求 n={want}{ctx} —— {why}，"
+                f"按口径**用成功的图补齐**到 {want} 个 url："
                 f"**其中 {want - uniq} 张是重复的**（url 与前 {uniq} 个相同，"
                 f"别当新图用）。")
         now = int(time.time())
