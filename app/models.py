@@ -84,6 +84,11 @@ class Capability:
     #: **既不报错也不留痕**；调用方以为用了 4 张、实际只用 1 张。
     #: 现在能力没声明支持几张，就只允许 1 张，多给的当场说清楚。
     max_images: int = 1
+    #: 媒体类型：`image`（图片族）| `video`（视频族）。
+    #: 它决定 resolve() 的**候选池**：图片端点只在 image 池里推导默认，
+    #: 视频端点只在 video 池里 —— 两条池子互不污染，
+    #: 否则"不写 model"就会在 t2i / t2v 之间产生歧义。
+    media: str = "image"
     notes: str = ""
 
     @property
@@ -149,6 +154,23 @@ CAPABILITIES: tuple[Capability, ...] = (
         notes="实测一次出 **4 张 4000×4000**，**与请求张数无关**（由上游决定），"
               "按 4 张计费 28 积分。",
     ),
+    Capability(
+        key="jimeng:t2v", name="t2v", title="文生视频（Seedance）",
+        accepts_image=False, image_required=False, prompt_required=True,
+        credits_measured=None, media="video",
+        notes="上游模型 dreamina_seedance_40_mini（网页端 Seedance 4.0 Mini，t2v）。"
+              "**提交侧已按 2026-09-20 实抓逐字段适配**（含计费字段 "
+              "benefit_type/amount）；**端到端实跑未验证**（建任务即计费，"
+              "需显式开闸后人工确认），结果回包结构未实抓 —— "
+              "产物解析为尽力而为，解析不到按失败处理。"
+              "已实抓档位仅 720p×4s（benefit_type seedance_20_mini_720p_output_5s，"
+              "预扣 4）；其余档位拒绝构造（白名单见 client.VIDEO_COMMERCE）。"
+              "视频草稿没有张数字段（抓包无 gen_option）⇒ 一次一条。"
+              "非 4:3/16:9 的比例未实抓。"
+              "⚠️ 查询侧复用图片同一套 get_history_by_ids 轮询（用户实抓确认）。"
+              "⚠️ 服务端 get_common_config 只下发图片模型表，视频模型清单"
+              "按场景单独下发 —— 新模型要靠补抓提交包登记。",
+    ),
 )
 
 REGISTRY: dict[str, Capability] = {c.key: c for c in CAPABILITIES}
@@ -168,10 +190,15 @@ ALIASES: dict[str, str] = {
     "超清": "jimeng-hd",
     "智能超清": "jimeng-pro-hd",
     "扩图": "jimeng-outpaint",
+    "文生视频": "jimeng-t2v",
+    "视频": "jimeng-t2v",
     # 常见英文写法
     "text2image": "jimeng-t2i",
     "image2image": "jimeng-i2i",
     "upscale": "jimeng-hd",
+    "text2video": "jimeng-t2v",
+    "t2v": "jimeng-t2v",
+    "seedance": "jimeng-t2v",
 }
 
 #: 第三方 SDK 常硬编码的占位模型名 —— 它们**不代表**调用意图。
@@ -196,14 +223,18 @@ def is_placeholder(model: str | None) -> bool:
 def _hint() -> str:
     ids = ", ".join(c.api_id for c in CAPABILITIES)
     return (f"model 取值：{ids}；"
-            f"也可只写能力名（t2i / i2i / hd / pro-hd / outpaint）、"
+            f"也可只写能力名（t2i / i2i / hd / pro-hd / outpaint / t2v）、"
             f"中文别名，或直接写上游模型 key（如 {DEFAULT_UPSTREAM_MODEL}）。"
             f"完整清单见 GET /async/v1/models")
 
 
 def resolve(model: str | None, *, has_image: bool,
-            n_images: int = 1) -> tuple[Capability, str | None]:
+            n_images: int = 1, video: bool = False) -> tuple[Capability, str | None]:
     """解析 `model`，返回 (能力, 上游模型 key 或 None)。
+
+    `video` 选择**候选池**（图片族 / 视频族）—— 两个池子的默认推导互不可见，
+    否则"不写 model"就会在 t2i / t2v 之间产生歧义。给视频能力传 `has_image=True`
+    会在形态校验处被拒（t2v 不吃输入图；i2v 未适配）。
 
     `has_image` 参与两件事：① 默认能力推导；② **能力与请求形态的一致性校验**
     （没给图却指定了吃图的能力 → 400，而不是跑到上游才发现）。
@@ -233,12 +264,21 @@ def resolve(model: str | None, *, has_image: bool,
             raise InvalidParameterError(
                 f"未知 model {raw!r}。{_hint()}", param="model")
         assert cap is not None
+        if (cap.media == "video") != video:
+            where = "视频接口 /async/v1/videos/generations" if cap.media == "video" \
+                else "图片接口 /async/v1/images/generations"
+            raise InvalidParameterError(
+                f"model {raw!r}（{cap.title}）属于{'视频' if cap.media == 'video' else '图片'}族，"
+                f"请走 {where}。", param="model")
         _check_shape(cap, raw=raw, has_image=has_image, n_images=n_images)
         return cap, upstream_model
 
-    # ---- 默认能力：只在无歧义时给 ----
+    # ---- 默认能力：只在无歧义时给（**在声明的媒体池内**推导）----
+    pool = "video" if video else "image"
     cands = [c for c in CAPABILITIES
-             if c.accepts_image is has_image and not (has_image and not c.image_required)]
+             if c.media == pool
+             and c.accepts_image is has_image
+             and not (has_image and not c.image_required)]
     if len(cands) == 1:
         # 默认分支同样要过形态校验（含张数上限）—— 否则"省掉 model"就成了绕过校验的口子
         _check_shape(cands[0], raw=cands[0].api_id, has_image=has_image,
@@ -285,8 +325,11 @@ def _check_shape(cap: Capability, *, raw: str, has_image: bool,
 def catalog() -> list[dict]:
     """`GET /async/v1/models` 用：本服务对外宣告的模型清单。
 
-    ⚠️ 只列**已端到端验证过**的能力。刻意缺席的（如细节修复 `super_resolution`
+    ⚠️ 只列**没有已知缺陷**的能力。刻意缺席的（如细节修复 `super_resolution`
     两次 `status=30 generate_failed`）不出现在这里 —— 那就是"制造假能力"。
+    ⚠️ "已端到端验证"与"已适配"是两档：`jimeng-t2v` 提交侧已按实抓适配、
+    但**未端到端实跑**（建任务即计费）—— 它的 notes 里如实写明，
+    调用方自己决定要不要当第一个吃螃蟹的人。
     """
     return [
         {
@@ -295,6 +338,7 @@ def catalog() -> list[dict]:
             "created": 0,
             "owned_by": "jimeng",
             "title": c.title,
+            "media": c.media,
             "accepts_image": c.accepts_image,
             "requires_image": c.image_required,
             "requires_prompt": c.prompt_required,
@@ -308,14 +352,13 @@ def catalog() -> list[dict]:
 #: 刻意缺席的能力 —— 出现在文档与门禁里，不出现在 catalog 里。
 DELIBERATE_ABSENCES: dict[str, str] = {
     "jimeng-detail-fix": (
-        "细节修复（super_resolution）。2026-09-19 两次真实提交（第二次补上了抓包里的 "
-        "`core_param`）都返回 `status=30 generate_failed`，且**照样计费**。"
-        "2026-09-20 补抓真实 UI 包确认：它的 `postedit_param` **没有 origin_image**，"
-        "输入图靠 `item_id`/`origin_history_id`（账号里已有作品）承载，"
-        "且组件带 `parent_id` 挂在生成父组件下 —— 单组件 + origin_image 形态"
-        "大概不满足其前置条件；公网直链（source_from=link）无证据支持。"
-        "按「不制造假能力」摘除，工具描述仍留在 client.POST_EDIT_TOOLS 供将来续查"
-        "（详见 docs/UPSTREAM.md §9.1）。"
+        "细节修复（super_resolution）。9-19 两次「单组件+origin_image」提交都"
+        "generate_failed 且计费；9-20 路 A 探针证实**死因是 origin_image**："
+        "单组件 + item_id/origin_history_id（无 origin_image，引用账号已有作品）"
+        "一次真跑成功（status=50，出图与源图同尺寸，见 UPSTREAM.md §9.2）。"
+        "输入图不支持公网直链（source_from=link 无证据），外部图需三步："
+        "上传→生成→修复。**暂不注册**：对外契约如何引用已有作品"
+        "（本地 task_id 还是直接 item_id）待定，定了即接线。"
     ),
 }
 

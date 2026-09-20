@@ -95,9 +95,11 @@ def test_catalog_hides_deliberately_absent_capabilities():
     ids = {m["id"] for m in catalog()}
     assert "jimeng-detail-fix" not in ids
     assert "jimeng-detail-fix" in DELIBERATE_ABSENCES, "缺席必须被显式记录，不是忘了"
-    # 五个已端到端验证过的能力都在
+    # 五个已端到端验证过的能力都在；jimeng-t2v 是"已适配、未端到端实跑"
+    # （notes 里如实写明，见 test_video.py::test_models_catalog_lists_video_capability）
     assert ids == {c.api_id for c in CAPABILITIES}
-    assert len(ids) == 5
+    assert len(ids) == 6
+    assert "jimeng-t2v" in ids
 
 
 def test_detail_fix_tool_description_is_kept_for_future_investigation():

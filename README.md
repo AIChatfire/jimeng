@@ -6,6 +6,8 @@
 ```
 POST /async/v1/images/generations        → 202 {"task_id": "jimeng_…"}     只回一个 id
 GET  /async/v1/images/generations/{id}   → 202 排队态 / 200 {data,created,usage}
+POST /async/v1/videos/generations        → 202 文生视频（jimeng-t2v，Seedance）
+GET  /async/v1/videos/generations/{id}   → 202 排队态 / 200 {data,created,usage.videos}
 GET  /async/v1/models                    → 能力清单
 ```
 

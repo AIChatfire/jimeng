@@ -138,7 +138,7 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 | 超清 | `normal_hd` | 13 | ✅ 实扣见过 **1**（forecast 报 9），2048² → **4096²** |
 | 智能超清 | `pro_hd` | 35 | ✅ → 2160²（又贵又小）；forecast 报 91，**实扣未测** |
 | 扩图 | `painting` | 8 | ✅ → **4 张** 4000²（张数由上游定）；forecast 报 28，**实扣未测** |
-| 细节修复 | `super_resolution` | 2 | ❌ 两次 `generate_failed` ⇒ **不注册** |
+| 细节修复 | `super_resolution` | 2 | ✅ **item 引用形态**（2026-09-20 路 A）；upload 形态 ❌ 两次 failed |
 
 ### 9.1 细节修复的输入图：不支持公网直链，且仅上传也未必够（2026-09-20 抓包）
 
@@ -158,6 +158,24 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 ⇒ 对外部图的可行路径：上传换 tos uri 后**先成功生成一张**（拿到
 `item_id`/`origin_history_id`），再对那张作品做细节修复 —— 三步，不是一步。
 （仅上传不生成、直接拿 tos uri 去细节修复 = 正是失败的形态。）
+
+### 9.2 路 A 验证成功（2026-09-20 17:53）：死因就是 origin_image，不需要父链
+
+`scripts/detail_fix_probe.py`（`--go`）单组件 + `item_id`/`origin_history_id`
+（**无 `origin_image`**、无父链）真跑一次：
+
+- `submit_id=47ae9aaa-0782-474f-8268-45d4c9b5c3a3`，~10s 到 `status=50 success`，
+  出图 **1 张 2560x1440**（与源图同尺寸）。
+- **结论**：细节修复的前置条件 = 引用账号已有作品（`item_id` +
+  `origin_history_id`）；带上 `origin_image`（tos uri）反而失败。
+  9-19 两次失败的死因即此，链式父组件**不是**必要条件。
+- **实扣待定**：截至提交后 ~5 分钟账单未出记录、余额未变（此前观察过延迟
+  结算，不能凭此断定免费；结算后再补记）。
+- `build_post_edit_draft` 已支持该形态（不给 uri/url 时要求
+  `item_id`+`origin_history_id`，此时不带 `origin_image`），
+  用例 `test_post_edit_item_reference_form_has_no_origin_image` 钉死。
+- **仍未注册对外能力**：对外契约怎么"引用一张已有作品"（传本地 task_id？
+  直接传 item_id？）是产品决定，定了再接线（见 models.DELIBERATE_ABSENCES）。
 
 ## 10. 图生图（blend）
 
@@ -332,3 +350,40 @@ body: {"count": 20, "cursor": "0", "history_type": 2}     # 2 = 消耗
 旧结论"v43=35 < v50=44 < v40=51、选旧模型省积分不成立"基于 forecast，**作废** ——
 实测口径下 Lite 免费、Pro 8/张，**选对档位才是省积分**。
 最老的 `v30l:general_v3.0_18b` 直接 `ret=1006`（权益不足，不可用）。
+
+## 13. 文生视频（Seedance t2v，2026-09-20 实抓）
+
+**端点与图片族同一个**：`POST /mweb/v1/aigc_draft/generate`。差异全在草稿与 `extend`：
+
+| 维度 | 图片族 | **视频族（t2v）** |
+|---|---|---|
+| 组件类型 | `image_base_component` | **`video_base_component`**（`min_version "1.0.0"`） |
+| `generate_type` | `generate` / `blend` / 工具名 | **`gen_video`** |
+| 参数位置 | `abilities.generate.core_param` 等 | **`abilities.gen_video.text_to_video_params`** |
+| 张数 | `abilities.gen_option.gen_count` | **没有**（实抓确认无 `gen_option`；`batchNumber=1` 只是埋点） |
+| 组件附加 | — | **`process_type: 1`** |
+| `extend` | `root_model` | `root_model` + **`m_video_commerce_info`（计费字段）** + `m_video_commerce_info_list` |
+
+### 已实抓样本（唯一依据）
+
+* 模型：`dreamina_seedance_40_mini`（网页端 Seedance 4.0 Mini，babi_param 场景
+  `makesame-text_to_video`，`generate_type: t2v`）；
+* 参数：`video_mode 2` · `fps 24` · `duration_ms 4000` · `resolution "720p"` ·
+  `video_aspect_ratio "16:9"` · `idip_meta_list []` · `priority 0`；
+* 计费：`benefit_type "seedance_20_mini_720p_output_5s"` · `amount 4`
+  （⚠️ 档位名叫 output_5s 但时长是 4s —— **照抄抓包，别"纠正"**）；
+* `metrics_extra` 是视频专用形态（`enterFrom "ai_feature"` /
+  `functionMode "omni_reference"` / `aiFeatureName "21228507900428"` /
+  `sceneOptions` 字符串），且**原样复本**挂进草稿的 `video_task_extra`。
+
+### 🔴 三个未取证边界（适配层据此设了硬闸）
+
+1. **计费档位白名单**：`(resolution, duration) → (benefit_type, amount)` 只有上表一档
+   （`client.VIDEO_COMMERCE`）。1080p / 5s / 10s 等没有抓包 ⇒ **拒绝构造**（受理时 400），
+   绝不猜 —— 计费字段写错 = 按错档位扣积分。
+2. **结果回包结构未实抓**：`get_history_by_ids` 查询侧已实抓（submit_id 可查），
+   但视频 item 的回包（`item_list[].video.video_url`?）没抓到 ⇒ 解析为尽力而为
+   并在产物上标注；解析不到按零产物 = 失败处理。
+3. **视频模型清单服务端不下发**：`get_common_config` 的 `model_list` 只有 9 个
+   `high_aes_general_*`（图片）。视频模型按场景（babi_param `tool_video`）单独下发，
+   只读接口拿不到 ⇒ **新模型要靠补抓提交包**登记（`dump_video_models.py` 探针可复跑验证）。

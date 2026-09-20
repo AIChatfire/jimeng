@@ -21,6 +21,41 @@
 鉴权：`Authorization: Bearer <key>`。`API_KEYS` 为空时**关闭鉴权**（仅限内网，
 启动会打 WARNING）。任务与 Key 指纹绑定。
 
+### 0.1 视频端点（2026-09-20 起，与图片端点同构）
+
+| 方法 | 路径 | 状态码 | 用途 |
+|---|---|---|---|
+| `POST` | `/async/v1/videos/generations` | `202` | 受理，**只回一个 `task_id`** |
+| `GET` | `/async/v1/videos/generations/{task_id}` | `202`/`200` | 非终态回排队态；终态回结果 |
+| `DELETE` | `/async/v1/videos/generations/{task_id}` | `200`/`400` | 删除**已终态**的任务 |
+
+受理体：
+
+```json
+{
+  "model": "jimeng-t2v",          // 可省略（视频族当前只有它）
+  "prompt": "一只猫在跳舞",        // 必填
+  "resolution": "720p",           // 可省略，默认 720p（已实抓档位）
+  "duration": 4,                  // 可省略，单位秒，默认 4（已实抓档位）
+  "aspect_ratio": "16:9",         // 可省略，默认 16:9（唯一有实抓样本的比例）
+  "seed": 123                     // 可选整数
+}
+```
+
+成功响应：`{"data": [{"url": "…mp4"}], "created": …, "usage": {"videos": 1}}`
+—— 量词是 **`usage.videos`**，不是 `images`。
+
+视频端点的**硬边界**（与"不猜"纪律一致）：
+
+* `(resolution, duration)` 必须命中**实抓档位白名单**
+  （当前仅 `720p × 4s`），否则受理时 400 —— `benefit_type`/`amount`
+  是计费字段，没有抓包依据的档位拒绝构造；
+* 视频草稿**没有张数字段**（实抓确认无 `gen_option`）⇒ `n>1` 按 1 处理
+  并在 `degradations` 留痕；
+* `size` / `image` / `negative_prompt` 不属于视频端点，传了 400；
+* ⚠️ `jimeng-t2v` 提交侧已按实抓适配，但**未端到端实跑**（建任务即计费）；
+  产物解析为尽力而为（回包结构未实抓），解析不到按失败处理。
+
 ---
 
 ## 1. 受理

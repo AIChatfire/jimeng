@@ -160,6 +160,13 @@ class FakeJimeng:
             raise self.fail_submit
         return self._new_submit_id()
 
+    def submit_video(self, prompt: str, **kw: Any) -> str:
+        """文生视频 —— 与图片族同构：记录收到过什么，按剧本回 id。"""
+        self._record("submit_video", prompt=prompt, **kw)
+        if self.fail_submit:
+            raise self.fail_submit
+        return self._new_submit_id()
+
     # ---- 取任务 ----
     def fetch_many(self, submit_ids: list[str]) -> dict[str, TaskState]:
         """批量查询 —— **一次调用 = 一轮上游查询**（与服务侧的真实实现同构）。

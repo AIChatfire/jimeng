@@ -72,6 +72,20 @@ class GenerationRequest(BaseModel):
     negative_prompt: str | None = None
 
 
+class VideoGenerationRequest(BaseModel):
+    """`POST /async/v1/videos/generations` 的请求体（宽松策略与图片端点一致）。"""
+
+    model_config = ConfigDict(extra="allow")
+
+    model: str | None = Field(default=None, description="能力名，如 jimeng-t2v（留空即默认）")
+    prompt: str | None = Field(default=None, description="提示词（视频必填）")
+    resolution: str | None = Field(default=None, description="分辨率档位（如 720p）")
+    duration: int | None = Field(default=None, description="时长（秒，整数）")
+    aspect_ratio: str | None = Field(default=None, description="画面比例（如 16:9）")
+    n: int | None = Field(default=None, description="条数（视频草稿无张数字段，恒按 1 处理并降级留痕）")
+    seed: int | None = None
+
+
 # ---------------------------------------------------------------------------
 # 依赖
 # ---------------------------------------------------------------------------
@@ -156,7 +170,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     app = FastAPI(
         title="jimeng-service",
         version=__version__,
-        description="即梦（jimeng.jianying.com）图片生成的**异步**出口。",
+        description="即梦（jimeng.jianying.com）图片/视频生成的**异步**出口。",
         lifespan=lifespan,
     )
 
@@ -326,13 +340,52 @@ def _install_routes(app: FastAPI) -> None:
         本地删掉只会让"还在跑并继续计费"变成看不见的事。"""
         return request.app.state.service.delete_for_credential(task_id, credential)
 
+    # ------------------------------------------------------------- 视频受理
+    @app.post("/async/v1/videos/generations", status_code=202)
+    async def create_video(
+        request: Request,
+        body: VideoGenerationRequest,
+        credential: str = Depends(require_key),
+    ) -> JSONResponse:
+        """受理一次**文生视频**，只回一个 task_id（语义与图片受理完全一致）。"""
+        svc: Service = request.app.state.service
+        rec = svc.create(body.model_dump(), credential=credential, video=True)
+        request.app.state.coordinator.wake()
+        return JSONResponse(
+            status_code=202, content={"task_id": rec.task_id},
+            headers={"Location": f"/async/v1/videos/generations/{rec.task_id}"})
+
+    # ------------------------------------------------------------- 视频查询
+    @app.get("/async/v1/videos/generations/{task_id}")
+    async def get_video(
+        request: Request,
+        task_id: str,
+        credential: str | None = Depends(require_key_optional),
+    ) -> JSONResponse:
+        """查视频任务（鉴权语义与图片查询一致：id 即凭据）。"""
+        svc: Service = request.app.state.service
+        rec = svc.get_for_credential(task_id, credential)
+        status_code, payload = view(rec)
+        return JSONResponse(status_code=status_code, content=payload)
+
+    # ------------------------------------------------------------- 视频删除
+    @app.delete("/async/v1/videos/generations/{task_id}")
+    async def delete_video(
+        request: Request,
+        task_id: str,
+        credential: str = Depends(require_key),
+    ) -> dict:
+        """删除视频任务（未终态响亮失败 —— 与图片删除同一纪律）。"""
+        return request.app.state.service.delete_for_credential(task_id, credential)
+
     # ------------------------------------------------------------- 模型
     @app.get("/async/v1/models")
     async def list_models() -> dict:
         """本服务对外宣告的能力清单（OpenAI 形态）。
 
-        只列**已端到端验证过**的能力；刻意缺席的（细节修复）不在这里 ——
-        那就是"制造假能力"。
+        只列**没有已知缺陷**的能力；刻意缺席的（细节修复）不在这里 ——
+        那就是"制造假能力"。`jimeng-t2v` 已适配但未端到端实跑，
+        其 notes 里如实写明。
         """
         return {"object": "list", "data": models.catalog()}
 

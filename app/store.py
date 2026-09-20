@@ -109,6 +109,13 @@ class TaskRecord(SQLModel, table=True):
     n: Optional[int] = None
     seed: Optional[int] = None
     negative_prompt: str = ""
+    #: 视频任务专用：时长（毫秒）。图片任务恒 None。
+    #: 🔴 历史库靠启动期幂等迁移补列（见 `_ensure_video_columns`），
+    #: 不再依赖运维手工 ALTER —— 那条路忘跑的症状是 `store.patch()` 报
+    #: column does not exist，且只在视频任务上炸。
+    duration_ms: Optional[int] = None
+    #: 视频任务专用：画面比例（如 "16:9"）。图片任务恒 None。
+    aspect_ratio: Optional[str] = None
 
     # ---- 上游与结果 ----
     #: 即梦的 `submit_id`。**绝不对外暴露**（对外只有本地 task_id）。
@@ -175,7 +182,8 @@ class Meta(SQLModel, table=True):
 
 _PATCHABLE = {
     "credential_id", "model", "cap_key", "upstream_model", "status", "prompt",
-    "image_refs", "size", "n", "seed", "negative_prompt", "upstream_submit_id",
+    "image_refs", "size", "n", "seed", "negative_prompt", "duration_ms",
+    "aspect_ratio", "upstream_submit_id",
     "upstream_history_id", "draft_json", "continuations",
     "images", "credits", "error", "degradations", "created_at", "updated_at",
     "started_at", "finished_at", "attempts", "lease_owner", "lease_until",
@@ -241,6 +249,7 @@ class TaskStore:
             pool_recycle=pool_recycle, pre_ping=pre_ping,
             connect_timeout=connect_timeout)
         SQLModel.metadata.create_all(self.engine)
+        self._ensure_video_columns()
         renamed = self.normalize_status_case()
         if renamed:
             # 响亮：这是"数据被就地改写"，运维必须能在日志里看到
@@ -248,6 +257,25 @@ class TaskStore:
         self.dsn = mask_dsn(target if isinstance(target, str) else str(target.url))
 
     # -------------------------------------------------------------- 迁移/维护
+
+    def _ensure_video_columns(self) -> None:
+        """视频任务的两列（`duration_ms` / `aspect_ratio`）**启动期幂等补列**。
+
+        🔴 为什么放这里而不是留给运维手工 ALTER：`create_all` **只建表不加列**
+        —— 已有库上直接加字段，症状是 `store.patch()` 报
+        `column does not exist`，而且只在视频任务上炸（图片链路全绿），
+        极难第一时间定位。这条线此前靠"两库手工 ALTER"的运维纪律兜着，
+        实践证明容易忘 ⇒ 现在由代码自己保证，`ADD COLUMN IF NOT EXISTS`
+        幂等且零代价（已存在时 PG 直接跳过）。
+        与 `normalize_status_case` 同一取向：**启动时无条件跑一遍**。
+        """
+        stmts = (
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS duration_ms INT",
+            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS aspect_ratio VARCHAR",
+        )
+        with self.engine.begin() as c:
+            for s in stmts:
+                c.execute(text(s))
 
     def normalize_status_case(self) -> int:
         """把历史行的大写状态归一化成小写。返回改动行数。

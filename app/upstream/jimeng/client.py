@@ -494,6 +494,23 @@ def parse_task(submit_id: str, node: dict) -> TaskState:
     st.cost = _pick(node, "forecast_generate_cost")
 
     for it in (node.get("item_list") or []):
+        # ---- 视频产物（t2v/i2v）：item 里带的是 `video` 而不是 `image` ----
+        # ⚠️ **回包结构未实抓验证**（2026-09-20 只抓到了提交侧与查询请求侧）。
+        # 这里按站点通用 item 形态做**尽力而为**解析，并在产物上如实标注；
+        # 解析不到视频 URL 时按"没有产物"处理（零产物 = 失败，不会伪装成功）。
+        vid = it.get("video")
+        if isinstance(vid, dict):
+            url = (vid.get("video_url")
+                   or next((u for u in (vid.get("video_url_list") or [])
+                            if isinstance(u, str) and u), None))
+            if url:
+                st.images.append(GeneratedImage(
+                    url=url, width=vid.get("width"), height=vid.get("height"),
+                    format=vid.get("format"),
+                    item_id=(it.get("common_attr") or {}).get("id"),
+                    note="视频产物（解析自 item.video；该回包结构未实抓验证）",
+                ))
+                continue
         img = it.get("image") or {}
         large = img.get("large_images") or []
         url = None
@@ -568,12 +585,11 @@ POST_EDIT_TOOLS: dict[str, dict[str, Any]] = {
         # （且照样计费）—— 这是"被接受≠能跑通"的又一例。
         "core_param": {"generate_type": 0},
         "scene": None,
-        #: ⚠️ **本工具刻意不注册为对外能力**：两次真实提交都 generate_failed。
-        #: 2026-09-20 补抓真实 UI 包确认：细节修复的 `postedit_param` 里
-        #: **没有 origin_image**，输入图靠 `item_id` + `origin_history_id`
-        #: （账号已有作品）承载，且组件带 `parent_id` 挂在生成父组件下 ——
-        #: 与我们的单组件 + origin_image 形态不同（详见 UPSTREAM.md §9.1）。
-        #: 描述留在表里供将来续查（见 app/models.py::DELIBERATE_ABSENCES）。
+        #: ✅ **9-20 路 A 已验证**：单组件 + item_id/origin_history_id
+        #: （无 origin_image）真跑成功 —— 死因就是 origin_image，父链非必需
+        #: （见 UPSTREAM.md §9.2）。upload（origin_image 带 tos uri）形态不可用。
+        #: 仍未注册为对外能力：对外契约如何引用已有作品待定
+        #: （见 app/models.py::DELIBERATE_ABSENCES）。
         "registered": False,
     },
 }
@@ -606,11 +622,16 @@ def build_post_edit_draft(*, tool: str, image_uri: str = "", image_url: str = ""
     if spec is None:
         raise JimengParamError(
             f"未知的即梦后编辑工具 {tool!r}；可用：{sorted(POST_EDIT_TOOLS)}", code=1001)
+    # 🔴 输入图三种承载方式（2026-09-20 细节修复抓包补全第三种）：
+    #   ① image_uri（tos 资产，已验证）② image_url（外链，未验证）
+    #   ③ item_id + origin_history_id（**不带 origin_image**，引用账号已有作品 ——
+    #      细节修复真实 UI 唯一可见的形态，见 UPSTREAM.md §9.1）
     if not image_uri and not image_url:
-        raise JimengParamError(
-            "后编辑需要输入图：image_uri（即梦存储资产）或 image_url（外链，未验证）",
-            code=1001)
-    if source_from == "upload" and not image_uri:
+        if item_id is None or origin_history_id is None:
+            raise JimengParamError(
+                "后编辑需要输入图：image_uri / image_url，"
+                "或 item_id+origin_history_id（引用账号已有作品）", code=1001)
+    elif source_from == "upload" and not image_uri:
         raise JimengParamError("source_from=upload 时必须给 image_uri", code=1001)
 
     comp_id = _uid()
@@ -785,6 +806,124 @@ def build_blend_draft(*, prompt: str, image_uris: Sequence[str] | None = None,
                     "gen_count": count, "generate_all": False,
                 },
             },
+        }],
+    }
+    return json.dumps(draft, ensure_ascii=False, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------------------
+# 文生视频（Seedance，t2v）
+# ---------------------------------------------------------------------------
+# 取证：2026-09-20 用户实抓网页端「文生视频」（babi_param 场景
+# `makesame-text_to_video`）。与图片族**共用同一个端点**（`aigc_draft/generate`），
+# 区别在草稿：`video_base_component` + `generate_type=gen_video` +
+# `abilities.gen_video.text_to_video_params`。
+#
+# 🔴 **两个刻意保守的决定**（都源于"没有抓包依据就拒绝猜测"）：
+# 1. **模型与计费档位白名单**：`extend.m_video_commerce_info` 里的
+#    `benefit_type` / `amount` 是**计费字段**，写错等于按错的档位扣积分。
+#    目前只有抓包里这一档（720p × 4s ⇒ `seedance_20_mini_720p_output_5s` / 4），
+#    其余组合（1080p、5s/10s…）**没有抓包依据 ⇒ 拒绝构造**，当场 400 说清楚。
+# 2. **视频草稿没有 `gen_option.gen_count`**：抓包里不存在该字段，
+#    `batchNumber=1` 只是埋点。⇒ 视频一次一条，`n>1` 不支持（降级留痕）。
+
+#: 抓包实测的视频模型（网页端 Seedance 4.0 Mini，t2v）。
+DEFAULT_VIDEO_MODEL = "dreamina_seedance_40_mini"
+#: (分辨率, 时长秒) → (benefit_type, 预扣积分 amount)。**只有实抓过的才登记。**
+VIDEO_COMMERCE: dict[tuple[str, int], tuple[str, int]] = {
+    ("720p", 4): ("seedance_20_mini_720p_output_5s", 4),
+}
+#: 分辨率取值（抓包见 720p；1080p 是站点枚举但**无抓包样本**，登记仅供报错提示）。
+VIDEO_RESOLUTIONS: tuple[str, ...] = ("720p", "1080p")
+DEFAULT_VIDEO_RESOLUTION = "720p"
+#: 画面比例（图片族同一套枚举标签；抓包样本是 16:9）。
+VIDEO_ASPECT_RATIOS: tuple[str, ...] = tuple(v[0] for v in IMAGE_RATIOS.values())
+DEFAULT_VIDEO_ASPECT_RATIO = "16:9"
+DEFAULT_VIDEO_FPS = 24
+
+
+def resolve_video_commerce(resolution: str, duration_s: int) -> tuple[str, int]:
+    """查 (分辨率, 时长) 对应的计费档位。**白名单外一律拒绝**，绝不猜。"""
+    hit = VIDEO_COMMERCE.get((resolution, int(duration_s)))
+    if hit is None:
+        known = ", ".join(f"{r}×{d}s" for r, d in sorted(VIDEO_COMMERCE))
+        raise JimengParamError(
+            f"视频档位 {resolution} × {duration_s}s 没有抓包依据，"
+            f"本服务拒绝构造计费字段（benefit_type/amount 写错 = 按错档位扣积分）。"
+            f"当前已实抓的档位：{known}。要放开新档位请先补抓对应请求包。",
+            code=1001)
+    return hit
+
+
+def build_video_draft(*, prompt: str,
+                      model: str = DEFAULT_VIDEO_MODEL,
+                      resolution: str = DEFAULT_VIDEO_RESOLUTION,
+                      duration_ms: int = 4000,
+                      aspect_ratio: str = DEFAULT_VIDEO_ASPECT_RATIO,
+                      fps: int = DEFAULT_VIDEO_FPS,
+                      seed: int | None = None,
+                      metrics: dict[str, Any] | None = None) -> str:
+    """构造**文生视频（t2v）**的 `draft_content` —— 返回 JSON 字符串（双重编码）。
+
+    结构逐字段照抄 2026-09-20 的网页端实抓（t2v）。与图片族的关键差异：
+    · 组件类型是 `video_base_component`（不是 `image_base_component`）；
+    · `generate_type` 是 `gen_video`；
+    · 参数在 `abilities.gen_video.text_to_video_params`，且**没有 `gen_option`**
+      （视频草稿没有张数字段，一次一条）；
+    · 组件带 `process_type: 1`（抓包形态）。
+    """
+    if not prompt or not prompt.strip():
+        raise JimengParamError("prompt 不能为空（文生视频必填）", code=1001)
+    video_task_extra = json.dumps(metrics or {}, ensure_ascii=False,
+                                  separators=(",", ":"))
+    comp_id = _uid()
+    draft = {
+        "type": "draft",
+        "id": _uid(),
+        "min_version": "3.0.5",
+        "min_features": [],
+        "is_from_tsn": True,
+        "version": DA_VERSION,
+        "main_component_id": comp_id,
+        "component_list": [{
+            "type": "video_base_component",
+            "id": comp_id,
+            "min_version": "1.0.0",
+            "aigc_mode": "workbench",
+            "metadata": {
+                "type": "", "id": _uid(), "created_platform": 3,
+                "created_platform_version": "",
+                "created_time_in_ms": str(_now_ms()), "created_did": "",
+            },
+            "generate_type": "gen_video",
+            "abilities": {
+                "type": "", "id": _uid(),
+                "gen_video": {
+                    "type": "", "id": _uid(),
+                    "text_to_video_params": {
+                        "type": "", "id": _uid(),
+                        "video_gen_inputs": [{
+                            "type": "", "id": _uid(),
+                            "min_version": "3.0.5",
+                            "prompt": prompt,
+                            "video_mode": 2,
+                            "fps": fps,
+                            "duration_ms": duration_ms,
+                            "resolution": resolution,
+                            "idip_meta_list": [],
+                        }],
+                        "video_aspect_ratio": aspect_ratio,
+                        "seed": seed if seed is not None
+                                else random.randint(1, 2 ** 32 - 1),
+                        "model_req_key": model,
+                        "priority": 0,
+                    },
+                    # 抓包里这是 metrics_extra 的**原样复本**（埋点字符串），
+                    # 挂在草稿内。照抄，不拼凑。
+                    "video_task_extra": video_task_extra,
+                },
+            },
+            "process_type": 1,
         }],
     }
     return json.dumps(draft, ensure_ascii=False, separators=(",", ":"))
@@ -1039,6 +1178,89 @@ class JimengClient:
         self._post(PATH_SUBMIT, body)
         return sid
 
+    # ------------------------------------------------------------ 文生视频
+
+    def submit_video(self, prompt: str, *, model: str = DEFAULT_VIDEO_MODEL,
+                     resolution: str = DEFAULT_VIDEO_RESOLUTION,
+                     duration_ms: int = 4000,
+                     aspect_ratio: str = DEFAULT_VIDEO_ASPECT_RATIO,
+                     seed: int | None = None,
+                     submit_id: str | None = None,
+                     dry_run: bool = False) -> str:
+        """提交一个**文生视频（t2v）**任务，返回 `submit_id`（**计费动作**）。
+
+        形态逐字段照抄 2026-09-20 网页端实抓（Seedance 4.0 Mini，720p × 4s）。
+        与图片族共用端点 `aigc_draft/generate`；差异全在草稿与 `extend`：
+
+        · `extend.m_video_commerce_info`（**计费字段**）按 (分辨率, 时长)
+          查 `VIDEO_COMMERCE` 白名单，**查不到当场拒绝**；
+        · `metrics_extra` 是视频专用形态（`functionMode=omni_reference` 等），
+          同时**原样复本**挂进草稿的 `video_task_extra`。
+
+        ⚠️ 视频草稿**没有张数字段**（抓包里不存在 `gen_option`）—— 一次一条。
+        `dry_run=True` 时**不发任何请求**，只走完构造与档位校验。
+        """
+        duration_s = int(duration_ms // 1000)
+        if duration_ms <= 0 or duration_ms % 1000:
+            raise JimengParamError(
+                f"duration_ms 必须是正的整秒（毫秒），实得 {duration_ms}", code=1001)
+        if resolution not in VIDEO_RESOLUTIONS:
+            raise JimengParamError(
+                f"resolution 只接受 {list(VIDEO_RESOLUTIONS)}，实得 {resolution!r}",
+                code=1001)
+        if aspect_ratio not in VIDEO_ASPECT_RATIOS:
+            raise JimengParamError(
+                f"aspect_ratio 只接受 {list(VIDEO_ASPECT_RATIOS)}，"
+                f"实得 {aspect_ratio!r}", code=1001)
+        benefit, amount = resolve_video_commerce(resolution, duration_s)
+        sid = submit_id or _uid()
+        # `metrics_extra` 与草稿内 `video_task_extra` 是同一份内容的两种挂法
+        metrics: dict[str, Any] = {
+            "isDefaultSeed": 1, "originSubmitId": sid, "isRegenerate": False,
+            "enterFrom": "ai_feature", "position": "page_bottom_box",
+            "aiFeatureName": "21228507900428", "promptType": "original_prompt",
+            "functionMode": "omni_reference", "generatorFeature": "omniReference",
+            "sceneOptions": json.dumps([{
+                "type": "video", "scene": "BasicVideoGenerateButton",
+                "resolution": resolution, "modelReqKey": model,
+                "videoDuration": duration_s, "batchNumber": 1,
+                "inputVideoDuration": 0, "chargeInputVideoDuration": True,
+                "isLongVideo": False, "hasInputVideo": False,
+                "useSeedanceFast5sFreeTrial": False,
+                "reportParams": {
+                    "enterSource": "generate", "vipSource": "generate",
+                    "extraVipFunctionKey": f"{model}-{resolution}",
+                    "useVipFunctionDetailsReporterHoc": True},
+                "materialTypes": [],
+            }], separators=(",", ":")),
+            "batchNumber": 1, "submitGroupId": _uid(), "hasRejectedAudit": 0,
+        }
+        draft = build_video_draft(
+            prompt=prompt, model=model, resolution=resolution,
+            duration_ms=duration_ms, aspect_ratio=aspect_ratio,
+            seed=seed, metrics=metrics)
+        # ⚠️ 必须在 dry_run 早退**之前**设好（与 blend/edit 同一教训）
+        self.last_warnings = []
+        self.last_draft = draft
+        if dry_run:
+            return sid
+        commerce = {"amount": amount, "benefit_type": benefit,
+                    "resource_id": "generate_video", "resource_id_type": "str",
+                    "resource_sub_type": "aigc"}
+        body = {
+            "extend": {"root_model": model, "m_video_commerce_info": commerce,
+                       **({"workspace_id": self.workspace_id}
+                          if self.workspace_id else {}),
+                       "m_video_commerce_info_list": [dict(commerce)]},
+            "submit_id": sid,
+            "metrics_extra": json.dumps(metrics, ensure_ascii=False,
+                                        separators=(",", ":")),
+            "draft_content": draft,
+            "http_common_info": {"aid": int(APPID)},
+        }
+        self._post(PATH_SUBMIT, body)
+        return sid
+
     # ------------------------------------------------------------ 后编辑
 
     def edit(self, tool: str, *, image_uri: str = "", image_url: str = "",
@@ -1285,8 +1507,10 @@ __all__ = [
     "JimengClient", "TaskState", "GeneratedImage",
     "JimengError", "JimengAuthError", "JimengRateLimitError", "JimengQuotaError",
     "JimengRiskError", "JimengContentError", "JimengParamError", "JimengTimeout",
-    "build_draft", "build_blend_draft", "build_post_edit_draft", "parse_task",
+    "build_draft", "build_blend_draft", "build_post_edit_draft", "build_video_draft",
+    "parse_task",
     "parse_size", "ratio_for_size", "raise_for_ret", "count_options", "resolve_count",
+    "resolve_video_commerce",
     "COUNT_OPTIONS_BY_MODEL", "DEFAULT_COUNT_OPTIONS",
     "BLEND_ABILITY_NAME", "POST_EDIT_TOOLS", "POSTEDIT_GENERATE_TYPE",
     "classify_reject", "REJECT_VERDICTS",
@@ -1296,4 +1520,6 @@ __all__ = [
     "DEFAULT_MODEL", "DEFAULT_SIZE", "BASE",
     "PATH_SUBMIT", "PATH_HISTORY", "PATH_HISTORY_LIST", "PATH_IMAGE_BY_URI",
     "PATH_UPLOAD_TOKEN", "PATH_COMMON_CONFIG",
+    "DEFAULT_VIDEO_MODEL", "DEFAULT_VIDEO_RESOLUTION", "DEFAULT_VIDEO_ASPECT_RATIO",
+    "VIDEO_COMMERCE", "VIDEO_RESOLUTIONS", "VIDEO_ASPECT_RATIOS",
 ]

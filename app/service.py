@@ -48,6 +48,10 @@ from .store import TaskRecord, TaskStore
 from .upstream.jimeng import (
     DEFAULT_MODEL,
     DEFAULT_SIZE,
+    DEFAULT_VIDEO_ASPECT_RATIO,
+    DEFAULT_VIDEO_RESOLUTION,
+    VIDEO_ASPECT_RATIOS,
+    VIDEO_RESOLUTIONS,
     JimengAuthError,
     JimengClient,
     JimengContentError,
@@ -59,6 +63,7 @@ from .upstream.jimeng import (
     JimengTimeout,
     ImageXUploader,
     parse_size,
+    resolve_video_commerce,
 )
 from .upstream.jimeng.capabilities import ModelConfigCache
 from .upstream.jimeng.client import CODES_SECURITY
@@ -69,6 +74,8 @@ log = logging.getLogger(__name__)
 ACCEPTED_FIELDS = frozenset({
     "model", "prompt", "image", "size", "n", "seed", "negative_prompt",
 })
+#: **视频接口额外**允许的字段（图片接口见到它们 = 传错了地方，400 说清楚）。
+VIDEO_FIELDS = frozenset({"resolution", "duration", "aspect_ratio"})
 #: **认得但本服务做不到**的字段 —— 见到就进 `degradations`（响亮降级），
 #: 而不是当"未知字段"报错。它们来自 OpenAI/方舟图片接口的习惯写法。
 KNOWN_UNSUPPORTED_FIELDS = frozenset({
@@ -206,7 +213,11 @@ def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
             **deg,
         }
 
-    usage: dict[str, Any] = {"images": len(rec.images)}
+    usage: dict[str, Any] = {}
+    _cap = models.REGISTRY.get(rec.cap_key)
+    # 视频任务对外的量词是 `videos`，不是 `images` —— 契约形状按媒体分流
+    usage["videos" if (_cap and _cap.media == "video") else "images"] \
+        = len(rec.images)
     if rec.credits is not None:
         # 🔴 **这是上游回执里的 `forecast_generate_cost`，是"预估"，不是实际扣费。**
         # 实测它**严重高估**：i2i 报 55 / 实扣 **12**（t2i / hd 在 Lite 上实测**免费**，
@@ -312,8 +323,12 @@ class Service:
         return credential_id(api_key, self._cred_secret)
 
     def create(self, body: dict[str, Any], *, credential: str,
-               dry_run: bool = False) -> TaskRecord:
+               dry_run: bool = False, video: bool = False) -> TaskRecord:
         """校验 + 落库，返回任务记录。**请求内零上游往返。**
+
+        `video=True` 表示走**视频端点**：候选池切到视频族、额外放行
+        `resolution` / `duration` / `aspect_ratio` 三个字段
+        （图片端点见到它们 = 传错了地方，400 说清楚）。
 
         🔴 刻意**不在这里下载输入图**：异步接口的语义就是"受理即返回"，
         把下载塞进请求会让受理时间随上游网络抖动。图片拉取失败会在任务里
@@ -328,14 +343,34 @@ class Service:
         # 未提供的可选字段填成 None，所以这一步是必需的，不是可选优化。）
         body = {k: v for k, v in body.items() if v is not None}
 
-        unknown = set(body) - ACCEPTED_FIELDS - KNOWN_UNSUPPORTED_FIELDS
+        unknown = set(body) - ACCEPTED_FIELDS - KNOWN_UNSUPPORTED_FIELDS \
+            - (VIDEO_FIELDS if video else frozenset())
         if unknown:
             raise InvalidParameterError(
                 f"未知字段 {sorted(unknown)}；本接口接受 "
-                f"{sorted(ACCEPTED_FIELDS)}（其中 "
+                f"{sorted(ACCEPTED_FIELDS | (VIDEO_FIELDS if video else frozenset()))}"
+                f"（其中 "
                 f"{sorted(KNOWN_UNSUPPORTED_FIELDS)} 是**认得但本服务做不到**的字段，"
                 f"传了会进 `degradations` 而不是报错）",
                 param=sorted(unknown)[0])
+        if video:
+            # 视频端点**不收**图片族字段：size（视频用 resolution 档位）、
+            # negative_prompt（视频草稿没有该字段，实抓确认）、image（t2v 不吃垫图；
+            # i2v 未适配）。静默忽略 = 调用方以为生效了 —— 必须当场说清。
+            banned = sorted(set(body) & {"size", "image", "negative_prompt"})
+            if banned:
+                raise InvalidParameterError(
+                    f"字段 {banned} 不属于视频接口：视频用 resolution/duration/"
+                    f"aspect_ratio 表达画面形态，草稿里没有"
+                    f"{'、'.join(banned)} 的对应位置（实抓确认）。",
+                    param=banned[0])
+        else:
+            misplaced = sorted(set(body) & VIDEO_FIELDS)
+            if misplaced:
+                raise InvalidParameterError(
+                    f"字段 {misplaced} 只属于**视频接口** "
+                    f"`/async/v1/videos/generations`（图片接口没有这些参数）。",
+                    param=misplaced[0])
 
         degradations: list[str] = []
         for k in sorted(set(body) & KNOWN_UNSUPPORTED_FIELDS):
@@ -356,17 +391,49 @@ class Service:
         prompt = (prompt or "").strip()
 
         cap, upstream_model = models.resolve(body.get("model"), has_image=bool(image),
-                                            n_images=len(image))
+                                            n_images=len(image), video=video)
         if cap.prompt_required and not prompt:
             raise InvalidParameterError(
                 f"model {cap.api_id}（{cap.title}）需要 prompt，但本次没给或为空。",
                 param="prompt")
 
-        size = body.get("size") or _default_size()
-        try:
-            parse_size(str(size))
-        except JimengError as e:
-            raise InvalidParameterError(str(e), param="size") from e
+        duration_ms: int | None = None
+        aspect_ratio: str | None = None
+        if cap.media == "video":
+            # 视频不吃像素尺寸 —— 分辨率/时长/比例各有自己的校验，
+            # 其中 (resolution, duration) 还要过**计费档位白名单**
+            # （benefit_type/amount 没抓包依据的档位当场拒绝，绝不猜）。
+            resolution = body.get("resolution") or DEFAULT_VIDEO_RESOLUTION
+            if not isinstance(resolution, str) or resolution not in VIDEO_RESOLUTIONS:
+                raise InvalidParameterError(
+                    f"resolution 只接受 {list(VIDEO_RESOLUTIONS)}，实得 {resolution!r}。",
+                    param="resolution")
+            size = resolution                      # 复用 size 列存分辨率档位
+            duration = body.get("duration")
+            if duration is None:
+                duration = 4                       # 实抓档位：720p × 4s
+            if isinstance(duration, bool) or not isinstance(duration, int) \
+                    or duration < 1:
+                raise InvalidParameterError(
+                    "duration 必须是 >=1 的整数（秒）", param="duration")
+            try:
+                resolve_video_commerce(resolution, duration)
+            except JimengError as e:
+                raise InvalidParameterError(str(e), param="duration") from e
+            duration_ms = duration * 1000
+            aspect = body.get("aspect_ratio") or DEFAULT_VIDEO_ASPECT_RATIO
+            if not isinstance(aspect, str) or aspect not in VIDEO_ASPECT_RATIOS:
+                raise InvalidParameterError(
+                    f"aspect_ratio 只接受 {list(VIDEO_ASPECT_RATIOS)}，"
+                    f"实得 {aspect!r}。⚠️ 只有 16:9 有实抓样本，其余比例未验证。",
+                    param="aspect_ratio")
+            aspect_ratio = aspect
+        else:
+            size = body.get("size") or _default_size()
+            try:
+                parse_size(str(size))
+            except JimengError as e:
+                raise InvalidParameterError(str(e), param="size") from e
 
         #: ⚠️ **不传 `n` 与传 `n=...` 是两种情况，必须分开处理。**
         #:
@@ -389,7 +456,17 @@ class Service:
             raise InvalidParameterError("seed 必须是整数", param="seed")
 
         n = n_raw or 1
-        if self.cfg is not None:
+        if cap.media == "video":
+            # 🔴 视频草稿**没有张数字段**（实抓确认无 `gen_option`，
+            # `batchNumber=1` 只是埋点）⇒ 一次一条。多要的响亮降级，
+            # 绝不假装能给 —— 静默只出 1 条比明确拒绝更害人。
+            if n_raw is not None and n_raw > 1:
+                degradations.append(
+                    f"视频任务请求 n={n_raw}，但视频草稿没有张数字段"
+                    f"（实抓确认无 gen_option）⇒ 按 n=1 处理；"
+                    f"要多条视频请发多个任务。")
+            n = 1
+        elif self.cfg is not None:
             # 🔴 **所有能力**的张数都走同一条路：草稿里写的都是
             # `abilities.gen_option.gen_count`（**组件级**字段，与具体 ability 平级）。
             # 早先只放行 t2i（后来才加上 i2i），后编辑族则写着"只接受 1" ——
@@ -436,6 +513,8 @@ class Service:
             n=n,
             seed=seed,
             negative_prompt=str(body.get("negative_prompt") or ""),
+            duration_ms=duration_ms,
+            aspect_ratio=aspect_ratio,
             degradations=degradations,
             created_at=now,
             updated_at=now,
@@ -940,6 +1019,15 @@ class Service:
                 rec.prompt, model=model_key, size=size, count=rec.n or 1,
                 negative_prompt=rec.negative_prompt, seed=rec.seed,
                 count_options=opts)
+        elif cap.name == "t2v":
+            # 文生视频：模型与计费档位由 client.submit_video 按白名单定，
+            # 张数恒 1（草稿无 gen_option，受理时已降级留痕）。
+            sid = self.client.submit_video(
+                rec.prompt,
+                resolution=rec.size or DEFAULT_VIDEO_RESOLUTION,
+                duration_ms=rec.duration_ms or 4000,
+                aspect_ratio=rec.aspect_ratio or DEFAULT_VIDEO_ASPECT_RATIO,
+                seed=rec.seed)
         elif cap.name == "i2i":
             # blend 原生吃**列表** ⇒ 多张垫图一次带上；
             # 张数走与文生图**同一套吸附**（`generate_count_options`）——
