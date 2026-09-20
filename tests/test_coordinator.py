@@ -338,6 +338,31 @@ def test_post_edit_family_also_carries_the_count():
         assert ab["gen_option"]["generate_all"] is False, tool
 
 
+def test_post_edit_item_reference_form_has_no_origin_image():
+    """🔴 输入图第三种承载：`item_id`+`origin_history_id`（**不带 origin_image**）。
+
+    2026-09-20 细节修复真实 UI 抓包里唯一可见的形态（UPSTREAM.md §9.1）；
+    2026-09-20 路 A 探针用它**一次真跑成功**（此前两次"单组件+origin_image"
+    都 generate_failed 且计费）。这条用例把"引用形态不带 origin_image"钉死，
+    防止将来有人把该校验改回"必须有输入图"。
+    """
+    from app.upstream.jimeng.client import build_post_edit_draft
+
+    d = json.loads(build_post_edit_draft(
+        tool="detail", item_id=7687536700452588862,
+        origin_history_id=44853933660428, count=1))
+    pedit = d["component_list"][0]["abilities"]["super_resolution"]["postedit_param"]
+    assert "origin_image" not in pedit, "引用形态不得带 origin_image"
+    assert pedit["generate_type"] == 2
+    assert pedit["item_id"] == 7687536700452588862
+    assert pedit["origin_history_id"] == 44853933660428
+    # 反向：什么输入都不给必须报错，不能静默构造空输入草稿
+    import pytest
+    from app.upstream.jimeng.client import JimengParamError
+    with pytest.raises(JimengParamError):
+        build_post_edit_draft(tool="normal_hd", count=1)
+
+
 def test_hd_passes_the_requested_count_to_edit(client, client_state,
                                                fake_jimeng, fake_uploader):
     """`n` 对后编辑族也要**真的流到上游** —— 不再"只接受 1"。"""
