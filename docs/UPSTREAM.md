@@ -140,6 +140,25 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 | 扩图 | `painting` | 8 | ✅ → **4 张** 4000²（张数由上游定）；forecast 报 28，**实扣未测** |
 | 细节修复 | `super_resolution` | 2 | ❌ 两次 `generate_failed` ⇒ **不注册** |
 
+### 9.1 细节修复的输入图：不支持公网直链，且仅上传也未必够（2026-09-20 抓包）
+
+补抓一次真实 UI 的细节修复请求（Pro 链上第 2 跳），三个结论：
+
+1. **输入图不是 URL、也不是 tos uri**：`postedit_param` 全部字段只有
+   `{type, id, generate_type: 2, item_id, origin_history_id}` —— 引用的是
+   **账号里已有作品**。整个 draft 里没有 `origin_image` / `image_url` /
+   `image_uri` 任何一个字段。
+2. **链式形态**：`super_resolution` 组件带 `parent_id` 指向前面的
+   `generate`（Pro）父组件。我们两次失败的提交是**单组件草稿**
+   （`origin_image` 带 tos uri + 补了 `core_param`）—— 形态差异明确存在，
+   但"缺父链"与"缺已有作品"哪个是死因，未经真跑不能断言。
+3. **`source_from: "link"`（外链）无证据支持**：前端 JS 枚举里确实有这个取值，
+   但所有已收集的抓包里**从未出现过**。结论：主输入图不支持公网直链。
+
+⇒ 对外部图的可行路径：上传换 tos uri 后**先成功生成一张**（拿到
+`item_id`/`origin_history_id`），再对那张作品做细节修复 —— 三步，不是一步。
+（仅上传不生成、直接拿 tos uri 去细节修复 = 正是失败的形态。）
+
 ## 10. 图生图（blend）
 
 不是另一个端点，而是同一个 `component_list` 里的另一种组件（`gen_type=12`、

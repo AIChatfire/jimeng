@@ -309,10 +309,13 @@ def catalog() -> list[dict]:
 DELIBERATE_ABSENCES: dict[str, str] = {
     "jimeng-detail-fix": (
         "细节修复（super_resolution）。2026-09-19 两次真实提交（第二次补上了抓包里的 "
-        "`core_param`）都返回 `status=30 generate_failed`，且**照样计费**。抓包里它是"
-        "链式第 4 跳、带 `item_id`/`origin_history_id`（引用账号里已有作品）——"
-        "独立草稿形态大概不满足其前置条件。按「不制造假能力」摘除，"
-        "工具描述仍留在 client.POST_EDIT_TOOLS 供将来续查。"
+        "`core_param`）都返回 `status=30 generate_failed`，且**照样计费**。"
+        "2026-09-20 补抓真实 UI 包确认：它的 `postedit_param` **没有 origin_image**，"
+        "输入图靠 `item_id`/`origin_history_id`（账号里已有作品）承载，"
+        "且组件带 `parent_id` 挂在生成父组件下 —— 单组件 + origin_image 形态"
+        "大概不满足其前置条件；公网直链（source_from=link）无证据支持。"
+        "按「不制造假能力」摘除，工具描述仍留在 client.POST_EDIT_TOOLS 供将来续查"
+        "（详见 docs/UPSTREAM.md §9.1）。"
     ),
 }
 

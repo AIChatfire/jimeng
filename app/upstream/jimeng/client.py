@@ -569,6 +569,10 @@ POST_EDIT_TOOLS: dict[str, dict[str, Any]] = {
         "core_param": {"generate_type": 0},
         "scene": None,
         #: ⚠️ **本工具刻意不注册为对外能力**：两次真实提交都 generate_failed。
+        #: 2026-09-20 补抓真实 UI 包确认：细节修复的 `postedit_param` 里
+        #: **没有 origin_image**，输入图靠 `item_id` + `origin_history_id`
+        #: （账号已有作品）承载，且组件带 `parent_id` 挂在生成父组件下 ——
+        #: 与我们的单组件 + origin_image 形态不同（详见 UPSTREAM.md §9.1）。
         #: 描述留在表里供将来续查（见 app/models.py::DELIBERATE_ABSENCES）。
         "registered": False,
     },
