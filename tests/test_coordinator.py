@@ -939,7 +939,13 @@ def test_short_delivery_is_declared_not_silent(client, client_state,
 
     body = client.get(f"{BASE}/{tid}").json()
     degs = body.get("degradations") or []
-    assert any("1/3" in d for d in degs), f"少给图没留痕：{degs}"
+    # ① 数量补齐到请求的 n（契约上的数量不因上游抖动而变）
+    assert len(body["data"]) == 3, f"应补齐到 3 个 url，实得 {len(body['data'])}"
+    # ② 第 2、3 张是复用第 1 张（同一个 url）
+    urls = [x["url"] for x in body["data"]]
+    assert urls[0] == urls[1] == urls[2] == "https://cdn/a.png", urls
+    # ③ **必须写明有几张是重复的** —— 不假装是新图
+    assert any("重复" in d and "2" in d for d in degs), f"没标注重复张数：{degs}"
 
 
 def test_full_delivery_has_no_shortfall_note(client, client_state,

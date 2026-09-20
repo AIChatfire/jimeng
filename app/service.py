@@ -696,20 +696,35 @@ class Service:
         notes = [im.note for im in st.images if im.note]
         deg = list(rec.degradations) + [f"产物提示：{n}" for n in notes]
 
-        # 🔴 **上游少出图时不许静默按少的交付。**
+        # 🔴 **上游少出图时，用成功的图补齐**（用户口径 2026-09-20 的"优化方案 1"）。
+        #
         # 上游自己维护 `total_image_count` / `finished_image_count`
         # （实测：4 张那条是 `total=4, finished=1, status=45`，排在队列里慢慢出）。
-        # 终态时两者若对不上，调用方会以为"我要的 n 张都在里面" ——
-        # 必须如实写在 `degradations` 里（与我们"降级必须可见"的一贯口径一致）。
-        if (st.total is not None and st.finished_count is not None
-                and st.finished_count < st.total):
+        #
+        # 语义（刻意选这个而不是"少给几张算几张"）：
+        #   · 调用方**拿到 `n` 个 url** —— 契约上的数量不因上游抖动而变；
+        #   · 缺口由**已成功的图按序重复填充**；
+        #   · **必须写明"其中 k 张是重复的"** —— 不假装那是新图。
+        #     否则调用方会以为拿到了 n 个不同结果，那是另一种静默失真。
+        # ⚠️ 零产物已在上面拦成失败，所以走到这里 `images` 必然 ≥1 张。
+        want = rec.n or len(images)
+        short = (st.total is not None and st.finished_count is not None
+                 and st.finished_count < st.total)
+        if want > len(images):
+            uniq = len(images)
+            images = [images[i % uniq] for i in range(want)]
+            deg.append(
+                f"⚠️ 上游只完成 {uniq} 张（请求 n={want}"
+                + (f"，上游声明 total={st.total}" if st.total is not None else "")
+                + f"）—— 已按口径**用成功的图补齐**到 {want} 个 url："
+                f"**其中 {want - uniq} 张是重复的**（url 与前 {uniq} 个相同，"
+                f"别当新图用）。")
+        elif short:
+            # 上游少给了，但调用方本来就要这么多（没缺口）⇒ 仍如实标注
             deg.append(
                 f"⚠️ 上游只完成 {st.finished_count}/{st.total} 张"
-                f"（本服务交付 {len(images)} 张；请求 n={rec.n}）。"
-                f"上游任务可能仍在生成"
-                f"（`finished_image_count < total_image_count`）。"
-                f"**这是上游侧的问题**：本服务**不补齐**（不做续生成），"
-                f"只要有 ≥1 张就按成功交付并如实标注。")
+                f"（本服务交付 {len(images)} 张；请求 n={rec.n}）—— "
+                f"上游任务可能仍在生成（`finished_image_count < total_image_count`）。")
         now = int(time.time())
         self.store.patch(
             rec.task_id, status="success", images=images,
