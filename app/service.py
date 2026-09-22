@@ -836,7 +836,9 @@ class Service:
                 param="task_id")
         self.store.delete(rec.task_id)
         OBS.info("task deleted", task_id=rec.task_id, status=rec.status)
-        return {"task_id": rec.task_id, "status": "DELETED"}
+        # 小写贯穿全部出口（2026-09-22 统一）：此处曾用大写 "DELETED"，
+        # 与任务状态机五态（queued/in_progress/success/failure/canceled）风格不一致。
+        return {"task_id": rec.task_id, "status": "deleted"}
 
     def list_for_credential(self, credential: str, *, limit: int = 50) -> dict:
         recs = self.store.list_recent(credential_id=credential, limit=limit)

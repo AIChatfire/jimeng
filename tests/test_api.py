@@ -265,7 +265,7 @@ def test_delete_terminal_task_removes_the_record(client, client_state, fake_jime
                       headers=AUTH).json()["task_id"]
     client_state.coordinator.tick()
     client_state.coordinator.tick()
-    assert client.delete(f"{BASE}/{tid}", headers=AUTH).json()["status"] == "DELETED"
+    assert client.delete(f"{BASE}/{tid}", headers=AUTH).json()["status"] == "deleted"
     assert client.get(f"{BASE}/{tid}", headers=AUTH).status_code == 404
 
 
