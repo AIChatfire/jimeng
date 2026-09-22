@@ -210,19 +210,29 @@ Authorization: Bearer <key>
 
 ```json
 {
+  "status": "success",
   "data": [ { "url": "https://...jpeg?X-Tos-Expires=86400&..." } ],
   "created": 1789490763,
-  "usage": { "images": 1, "credits": 44 }
+  "usage": { "images": 1, "forecast_credits": 44 }
 }
 ```
 
-三条刻意的取舍：
+四条刻意的取舍：
 
-1. **`data[]` 里只有 `url`。** 宽高/格式我们确实知道，但**不塞进来** ——
+1. **五态都带顶层 `status`**（`queued` / `in_progress` / `success` / `failure` /
+   `canceled`，2026-09-22 补齐成功态）—— 调用方**只凭这一个字段判终态**，
+   不必按"有没有 `data`"推断。取值与自身 `store` 状态同名（小写）。
+   **跨系统对齐不在这里做**：对接 New API 任务插件时，由**插件侧**把五种取值
+   归一化到其大写枚举（`QUEUED` / `IN_PROGRESS` / `SUCCESS` / `FAILURE`）——
+   其中 `canceled` 归 `FAILURE`（New API 无独立取消态）。
+2. **`data[]` 里只有 `url`。** 宽高/格式我们确实知道，但**不塞进来** ——
    与冻结契约逐字一致，多一个键就多一分"形状不同"的风险。那些真知识在 trace 里。
-2. **结果 URL 原样透传，不做转存。** 参考实现的产物也是上游直链（预签名）。
+3. **结果 URL 原样透传，不做转存。** 参考实现的产物也是上游直链（预签名）。
    ⚠️ 即梦产物链接的有效期**未取证** —— 需要长期可用链接时得另做转存，本服务没做。
-3. **`created` 是 epoch 秒**（任务完成时刻）。
+4. **`created` 是 epoch 秒**（任务完成时刻）。
+
+⚠️ `usage.forecast_credits` 是**上游回执的预估**（`forecast_generate_cost`），
+**不是实际扣费** —— 实测高估数倍，对账口径见 `UPSTREAM.md` 积分章节。
 
 ### 2.3 失败 → `200`
 

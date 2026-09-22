@@ -242,7 +242,12 @@ def _record(**kw):
 
 
 def test_response_view_is_callable_for_every_state():
-    """`view()` 是响应的**唯一出口** —— 每个状态都必须能渲染出来。"""
+    """`view()` 是响应的**唯一出口** —— 每个状态都必须能渲染出来，
+    且**五态都必须带同名顶层 `status`**（2026-09-22 补齐成功态）。
+
+    此前成功态无 `status`，调用方只能按"有没有 `data`"推断终态 ——
+    形态与其余四态不一致，任何统一状态机的客户端都会踩空。
+    """
     from app.service import view
 
     for status, expected_code in (("queued", 202), ("in_progress", 202),
@@ -256,6 +261,10 @@ def test_response_view_is_callable_for_every_state():
         code, body = view(_record(**kw))
         assert code == expected_code, f"{status} 的 HTTP 码不对"
         assert isinstance(body, dict) and body
+        assert body.get("status") == status, (
+            f"{status} 态的响应必须带同名顶层 status 字段"
+            f"（实得 {body.get('status')!r}）"
+        )
 
 
 def test_error_mapping_covers_every_upstream_error_class():

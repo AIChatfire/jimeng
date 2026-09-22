@@ -196,12 +196,16 @@ def _degradations(rec: TaskRecord) -> dict[str, Any]:
 def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
     """任务记录 → (HTTP 状态码, 响应体)。
 
-    三条刻意选择：
+    四条刻意选择：
       · **非终态回 202**：调用方拿到 202 就该继续轮询，不该把排队态当结果；
       · **失败也回 200**：任务本身完成了（只是结果是失败）——
         请求没有出错，HTTP 层不该报错，否则调用方的重试逻辑会误触发；
-      · **成功体只给 `url`**：与参考接口逐字一致。宽高/格式等真知识别的地方有
-        （trace 里），不塞进这里 —— 多一个键就多一分"契约形状不同"的风险。
+      · **成功体只给 `url`**：`data[]` 元素与参考接口逐字一致。宽高/格式等真知识
+        别的地方有（trace 里），不塞进这里 —— 多一个键就多一分"契约形状不同"的风险；
+      · **五态都带顶层 `status`**（2026-09-22 补成功态）：queued / in_progress /
+        success / failure / canceled 统一 —— 调用方**一个字段判全程**，不必按
+        "有没有 `data`"推断终态。取值与 `store` 状态同名（小写）**是本服务的契约**；
+        对接 New API 任务插件时由**插件侧**归一化到其大写枚举，本服务不做跨系统对齐。
     """
     deg = _degradations(rec)
     if rec.status == "queued":
@@ -230,6 +234,7 @@ def view(rec: TaskRecord) -> tuple[int, dict[str, Any]]:
         # `POST /commerce/v1/benefits/user_credit_history`。名字里必须带 `forecast`。
         usage["forecast_credits"] = rec.credits
     return 200, {
+        "status": "success",
         "data": [{"url": im["url"]} for im in rec.images],
         "created": rec.finished_at or rec.updated_at,
         "usage": usage,

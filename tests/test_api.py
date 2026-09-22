@@ -163,7 +163,13 @@ def test_pending_task_returns_202_with_status(client):
 
 
 def test_success_body_matches_the_frozen_shape(client, client_state, fake_jimeng):
-    """成功体 = `{data:[{url}], created, usage}`，且 `data[]` 里**只有 url**。"""
+    """成功体 = `{status, data:[{url}], created, usage}`，且 `data[]` 里**只有 url**。
+
+    2026-09-22 契约更新（用户指令）：成功态补顶层 `status: "success"` ——
+    此前成功体只有 data/created/usage，是全链路唯一不带 status 的态，调用方
+    只能按"有没有 data"推断终态。现五态（queued / in_progress / success /
+    failure / canceled）**统一带顶层 status**。键集仍**精确相等**（防静默多键）。
+    """
     fake_jimeng.states = [ok_state(["https://cdn/1.png", "https://cdn/2.png"],
                                    cost=44)]
     tid = client.post(BASE, json={"model": "jimeng-t2i", "prompt": "x", "n": 2},
@@ -175,7 +181,9 @@ def test_success_body_matches_the_frozen_shape(client, client_state, fake_jimeng
     r = client.get(f"{BASE}/{tid}", headers=AUTH)
     assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"data", "created", "usage"}, f"键集不符：{set(body)}"
+    assert set(body) == {"status", "data", "created", "usage"}, \
+        f"键集不符：{set(body)}"
+    assert body["status"] == "success", "成功态必须带顶层 status=success"
     assert [d["url"] for d in body["data"]] == ["https://cdn/1.png",
                                                 "https://cdn/2.png"]
     assert set(body["data"][0]) == {"url"}, "data[] 里只该有 url（与冻结契约逐字一致）"
