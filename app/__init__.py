@@ -7,4 +7,4 @@
   GET  /async/v1/images/generations/{id}   非终态回排队态；终态回 {data, created, usage}
 """
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
