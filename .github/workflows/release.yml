@@ -335,15 +335,25 @@ jobs:
             -H 'Content-Type: application/json' -d '{"prompt":"smoke","n":1}' \
             http://127.0.0.1:8200/async/v1/images/generations)
           [ "$nocode" = 401 ] || { echo "::error::无 key 创建竟得 ${nocode}，鉴权没接线"; exit 1; }
-          # ④ GET 按 task_id 查询**刻意不鉴权**（task_id 本身就是凭据，见 main.py）：
-          #    不存在 → 404 task_not_found（本地拦，不发上游）
+          # ④ 查询任务**要 Bearer**（2026-09-23 收紧：所有业务端点含 GET 都鉴权）：
+          #    无 key → 401（本地拦，不发上游）
           kcode=$(curl -s -o /dev/null -w '%{http_code}' \
             http://127.0.0.1:8200/async/v1/images/generations/smoke-nonexistent)
-          [ "$kcode" = 404 ] || { echo "::error::查不存在任务得 ${kcode}（期望 404）"; exit 1; }
-          # ⑤ openapi 版本 = 发布版本（run 期证据，与镜像内常量双确认）
+          [ "$kcode" = 401 ] || { echo "::error::无 key 查任务得 ${kcode}（期望 401）"; exit 1; }
+          #    带 key 查不存在 → 404 task_not_found（本地拦，不发上游）
+          kcode2=$(curl -s -o /dev/null -w '%{http_code}' \
+            -H 'Authorization: Bearer sk-smoke-key-000000000000' \
+            http://127.0.0.1:8200/async/v1/images/generations/smoke-nonexistent)
+          [ "$kcode2" = 404 ] || { echo "::error::带 key 查不存在任务得 ${kcode2}（期望 404）"; exit 1; }
+          # ⑤ 同步出图端点已接线：无 key → 401（本地拦；不落库、不发上游）
+          scode=$(curl -s -o /dev/null -w '%{http_code}' -X POST \
+            -H 'Content-Type: application/json' -d '{"prompt":"smoke","n":1}' \
+            http://127.0.0.1:8200/v1/images/generations)
+          [ "$scode" = 401 ] || { echo "::error::同步端点无 key 竟得 ${scode}（期望 401）"; exit 1; }
+          # ⑥ openapi 版本 = 发布版本（run 期证据，与镜像内常量双确认）
           OV=$(curl -fsS http://127.0.0.1:8200/openapi.json | python3 -c "import sys,json;print(json.load(sys.stdin)['info']['version'])")
           [ "$OV" = "${VERSION}" ] || { echo "::error::openapi 版本 ${OV} != ${VERSION}"; exit 1; }
-          echo "smoke OK: healthz/readyz/401/404/version=${VERSION}"
+          echo "smoke OK: healthz/readyz/401x3/404/version=${VERSION}"
 
       - name: Push (only after smoke passed)
         run: |
