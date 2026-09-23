@@ -193,7 +193,7 @@ def test_ark_create_and_poll(app_and_client, fake_jimeng, client_state):
 
     for _ in range(2):
         client_state.coordinator.tick()            # 轮询到终态
-    g = client.get(f"/api/v3/contents/generations/tasks/{task_id}")
+    g = client.get(f"/api/v3/contents/generations/tasks/{task_id}", headers=AUTH)
     assert g.status_code == 200
     v = g.json()
     assert v["id"] == task_id

@@ -366,3 +366,40 @@ def test_normalization_does_not_touch_already_lowercase_rows(store):
     mk(store, status="queued")
     mk(store, status="success")
     assert store.normalize_status_case() == 0
+
+
+def test_startup_migration_heals_a_table_missing_model_columns(store, settings):
+    """**老库缺列必须能被启动期自动补上** —— 这是那条"别指望手工 ALTER"的纪律。
+
+    症状与来源（2026-09-23 实测）：`SQLModel.metadata.create_all()` **只建表不加列**，
+    所以给模型加字段后，老库会在**新字段第一次被写到时**才炸
+    （`store.patch()` → `column tasks.upstream_history_id does not exist`），
+    而图片链路全绿。手工维护的补列清单只列了视频三列，后来加的
+    `upstream_history_id` / `draft_json` / `continuations` 全漏了 ⇒
+    现在从 `TaskRecord.__table__` **机械派生**，模型加字段就不会再漏。
+    """
+    from sqlalchemy import inspect, text
+
+    # 造出"老库"：把两个后加的列删掉（一个可空、一个非空带标量默认）
+    with store.engine.begin() as c:
+        c.execute(text("ALTER TABLE tasks DROP COLUMN IF EXISTS upstream_history_id"))
+        c.execute(text("ALTER TABLE tasks DROP COLUMN IF EXISTS continuations"))
+    before = {col["name"] for col in inspect(store.engine).get_columns("tasks")}
+    assert "upstream_history_id" not in before and "continuations" not in before
+
+    # 再构造一个 TaskStore（= 一次启动）⇒ 应把缺的列补回来。
+    # ⚠️ 必须用 `settings.db_target`：`store.dsn` 是**脱敏后**的串（密码已换 ***），
+    # 拿它建引擎会连不上。
+    TaskStore(settings.db_target)
+
+    cols = {col["name"]: col for col in inspect(store.engine).get_columns("tasks")}
+    assert "upstream_history_id" in cols, "可空的新列没被自动补上"
+    assert "continuations" in cols, "非空的新列没被自动补上"
+    assert cols["continuations"]["nullable"] is False, \
+        "非空列必须带 NOT NULL（并靠 DEFAULT 对已有行安全）"
+
+    # 补完之后旧行可读、可写（这是补列的真正目的）
+    rec = mk(store, status="queued")
+    store.patch(rec.task_id, upstream_history_id="h-1", continuations=1)
+    got = store.get(rec.task_id)
+    assert got.upstream_history_id == "h-1" and got.continuations == 1

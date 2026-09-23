@@ -452,3 +452,104 @@ body: {"count": 20, "cursor": "0", "history_type": 2}     # 2 = 消耗
 * ⚠️ 上传 host（`*.snssdk.com`）**不能走系统代理**（502 ProxyError）——
   客户端 `trust_env=False` 直连；
 * 全链路**免费**（不产生生成、不扣积分），已用真实小文件端到端验证。
+
+---
+
+## 14. 服务端能力表实读：新模型 **Seedream 5.0 Flash**（2026-09-23）
+
+只读复现（**零成本、不出图、不扣积分**）：
+
+```bash
+python scripts/dump_video_models.py --new               # 新模型巡检（一行一条）
+python scripts/dump_video_models.py --all --raw /tmp/cfg.json
+```
+
+`POST /mweb/v1/get_common_config`（body `{}`）本次返回 **10 个图片模型**（§11 那张表
+列的是 9 个）。**新增的那一个**：
+
+| 字段 | 值 |
+|---|---|
+| `model_req_key` | `high_aes_general_v50_flash` |
+| 面板名字 | **Seedream 5.0 Flash** |
+| `is_new_model` | **`true`**（`feats` 里也带 `new_model`） |
+| `model_tip` | 「轻量化版 Seedream 5.0 Pro，更快更便宜」 |
+| `generate_count_options` | **1..4**（`default_generate_count` = 4） |
+| `resolution_map` | **1.5k / 2k** 两档；`default_resolution_type` = `2k` |
+| 2k 比例表 | 1:1 2048² / 3:4 1728×2304 / 16:9 2560×1440 / 4:3 2304×1728 / 9:16 1440×2560 / 2:3 1664×2496 / 3:2 2496×1664 / 21:9 3024×1296 |
+| `benefit_type`（服务端声明） | `image_basic_v50_flash_15k` / `image_basic_v50_flash_2k`，`amount` 均 **1** |
+| `input_image_limit` | `[{"max_image_num": 10, "ability_name": "byte_edit"}]`（同 §11 的读不出口子） |
+
+**它被登记成什么**：`app/models.py::UPSTREAM_MODEL_KEYS` 多一项 ⇒
+`model: "high_aes_general_v50_flash"` 等价于「`jimeng-t2i` + 该上游模型」；
+张数快照 `client.COUNT_OPTIONS_BY_MODEL` 同步为 `(1, 2, 3, 4)`。
+**没有**变成新能力（它不是一个能力，是 t2i 族的一个模型选项）。
+
+### 🔴 三条纪律（别越线）
+
+1. **证据等级 = "上游自己宣告"，不是"实跑过"。** 依据只有这张只读能力表
+   （"能读的就不许猜"）。§11 的反例还在眼前：v30l / v30l_art **表里也有**，
+   实跑 `ret=1006` 权益不足 ⇒ **读得到 ≠ 用得了**。所以
+   `credits_measured` 保持 `None`（**不报单价**），notes/文档都写明"未端到端实跑"。
+2. **服务端声明的 `amount: 1` 不是实扣。** §12 已证：Pro（`v50p_large`）服务端
+   `amount` 也是 1，而**实测 8 积分/张**。⇒ 任何"Flash 一张 1 积分"的推论都不成立，
+   要对账只能 `submit_id` + `user_credit_history`（§11.5）。
+3. **视频模型仍然不在这张表里。** 全 10 条的 `duration_option` /
+   `video_aspect_ratio_option` / `fps` 恒 `null`/`0`，且 `common_config()`
+   的 `model` 参数**被服务端忽略**（`_ = model`，按 tk 下发图片全集）
+   ⇒ 「t2v-fast / t2v-pro 到底支持哪些比例与时长」**读不到**，
+   缺口与 §13 一致：**只能靠补抓提交包**，别拿图片表的字段去推视频。
+
+### 巡检动作（上游再上新模型时）
+
+1. `scripts/dump_video_models.py --new` —— 看有没有新的 `is_new_model`；
+2. 有的就按上表把 key 登记进 `UPSTREAM_MODEL_KEYS`、张数同步进
+   `COUNT_OPTIONS_BY_MODEL`；
+3. 门禁在 `tests/test_models.py::test_new_upstream_model_flash_is_registered_with_declared_count_options`
+   （钉"可路由 + 张数与服务端一致 + 不报单价"）。
+
+---
+
+## 15. 真跑对账：Flash + 两个视频变体（2026-09-23）
+
+用户明确授权真实提交后跑的**三笔**。口径：余额差分 + `user_credit_history`
+记录 + 任务表 `upstream_submit_id` **三证吻合**才算数（余额 5962 → 5859，共花 103）。
+
+| 提交的东西 | 档位 | 上游 `forecast_generate_cost` | **实扣** | 耗时 |
+|---|---|---|---|---|
+| `Seedream 5.0 Flash`（面板名直传） | 2k / 1 张 | 23 | **3** | 21s |
+| `jimeng-t2v-fast` | 720p / 5s / **16:9** | 156 | **30** | 93s |
+| `jimeng-t2v-pro` | 720p / 5s / **16:9** | 453 | **70** | 167s |
+
+对账明细（`user_credit_history` 里的原文 title 一并记下，便于复现）：
+
+| submit_id | 记录 title | amount |
+|---|---|---|
+| `be194863-31a9-48d5-a203-eece74ef7d7f` | 图片生成 | 3 |
+| `437eb55b-8c37-4cd5-8ce2-484c0f38a3db` | 视频生成720P 5秒 | 30 |
+| `6337a44d-4ade-4408-97dc-972a093b2f70` | 视频生成 | 70 |
+
+### 三条被实测推翻/坐实的推论
+
+1. ❌ **"`amount` = 实扣"** —— 推翻。我们构造的 `amount` 是 5（输出秒数），
+   实扣却是 30 / 70。`amount` 只是**预扣字段**，真扣由上游定价（≈6/秒）。
+   §13 那条"1 积分/秒"的口径要读成"我们传的字段值"，不是"花掉的钱"。
+2. ❌ **"t2v-fast 的 5s 免费试用"** —— 推翻。UI 标 `useSeedanceFast5sFreeTrial: true`，
+   实跑照样扣 30。
+3. ✅ **"`forecast` 高估 4~12 倍"** —— 坐实并扩展到视频：23→3（7.7×）、
+   156→30（5.2×）、453→70（6.5×）。
+
+### 附带解决的两个开放问题
+
+* **`t2v-fast` 的 16:9 可用**：提交侧亲传 `aspect_ratio=16:9`，出片元数据
+  `width=1280, height=720`（正是 16:9）⇒ 比例**确实生效**，
+  此前 notes 里"仅实抓 4:3"只是抓包当时选的那个值。
+* **视频链路此前是坏的**：`t2v-fast` / `t2v-pro` **不在 `Service._submit` 的任何分支里**，
+  掉进后编辑族 `else` ⇒ `assert cap.jimeng_tool` 炸，还被兜底逻辑报成
+  "上游不可用·**可重试**"。修法：`models.T2V_VARIANTS` 共用一条路径 +
+  `CapabilityNotWiredError`（500·不可重试）+ `SUBMIT_ROUTES` 静态对照门禁。
+
+### 产物形态（视频）
+
+任务表 `images` 列里的视频元素：
+`{url, vid, width, height, format, item_id}`（`parse_task` 尽力而为解析，
+2026-09-23 首次实读到完整形态）。

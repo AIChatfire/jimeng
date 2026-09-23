@@ -6,7 +6,7 @@
 
 | 阶段 | 花积分 | 干什么 |
 |---|---|---|
-| `models`   | ❌ | `GET /async/v1/models` 契约自检 |
+| `models`   | ❌ | `GET /v1/models` 契约自检（含 `upstream_models` 与声明单价） |
 | `accept`   | ❌ | `POST` 受理，断言**只回一个 task_id**，再查一次状态（协调器不推进 ⇒ 零上游往返） |
 | `upload`   | ❌ | **真实**跑一遍火山 ImageX 四段式上传本地图 → `image_uri`，并用 `get_image_by_uri` 免费验真 |
 | `dry`      | ❌ | 用 `submit(dry_run=True)` 走完草稿构造与张数吸附，**不发任何请求**，打印将要提交的内容 |
@@ -18,18 +18,33 @@
 所以这里沿用上游参考仓的双闸门做法：不显式开闸时，`generate` 阶段只打印
 "将要发生什么"，一个字节都不发。
 
+## 单价从哪来
+
+🔴 **不再写死**。原先这里那张表（t2i 44 / i2i 40 / hd 9 / pro-hd 91 / outpaint 28）
+抄的是上游回执的 `forecast_generate_cost`，实测**高估 4~9 倍**（见 `docs/UPSTREAM.md` §12），
+已于 2026-09-23 删除。现在一律读服务自己的 `/v1/models`：
+`credits_measured` 是**实测**值，`null` = **未实测**（**不等于免费**）。
+
 ## 用法
 
 ```bash
 # 零成本四阶段（推荐先跑这个）
+python scripts/e2e.py                       # 凭据自动读仓库 .env
 python scripts/e2e.py --cookie-file /path/to/cookie_jimeng.txt
 
 # 真实出图（会扣积分，先看清打印的单价）
-python scripts/e2e.py --cookie-file … --phases generate \
-    --model jimeng-hd --image /path/to/local.png --allow-real-submit
+python scripts/e2e.py --phases generate --model jimeng-hd \
+    --image /path/to/local.png --allow-real-submit
+
+# 真实跑新模型（面板名也能直接写）
+python scripts/e2e.py --phases generate --model "Seedream 5.0 Flash" --allow-real-submit
+
+# 真实跑视频（能力 id 决定走哪个端点，不用加开关）
+python scripts/e2e.py --phases generate --model jimeng-t2v-fast \
+    --duration 5 --aspect-ratio 16:9 --allow-real-submit
 ```
 
-⚠️ 跑真实出图前先确认：`--model` 的单价、以及**这张图是你愿意花掉的**。
+⚠️ 跑真实出图前先确认：打印出来的单价、以及**这次花费是你愿意付的**。
 """
 from __future__ import annotations
 
@@ -40,12 +55,13 @@ import sys
 import time
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+REPO = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(REPO))
 
-#: 实测单价（积分/次）。`outpaint` 一次出 4 张、按 4 张计费。
-COST = {
-    "jimeng-t2i": 44, "jimeng-i2i": 40, "jimeng-hd": 9,
-    "jimeng-pro-hd": 91, "jimeng-outpaint": 28,
+#: 端点按**媒体**分流（与 `app/main.py` 的装配一致）。
+ENDPOINTS = {
+    "image": "/async/v1/images/generations",
+    "video": "/async/v1/videos/generations",
 }
 #: 默认只跑不花钱的四个阶段。
 SAFE_PHASES = ("models", "accept", "upload", "dry")
@@ -53,6 +69,7 @@ ALL_PHASES = SAFE_PHASES + ("generate",)
 
 OK = "  ✅"
 NO = "  ❌"
+WARN = "  ⚠️ "
 
 
 def _make_test_image(size: int = 1024) -> bytes:
@@ -89,18 +106,87 @@ def _read_cookie(path: str) -> str:
     raise SystemExit(f"在 {path} 里找不到 sessionid")
 
 
+def _read_env(path: Path) -> dict[str, str]:
+    """极简 .env 解析（与 `dump_video_models.py` 同一套，够用即可）。
+
+    🔴 只取值、**不打印**：会话凭据不进日志、不进响应。
+    """
+    out: dict[str, str] = {}
+    if not path.exists():
+        return out
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        k, _, v = line.partition("=")
+        v = v.strip().strip('"').strip("'")
+        if k.strip() and v:
+            out[k.strip()] = v
+    return out
+
+
+def _media_of(catalog: dict, model: str) -> str:
+    """该 `model` 走哪个端点？**只按服务自己的目录判**（不另起一套推导）。
+
+    目录里没有 ⇒ 它是上游模型 key / web 面板名 ⇒ 文生图族（`resolve` 的规则：
+    上游模型只在 t2i 族有意义）。
+    """
+    for m in catalog.get("data") or []:
+        if m.get("id") == model:
+            return m.get("media") or "image"
+    return "image"
+
+
+def _declared_cost(catalog: dict, model: str) -> str:
+    """服务声明的单价文案。`null` = **未实测**，绝不是"免费"。"""
+    for m in catalog.get("data") or []:
+        if m.get("id") == model:
+            c = m.get("credits_measured")
+            return "未实测" if c is None else f"{c} 积分/次（实测）"
+    return "未实测（面板名/上游 key：单价是能力级的，见 jimeng-t2i）"
+
+
+def _pick_sessionid(args: argparse.Namespace) -> str:
+    sid = (args.sessionid or os.environ.get("JIMENG_SESSIONID") or "").strip()
+    if not sid and args.cookie_file:
+        sid = _read_cookie(args.cookie_file)
+    if not sid:
+        env = _read_env(REPO / ".env")
+        sid = (env.get("JIMENG_SESSIONID") or "").strip()
+        if not sid and env.get("JIMENG_COOKIE"):
+            sid = _read_cookie_value(env["JIMENG_COOKIE"])
+    if not sid:
+        raise SystemExit(
+            "缺少登录态：给 --cookie-file / --sessionid，或设 JIMENG_SESSIONID，"
+            "或在仓库 .env 里配 JIMENG_SESSIONID")
+    return sid
+
+
+def _read_cookie_value(raw: str) -> str:
+    for part in raw.split(";"):
+        k, _, v = part.strip().partition("=")
+        if k.strip() == "sessionid" and v.strip():
+            return v.strip()
+    return raw.strip() if "=" not in raw else ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cookie-file", help="含 sessionid 的 cookie 文件（不打印、不入库）")
-    ap.add_argument("--sessionid", help="直接给 sessionid（默认读 env JIMENG_SESSIONID）")
+    ap.add_argument("--sessionid", help="直接给 sessionid（默认 env / 仓库 .env）")
     ap.add_argument("--phases", default=",".join(SAFE_PHASES),
                     help=f"逗号分隔，可选 {','.join(ALL_PHASES)}（默认 {','.join(SAFE_PHASES)}）")
-    ap.add_argument("--model", default="jimeng-t2i", help="generate 阶段用哪个能力")
+    ap.add_argument("--model", default="jimeng-t2i",
+                    help="能力 id / 裸能力名 / web 面板名 / 上游模型 key")
     ap.add_argument("--prompt", default="一只在窗台上晒太阳的橘猫，柔和光线")
     ap.add_argument("--image", help="输入图路径（i2i / hd / pro-hd / outpaint 需要）")
     ap.add_argument("--size", default="2048x2048")
     ap.add_argument("--n", type=int, default=1)
+    # 视频族参数（图片族会忽略它们）
+    ap.add_argument("--resolution", default="720p", help="视频：分辨率档位")
+    ap.add_argument("--duration", type=int, default=5, help="视频：时长（秒）")
+    ap.add_argument("--aspect-ratio", default="16:9", help="视频：画面比例")
     ap.add_argument("--timeout", type=float, default=300.0, help="generate 阶段轮询上限（秒）")
     ap.add_argument("--allow-real-submit", action="store_true",
                     help="🔴 允许真实建任务（扣积分）")
@@ -111,11 +197,7 @@ def main() -> int:
     if bad:
         raise SystemExit(f"未知阶段 {bad}；可选 {ALL_PHASES}")
 
-    sid = args.sessionid or (os.environ.get("JIMENG_SESSIONID") or "").strip()
-    if not sid and args.cookie_file:
-        sid = _read_cookie(args.cookie_file)
-    if not sid:
-        raise SystemExit("缺少登录态：给 --cookie-file / --sessionid，或设 JIMENG_SESSIONID")
+    sid = _pick_sessionid(args)
 
     # 单进程直连：不走 gunicorn，也不启后台协调器线程 ——
     # 推进与否完全由本探针控制（`COORDINATOR_ENABLED=0` + 手动 tick）。
@@ -134,6 +216,7 @@ def main() -> int:
     client_ = TestClient(app)
     auth = {"Authorization": "Bearer sk-e2e-local"}
     failures: list[str] = []
+    catalog: dict = {}
 
     def step(name: str, fn) -> None:
         print(f"\n── {name} " + "─" * max(0, 46 - len(name)))
@@ -145,31 +228,50 @@ def main() -> int:
 
     with client_:
         # ---------------------------------------------------------- models
+        def _models():
+            nonlocal catalog
+            r = client_.get("/v1/models", headers=auth)
+            assert r.status_code == 200, r.text
+            catalog = r.json()
+            print(f"{OK} 能力清单 {len(catalog['data'])} 项")
+            for m in catalog["data"]:
+                c = m.get("credits_measured")
+                money = "未实测" if c is None else f"{c} 积分/次"
+                print(f"      {m['id']:18s} {m['media']:5s} {money}")
+            t2i = next((m for m in catalog["data"] if m["id"] == "jimeng-t2i"), None)
+            for u in (t2i or {}).get("upstream_models") or []:
+                print(f"        ↳ {u['key']:24s} {u['web_name']}")
         if "models" in phases:
-            def _models():
-                r = client_.get("/async/v1/models")
-                assert r.status_code == 200, r.text
-                ids = [m["id"] for m in r.json()["data"]]
-                print(f"{OK} 能力清单 {ids}")
-                for m in ids:
-                    print(f"      {m:16s} {COST.get(m, '?')} 积分/次")
             step("models", _models)
+        if not catalog:                      # 没跑 models 阶段也要有目录做判据
+            catalog = client_.get("/v1/models", headers=auth).json()
 
+        media = _media_of(catalog, args.model)
+        ep = ENDPOINTS[media]
         task_id = None
 
         # ---------------------------------------------------------- accept
+        def _body(imgs: list[str]) -> dict:
+            if media == "video":
+                return {"model": args.model, "prompt": args.prompt,
+                        "resolution": args.resolution, "duration": args.duration,
+                        "aspect_ratio": args.aspect_ratio}
+            #: 🔴 `size` / `n` **必须带上**：漏掉的话调用方传了 `--n 2` 却只出 1 张，
+            #: 看起来"一切正常"——而这正是本仓最不能接受的**静默失效**
+            #: （2026-09-23 实测踩到：`--n 2` 落库仍是 n=1，白跑一轮才发现）。
+            return {"model": args.model, "prompt": args.prompt, "image": imgs,
+                    "size": args.size, "n": args.n}
+
         if "accept" in phases:
             def _accept():
                 nonlocal task_id
-                body = {"model": args.model, "prompt": args.prompt, "image": []}
-                r = client_.post("/async/v1/images/generations", json=body, headers=auth)
+                r = client_.post(ep, json=_body([]), headers=auth)
                 assert r.status_code == 202, f"{r.status_code} {r.text}"
                 got = r.json()
                 assert set(got) == {"task_id"}, f"受理响应只该有 task_id，实得 {set(got)}"
                 task_id = got["task_id"]
                 print(f"{OK} 受理 → {task_id}（只回一个 id）")
-                st = client_.get(f"/async/v1/images/generations/{task_id}",
-                                 headers=auth).json()
+                st = client_.get(f"{ep}/{task_id}", headers=auth).json()
                 assert st["status"] == "queued", st
                 print(f"{OK} 状态 {st['status']}（协调器没跑 ⇒ 零上游往返）")
             step("accept", _accept)
@@ -198,42 +300,56 @@ def main() -> int:
         # ---------------------------------------------------------- dry
         if "dry" in phases:
             def _dry():
+                from app.models import resolve
                 from app.upstream.jimeng import DEFAULT_MODEL
-                sid_ = svc.client.submit(args.prompt, model=DEFAULT_MODEL,
+
+                # 走一遍**服务自己的解析**，把"面板名 → 上游模型"这一步也验到
+                cap, upstream = resolve(args.model, has_image=bool(args.image),
+                                        video=(media == "video"))
+                print(f"{OK} 解析：{args.model!r} → {cap.api_id}"
+                      + (f"（上游模型 {upstream}）" if upstream else ""))
+                if cap.media == "video":
+                    print("      视频族：草稿构造由提交侧负责，dry 只验解析与档位")
+                    print(f"      档位：{args.resolution} × {args.duration}s × "
+                          f"{args.aspect_ratio}")
+                    return
+                sid_ = svc.client.submit(args.prompt,
+                                         model=upstream or DEFAULT_MODEL,
                                          size=args.size, count=args.n, dry_run=True)
                 print(f"{OK} 草稿构造通过（dry_run，**未发任何请求**），submit_id={sid_}")
-                print(f"      将要提交：model={DEFAULT_MODEL} size={args.size} n={args.n}")
+                print(f"      将要提交：model={upstream or DEFAULT_MODEL} "
+                      f"size={args.size} n={args.n}")
                 print(f"      告警：{svc.client.last_warnings or '无'}")
             step("dry", _dry)
 
         # ---------------------------------------------------------- generate
         if "generate" in phases:
-            cost = COST.get(args.model, "未知")
             print("\n── generate " + "─" * 36)
+            cost = _declared_cost(catalog, args.model)
             if not args.allow_real_submit:
                 print(f"{NO} 已跳过：未传 --allow-real-submit（这是刻意的双闸门）")
-                print(f"      将会做：建任务 + 轮询到终态，model={args.model}，"
-                      f"预估 **{cost} 积分**")
+                print(f"      将会做：建任务 + 轮询到终态，model={args.model}"
+                      f"（{media} 族）")
+                print(f"      服务声明的花费：**{cost}**")
                 print("      要真跑就加：--allow-real-submit")
             else:
-                if args.model not in COST:
-                    raise SystemExit(f"未知 model {args.model}，无法预估花费，拒绝执行")
-                print(f"  🔴 即将真实建任务：{args.model}，预估 **{cost} 积分**"
-                      f"（上游失败也照样计费）")
+                print(f"  🔴 即将真实建任务：{args.model}（{media} 族）")
+                print(f"     服务声明的花费：**{cost}**"
+                      f"（上游失败也照样计费；未实测≠免费）")
+                if media == "image":
+                    print(f"     请求：size={args.size} n={args.n}")
 
                 def _generate():
                     nonlocal task_id
                     # 接口收的是 URL / data URI / base64 —— **不收本地路径**，
                     # 所以本地图要在这里转成 data URI（服务侧再去下载/解码并上传）。
                     imgs: list[str] = []
-                    if args.image:
+                    if args.image and media == "image":
                         raw = Path(args.image).expanduser().read_bytes()
                         imgs = ["data:image/png;base64," + base64.b64encode(raw).decode()]
                         print(f"      输入图 {len(raw)} 字节（以 data URI 传入）")
                     if not task_id:
-                        r = client_.post("/async/v1/images/generations",
-                                         json={"model": args.model, "prompt": args.prompt,
-                                               "image": imgs}, headers=auth)
+                        r = client_.post(ep, json=_body(imgs), headers=auth)
                         assert r.status_code == 202, f"{r.status_code} {r.text}"
                         task_id = r.json()["task_id"]
                     print(f"      task_id={task_id}")
@@ -241,9 +357,7 @@ def main() -> int:
                     last = None
                     while time.time() < deadline:
                         app.state.coordinator.tick()      # 手动推进（未启后台线程）
-                        body = client_.get(
-                            f"/async/v1/images/generations/{task_id}",
-                            headers=auth).json()
+                        body = client_.get(f"{ep}/{task_id}", headers=auth).json()
                         s = body.get("status", "success")
                         if s != last:
                             print(f"      … {s}")
@@ -251,7 +365,17 @@ def main() -> int:
                         if s in ("success", "failure", "canceled"):
                             if s == "success":
                                 urls = [d["url"] for d in body["data"]]
-                                print(f"{OK} 出图 {len(urls)} 张，usage={body.get('usage')}")
+                                kind = "出片" if media == "video" else "出图"
+                                print(f"{OK} {kind} {len(urls)} 个，"
+                                      f"usage={body.get('usage')}")
+                                #: 🔴 **少给要报出来**：判据是"交付张数 < 请求的 n"，
+                                #: 不是上游的 total/finished 计数（那两个跟的是垫图数）。
+                                if media == "image" and len(urls) < args.n:
+                                    print(f"{WARN} **少给**：请求 n={args.n}、"
+                                          f"只交付 {len(urls)} 张"
+                                          f"（按本仓口径这属于如实降级，不是成功）")
+                                for d in body.get("degradations") or []:
+                                    print(f"{WARN} 降级：{d}")
                                 for u in urls:
                                     print(f"      {u[:110]}…")
                             else:

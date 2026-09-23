@@ -789,7 +789,7 @@ def test_credits_warning_is_silent_for_measured_free_capability(
 
 
 # ---------------------------------------------------------------------------
-# GET 免鉴权（task_id 即凭据）以及**刻意不放宽**的边界
+# GET 也要鉴权（2026-09-23 收紧）以及**刻意不放宽**的边界
 # ---------------------------------------------------------------------------
 
 def _a_terminal_task(client, client_state, fake_jimeng, fake_uploader):
@@ -799,26 +799,45 @@ def _a_terminal_task(client, client_state, fake_jimeng, fake_uploader):
     return tid
 
 
-def test_get_task_without_authorization_is_allowed(client, client_state,
-                                                   fake_jimeng, fake_uploader):
-    """🔴 **查任务不需要 Bearer** —— `task_id` 是不可猜的 128 位随机值，本身就是凭据。
+def test_get_task_without_authorization_is_401(client, client_state,
+                                               fake_jimeng, fake_uploader):
+    """🔴 **查任务必须带 Bearer** —— 2026-09-23 收紧了"`task_id` 即凭据"的旧口径。
 
-    这样调用方可以把结果链接直接分享出去（不需要连带交出 API Key）。
+    旧口径的理由是"id 是不可猜的 128 位随机值、只在受理时发给带 Key 的调用方，
+    所以可以当链接分享"。但它与写/删两个动作的可见范围**不一致**：
+    调用方很容易以为"有 id 就能读"，而 id 一旦贴进工单/聊天记录就是泄漏产物。
+    要分享产物请分享产物 `url`。
     """
     tid = _a_terminal_task(client, client_state, fake_jimeng, fake_uploader)
 
     r = client.get(f"{BASE}/{tid}")          # 刻意**不带** Authorization
 
-    assert r.status_code == 200, r.text
-    assert r.json()["data"][0]["url"] == "https://cdn/a.png"
+    assert r.status_code == 401, r.text
+    assert "Authorization" in r.json()["error"]["message"]
+
+
+def test_get_task_with_another_valid_key_is_404(client, client_state,
+                                                fake_jimeng, fake_uploader):
+    """内部映射：**API Key 指纹 → 任务归属**。拿着**合法但非属主**的 Key ⇒ 404。
+
+    "不存在"与"不属于你"合并成同一个 404 —— 区分开就等于告诉别人
+    "这个 id 是存在的"，那正是枚举的前置条件（与 `DELETE` 同一口径）。
+    """
+    from tests.conftest import AUTH_B
+
+    tid = _a_terminal_task(client, client_state, fake_jimeng, fake_uploader)
+
+    ok = client.get(f"{BASE}/{tid}", headers=AUTH)
+    assert ok.status_code == 200, ok.text
+
+    other = client.get(f"{BASE}/{tid}", headers=AUTH_B)
+    assert other.status_code == 404, other.text
 
 
 def test_get_task_with_invalid_key_still_401(client, client_state,
                                              fake_jimeng, fake_uploader):
-    """⚠️ 但**带了无效 Key 仍要报 401** —— 不能因为"反正放行"把错的 Key 蒙过去。
-
-    否则调用方写错 Key 会被静默吞掉（最难查的一类问题）。
-    """
+    """⚠️ 无效 Key 报 401（而不是 404）—— 调用方写错 Key 必须响亮，
+    不能被静默吞掉（那是最难查的一类问题）。"""
     tid = _a_terminal_task(client, client_state, fake_jimeng, fake_uploader)
 
     r = client.get(f"{BASE}/{tid}", headers={"Authorization": "Bearer wrong-key"})
@@ -916,7 +935,7 @@ def test_content_review_failure_is_reported_as_policy_error(
     tid = _create(client, model="jimeng-t2i", prompt="某段违规文本")
     _tick_until_terminal(client_state)
 
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     assert body["status"] == "failure", body
     assert body["error"]["type"] == ContentPolicyError.err_type, body["error"]
     assert "内容审核" in body["error"]["message"], body["error"]
@@ -937,7 +956,7 @@ def test_generic_generation_failure_is_not_mislabelled_as_policy(
     tid = _create(client, model="jimeng-t2i", prompt="x")
     _tick_until_terminal(client_state)
 
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     assert body["error"]["type"] != ContentPolicyError.err_type, body["error"]
 
 
@@ -962,7 +981,7 @@ def test_short_delivery_is_declared_not_silent(client, client_state,
     tid = _create(client, model="jimeng-t2i", prompt="x", n=3)
     _tick_until_terminal(client_state)
 
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     degs = body.get("degradations") or []
     # ① 数量补齐到请求的 n（契约上的数量不因上游抖动而变）
     assert len(body["data"]) == 3, f"应补齐到 3 个 url，实得 {len(body['data'])}"
@@ -981,7 +1000,7 @@ def test_full_delivery_has_no_shortfall_note(client, client_state,
     tid = _create(client, model="jimeng-t2i", prompt="x")
     _tick_until_terminal(client_state)
 
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     degs = body.get("degradations") or []
     assert not [d for d in degs if "只出了" in d], f"不该有的少给降级：{degs}"
 
@@ -1003,7 +1022,7 @@ def test_zero_images_success_is_delivered_as_failure(client, client_state,
     tid = _create(client, model="jimeng-t2i", prompt="x")
     _tick_until_terminal(client_state)
 
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     assert body["status"] == "failure", f"零产物不该报成功：{body}"
     assert "零产物" in body["error"]["message"], body["error"]
 
@@ -1036,7 +1055,7 @@ def test_total_image_count_tracks_refs_not_outputs(client, client_state,
                   image=[prod])
     _tick_until_terminal(client_state)
 
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     urls = [x["url"] for x in body["data"]]
     assert len(urls) == 2, f"要 2 张就该给 2 张，实得 {len(urls)}"
     assert urls == ["https://cdn/a.png", "https://cdn/b.png"], "不该被改写/补齐"
@@ -1095,7 +1114,7 @@ def test_short_delivery_triggers_auto_continue(client, client_state, fake_jimeng
     # 45 分支已接管续生成 ⇒ 走到「终态成功但少给」这条路时**只补齐、不再试续**：
     # 在 50 调 `action=2` 必然 `ret=1002`（白花一次请求）。
     assert not calls, f"50 时不该再试续生成（必然 1002）：{calls}"
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     assert len(body["data"]) == 3, f"该补齐到 n=3，实得 {len(body['data'])}"
     rec = service.store.get(tid)
     assert rec.status == "success", rec.status
@@ -1118,7 +1137,7 @@ def test_continued_batch_is_merged_without_duplicates(client, client_state,
     tid = _create(client, model="jimeng-t2i", prompt="x", n=2)
     _tick_until_terminal(client_state, times=3)
 
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     urls = [x["url"] for x in body["data"]]
     assert urls == ["https://cdn/a.png", "https://cdn/b.png"], f"两批没合并对：{urls}"
     rec = service.store.get(tid)
@@ -1144,7 +1163,7 @@ def test_continue_is_capped_and_falls_back_to_repeats(client, client_state,
     _tick_until_terminal(client_state)
 
     assert not calls, f"到顶了还续生成（会无限计费）：{calls}"
-    body = client.get(f"{BASE}/{tid}").json()
+    body = client.get(f"{BASE}/{tid}", headers=AUTH).json()
     assert len(body["data"]) == 3, "到顶后要退回补齐"
     degs = body.get("degradations") or []
     assert any("已续生成" in d and "重复" in d for d in degs), f"没写清续了几次：{degs}"
@@ -1239,3 +1258,65 @@ def test_partial_45_does_nothing_when_switch_is_off(client, client_state,
     rec = service.store.get(tid)
     assert rec.status in ("in_progress", "queued"), rec.status
     assert (rec.continuations or 0) == 0
+
+
+def test_dispatch_starvation_is_counted_not_silent(settings):
+    """并发额度被在途任务占满时**必须留痕** —— 此前是静默 `return`。
+
+    真实症状（2026-09-23 实测）：本机并发 = 1，库里躺着 1 条在途任务 ⇒
+    新任务排队 **15 分钟**一动不动，而 `stats()` 里 `ticks` 一直在涨、
+    别的什么都没有 —— "额度满了"这条最常见的原因**完全不可见**，
+    与"上游慢"长得一模一样。故补三个计数器，并在这里钉死。
+    """
+    from app.coordinator import Coordinator
+
+    class _Store:
+        def __init__(self, running: int) -> None:
+            self.running = running
+            self.list_calls = 0
+
+        def count_by_status(self, _status: str) -> int:
+            return self.running
+
+        def list_by_status(self, *a, **k):
+            self.list_calls += 1
+            return [object()]          # 有一条待派发
+
+    class _Gate:
+        def __init__(self, cooling: float) -> None:
+            self.cooling = cooling
+
+        def stats(self) -> dict:
+            return {"cooling_for": self.cooling}
+
+    class _Svc:
+        def __init__(self, running: int, cooling: float = 0.0) -> None:
+            self.store = _Store(running)
+            self.gate = _Gate(cooling)
+            self.sent: list = []
+
+        def dispatch(self, rec) -> None:
+            self.sent.append(rec)
+
+    # ① 在途数 == 并发上限 ⇒ 不派发、且计数
+    full = _Svc(running=1)
+    co = Coordinator(service=full, settings=settings, owner="x")  # type: ignore[arg-type]
+    co._dispatch_queued()
+    assert co.dispatched == 0 and full.sent == []
+    assert co.dispatch_full == 1
+    assert co.stats()["dispatch_full"] == 1, "运维要能在 /stats 里看到它"
+    assert full.store.list_calls == 0, "额度满了就不该再去查排队列表"
+
+    # ② 上游冷却中 ⇒ 另一条早退路径，单独计数
+    cool = _Svc(running=0, cooling=600.0)
+    co2 = Coordinator(service=cool, settings=settings, owner="x")  # type: ignore[arg-type]
+    co2._dispatch_queued()
+    assert co2.dispatch_cooling == 1 and co2.dispatched == 0
+    assert cool.store.list_calls == 0
+
+    # ③ 额度够 ⇒ 真派发，计数为正（对照组，防止"计数器永远不涨"也算通过）
+    free = _Svc(running=0)
+    co3 = Coordinator(service=free, settings=settings, owner="x")  # type: ignore[arg-type]
+    co3._dispatch_queued()
+    assert len(free.sent) == 1 and co3.dispatched == 1
+    assert co3.dispatch_full == 0 and co3.dispatch_cooling == 0

@@ -66,6 +66,13 @@ class Coordinator:
         #: 累计统计（运维观测）
         self.ticks = 0
         self.skipped_lease = 0
+        #: 🔴 **派发饥饿计数器**（2026-09-23 补）。运维症状是"任务一直排队、什么都不动"，
+        #: 而此前 `stats()` 只能看到 ticks / skipped_lease —— 于是"并发额度被在途任务
+        #: 占满"这条最常见的原因**完全不可见**（实测：一个在途任务 + 默认并发 1
+        #: ⇒ 新任务排 15 分钟不动，日志零线索）。
+        self.dispatch_full = 0        # 因"在途数已达并发上限"而跳过派发的轮次
+        self.dispatch_cooling = 0     # 因"上游冷却中"而跳过派发的轮次
+        self.dispatched = 0           # 真正派发出去的任务数
 
     # ------------------------------------------------------------------ 线程
 
@@ -92,6 +99,17 @@ class Coordinator:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+
+    @property
+    def running(self) -> bool:
+        """后台线程是否**真的在跑** —— 同步接口据此判"当前有没有推进者"。
+
+        🔴 为什么不是看 `settings.coordinator_enabled`：配置只说明**意图**，
+        而决定任务能不能被推进的是"线程活着"这件事。声明开着、线程却没起来
+        （启动期异常、或有人手工构造了 Coordinator 但没 `start()`）时，
+        同步等待必然熬到预算耗尽，还让调用方以为"它在跑" —— 那是制造假能力。
+        """
+        return self._thread is not None and self._thread.is_alive()
 
     def wake(self) -> None:
         """叫醒循环：**有新任务进来了，不用等下一个 tick**。
@@ -173,12 +191,18 @@ class Coordinator:
         running = store.count_by_status("in_progress")
         budget = self.settings.jm_concurrency - running
         if budget <= 0:
+            # 响亮计数：这条路径此前是**静默 return**，而它的症状（"任务一直排队"）
+            # 与"上游慢"长得一模一样 —— 运维只能靠猜。别在这里打日志（一 tick 一条），
+            # 计数走 `stats()`，需要细节时看 `/stats`。
+            self.dispatch_full += 1
             return
         # 冷却中就不要再去 acquire（gate 会抛，日志会被刷；而且那本来就是"别打"）
         if self.service.gate.stats()["cooling_for"] > 0:
+            self.dispatch_cooling += 1
             return
         for rec in store.list_by_status("queued", limit=budget, order="oldest"):
             self.service.dispatch(rec)
+            self.dispatched += 1
 
     def _poll_running(self) -> None:
         """推进所有在途任务 —— **上游查询合并成一次**（见 `Service.poll_many`）。
@@ -210,7 +234,13 @@ class Coordinator:
     def stats(self) -> dict:
         return {"owner": self.owner, "ticks": self.ticks,
                 "skipped_lease": self.skipped_lease,
-                "running": self._thread is not None and self._thread.is_alive()}
+                #: 派发侧：`dispatched` 长时间不涨而 `dispatch_full` 在涨
+                #: ⇒ 并发额度被在途任务占满（把 JM_CONCURRENCY 提上去，或
+                #: 等那条在途任务到 TASK_TIMEOUT）。
+                "dispatched": self.dispatched,
+                "dispatch_full": self.dispatch_full,
+                "dispatch_cooling": self.dispatch_cooling,
+                "running": self.running}
 
 
 __all__ = ["Coordinator"]

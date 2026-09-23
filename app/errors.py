@@ -127,6 +127,24 @@ class CapabilityUnavailableError(AdapterError):
     retryable = False
 
 
+class CapabilityNotWiredError(AdapterError):
+    """能力**已注册**，但服务里没有它的提交实现 —— 内部接线遗漏。
+
+    🔴 刻意**不可重试**，而且必须与"上游异常"分开报。教训（2026-09-23 实测）：
+    这条路径此前是 `assert cap.jimeng_tool` ⇒ 抛 `AssertionError`，被兜底逻辑
+    归成 `upstream_unavailable`（**可重试**），于是：
+      · `attempts` 白涨到 2（每次派发都再炸一次）；
+      · 日志/响应里显示"上游不可用"，**排障方向被完全带偏**
+        （真因是本地一行分支没写）。
+    内部 bug 就该报成内部 bug。
+    """
+
+    status_code = 500
+    err_type = "internal_error"
+    err_code = "capability_not_wired"
+    retryable = False
+
+
 class AuthError(AdapterError):
     """调用方自己的 Key 不对（本服务的门），与上游凭据无关。"""
 
@@ -157,10 +175,29 @@ class TaskStateError(AdapterError):
     retryable = False
 
 
+class SyncUnavailableError(AdapterError):
+    """同步接口在当前部署形态下**无法履行** —— 没有任务的推进者。
+
+    触发条件：后台协调器线程没有在跑（`COORDINATOR_ENABLED=0`、或启动异常）。
+    此时同步等待注定熬到预算耗尽，还会让调用方误以为"任务在跑" ⇒
+    快速 503 说清原因，而不是白等 300s。
+
+    🔴 与 `CapabilityUnavailableError`（上游凭据未配）刻意分开：
+    那说的是"上游打不了"，这里说的是"本服务没有执行者" ——
+    排障方向与处置动作完全不同（配凭据 vs 开协调器 / 改用异步端点）。
+    """
+
+    status_code = 503
+    err_type = "capability_unavailable"
+    err_code = "sync_unavailable"
+    retryable = False
+
+
 __all__ = [
     "AdapterError", "InvalidParameterError", "ContentPolicyError",
     "RiskControlError", "UpstreamRateLimitError", "UpstreamQuotaError",
     "UpstreamUnavailableError", "UpstreamTimeoutError",
-    "CapabilityUnavailableError", "AuthError", "TaskNotFoundError",
+    "CapabilityUnavailableError", "CapabilityNotWiredError",
+    "SyncUnavailableError", "AuthError", "TaskNotFoundError",
     "TaskStateError",
 ]

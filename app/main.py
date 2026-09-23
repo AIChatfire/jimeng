@@ -2,13 +2,22 @@
 # -*- coding: utf-8 -*-
 """FastAPI 装配：路由 + 统一错误信封 + lifespan（协调器）+ 埋点接线。
 
-## 对外契约只有三条（冻结，见 `docs/INTERFACE.md`）
+## 对外契约（冻结，见 `docs/INTERFACE.md`）
 
 ```
 POST   /async/v1/images/generations         受理，只回一个 task_id
 GET    /async/v1/images/generations/{id}    非终态回排队态；终态回 {data, created, usage}
-GET    /async/v1/models                     模型清单（OpenAI 形态）
+POST   /v1/images/generations               同步：创建+轮询合并，预算内直接回结果
+GET    /v1/models                           模型清单（OpenAI 形态）
 ```
+
+🔴 **前缀即语义**（2026-09-23 起）：`/v1/*` = 同步语义，`/async/*` = 异步任务语义。
+  · `GET /v1/models` —— 同步、无任务语义（OpenAI 风格客户端按惯例探它）；
+  · `POST /v1/images/generations` —— **真同步**生成：创建+轮询合并进一个请求，
+    预算内（`SYNC_MAX_WAIT`，默认 300s）直接回最终结果；超预算降级回
+    `202 + task_id`，调用方无缝转异步轮询。
+`/async` 前缀留给**异步任务**语义（受理/查询/删除），它是那道护栏 ——
+拦的是"把**异步**语义的端点挂到 `/v1` 被误读成同步 API"，不是禁止同步端点进 `/v1`。
 
 `GET /healthz` 是**运维端点**，不属于对外契约：它零依赖、不触上游、不消耗积分
 （容器 HEALTHCHECK 每 30s 打它）。它**既不上报 span、也不留日志** ——
@@ -33,7 +42,12 @@ from .ark import ark_task_view as ark_view
 from .ark import translate_ark_create as ark_translate
 from .config import Settings
 from .coordinator import Coordinator
-from .errors import AdapterError, AuthError, InvalidParameterError
+from .errors import (
+    AdapterError,
+    AuthError,
+    InvalidParameterError,
+    SyncUnavailableError,
+)
 from .observability import (
     OBS,
     excluded_urls,
@@ -114,6 +128,13 @@ def require_key(request: Request) -> str:
 
     · 未配置 `API_KEYS` ⇒ 鉴权关闭（dev），返回 `"anonymous"`；
     · 配置了 ⇒ 必须带 Bearer，且必须在白名单里。
+
+    🔴 **所有业务端点（任何方法）都走它** —— 2026-09-23 收紧了此前的
+    "GET 单条任务可不带 Key（`task_id` 即凭据）"放宽口径；门禁已从"只看 GET"
+    升级为**全方法**扫描（POST/DELETE 才是会产生费用的写路径），理由见
+    `get_generation` 的 docstring。运维探针 `/healthz` `/readyz` 是**唯一**
+    的不鉴权例外（判活必须无凭据可用），由
+    `tests/test_api.py::test_every_business_route_requires_a_bearer` 钉死。
     """
     settings: Settings = request.app.state.settings
     key = _bearer(request)
@@ -124,27 +145,6 @@ def require_key(request: Request) -> str:
     if key not in settings.api_keys:
         raise AuthError("API Key 无效")
     return request.app.state.service.credential_of(key)
-
-
-def require_key_optional(request: Request) -> str | None:
-    """**可选的**调用方 Key —— 只给"按 id 即凭据"的读接口用（GET 单条任务）。
-
-    三种情况分得很清（刻意不合并）：
-
-    · **完全没带** `Authorization` ⇒ 返回 `None`，**放行**。
-      理由：`task_id` 是不可猜的 128 位随机值，且**只在受理时返回给带 Key 的调用方**
-      ⇒ id 本身就是凭据（调用方可以把结果链接直接给别人看）。
-    · **带了但无效**（不在白名单）⇒ **照旧报 401**。不能因为"反正放行"就把错的 Key
-      蒙过去 —— 那会让调用方的配置错误被静默吞掉，是最难查的一类问题。
-    · **带了且有效、但不是该任务的属主** ⇒ 返回该指纹；上游按 id 取，
-      **不做属主校验**（与"没带"同一待遇，语义统一好预测）。
-    """
-    settings: Settings = request.app.state.settings
-    if _bearer(request) is None:
-        # 鉴权关闭（dev）时也走这条路：与"没带"同样放行
-        _ = settings
-        return None
-    return require_key(request)
 
 
 # ---------------------------------------------------------------------------
@@ -299,24 +299,77 @@ def _install_routes(app: FastAPI) -> None:
             status_code=202, content={"task_id": rec.task_id},
             headers={"Location": f"/async/v1/images/generations/{rec.task_id}"})
 
+    # ------------------------------------------------- 同步生成（创建+轮询合并）
+    @app.post("/v1/images/generations")
+    def create_generation_sync(
+        request: Request,
+        body: GenerationRequest,
+        credential: str = Depends(require_key),
+    ) -> JSONResponse:
+        """**同步**出图：创建 + 轮询合并进一个请求，预算内直接给最终结果。
+
+        ⚠️ 刻意用 `def` 而**不是** `async def`：本函数会阻塞等待至多
+        `SYNC_MAX_WAIT` 秒（默认 300）—— 在 `async def` 里这样等会卡死整个
+        事件循环（同 worker 的其它请求全部排队）。FastAPI 会把同步端点丢进
+        线程池执行，阻塞因而只影响这一个请求。**改动签名前先想清这一点。**
+
+        语义（与异步族共用同一判定，`view()` 仍是唯一出口）：
+          · 预算内到终态 → 直接回终态体（成功 200；失败 200 + `status: failure`）；
+          · 预算耗尽仍在跑 → **202 + `task_id`** + `Location` 指向异步查询端点
+            —— 调用方无缝转异步轮询；任务不会丢、也不会被取消；
+          · 没有推进者（协调器线程没在跑）→ **503**（`sync_unavailable`）快速
+            失败，而不是让调用方白等 —— 那种部署形态下任务根本不会被推进。
+
+        内部链路与异步受理完全一致：落库 → 叫醒协调器 → 等库里的状态变化。
+        等待期间**不发任何上游请求**（推进是协调器线程的职责，这里只读库）。
+        """
+        settings: Settings = request.app.state.settings
+        coordinator = request.app.state.coordinator
+        if not coordinator.running:
+            # 配置只说明意图，线程活着才算数（与 Coordinator.running 同口径）：
+            # 没有推进者就快速 503，别让调用方白等一整个预算。
+            raise SyncUnavailableError(
+                "后台协调器未在运行（COORDINATOR_ENABLED=0？）—— 没有任务推进者，"
+                "同步等待无法履行。请改用异步端点 POST /async/v1/images/generations，"
+                "或开启协调器后重试。")
+
+        svc: Service = request.app.state.service
+        rec = svc.create(body.model_dump(), credential=credential)
+        coordinator.wake()
+        rec = svc.wait_terminal(rec.task_id, credential,
+                                max_wait=settings.sync_max_wait)
+
+        status_code, payload = view(rec)
+        headers: dict[str, str] = {}
+        if status_code == 202:
+            # 预算耗尽但任务仍在跑：告诉调用方"去哪继续查"。
+            # 202 是**降级**而不是失败 —— 任务没丢，转异步轮询即可。
+            headers["Location"] = f"/async/v1/images/generations/{rec.task_id}"
+        return JSONResponse(status_code=status_code, content=payload,
+                            headers=headers)
+
     # ------------------------------------------------------------- 查询
     @app.get("/async/v1/images/generations/{task_id}")
     async def get_generation(
         request: Request,
         task_id: str,
-        credential: str | None = Depends(require_key_optional),
+        credential: str = Depends(require_key),
     ) -> JSONResponse:
-        """查任务。**不需要 Authorization：`task_id` 本身就是凭据。**
+        """查任务。**需要 `Authorization: Bearer <key>`。**
 
         · 非终态 → **202** + `{task_id, status}`（调用方据此继续轮询）；
         · 成功 → **200** + `{data: [{url}], created, usage}`；
         · 失败 → **200** + `{task_id, status: "failure", error}`；
-        · 不存在 → **404**（**本地拦，不发上游请求**）。
+        · 不存在 **或不属于该 Key** → **404**（**本地拦，不发上游请求**；
+          两者刻意合并成同一个 404 —— 区分开就等于告诉别人"这个 id 存在"）。
 
-        鉴权（2026-09-20 起刻意放宽，判据见 `require_key_optional`）：
-        **不带 Key 也能查**；带了**无效** Key 仍报 401；
-        带了有效但不属于该任务的 Key **照样能查**（id 即凭据）。
-        ⚠️ `DELETE` 与**列表**接口**仍然强制鉴权** —— 否则可以枚举/删除别人的任务。
+        🔴 **鉴权口径 2026-09-23 收紧**（此前是"`task_id` 即凭据、可不带 Key"）：
+        现在**所有业务 GET 都要 Bearer**，且**按 Key 指纹校验属主**
+        （内部映射见 `Service.get_for_credential`）。
+        收紧的理由是可预测性：读/写/删三者的可见范围此前不一致
+        （读能靠 id 分享、写与删不能），调用方很容易以为"有 id 就能读"，
+        而 id 一旦泄漏 —— 例如贴进工单/聊天记录 —— 就等价于泄漏了产物。
+        要分享产物请用产物的 `url`，不要分享任务的 `task_id`。
         """
         svc: Service = request.app.state.service
         rec = svc.get_for_credential(task_id, credential)
@@ -364,9 +417,9 @@ def _install_routes(app: FastAPI) -> None:
     async def get_video(
         request: Request,
         task_id: str,
-        credential: str | None = Depends(require_key_optional),
+        credential: str = Depends(require_key),
     ) -> JSONResponse:
-        """查视频任务（鉴权语义与图片查询一致：id 即凭据）。"""
+        """查视频任务（鉴权与属主口径与图片查询完全一致：都要 Bearer）。"""
         svc: Service = request.app.state.service
         rec = svc.get_for_credential(task_id, credential)
         status_code, payload = view(rec)
@@ -409,28 +462,41 @@ def _install_routes(app: FastAPI) -> None:
     async def ark_get_task(
         request: Request,
         task_id: str,
-        credential: str | None = Depends(require_key_optional),
+        credential: str = Depends(require_key),
     ) -> JSONResponse:
-        """查询视频生成任务 —— **火山方舟原生契约**（id 即凭据，同方舟语义）。"""
+        """查询视频生成任务 —— **火山方舟原生契约**（请求/响应形态同方舟，
+        但**鉴权按本服务的 Bearer 口径**：方舟 SDK 本来就会带
+        `Authorization: Bearer <api_key>`，所以客户端无需改动）。"""
         svc: Service = request.app.state.service
         rec = svc.get_for_credential(task_id, credential)
         return JSONResponse(status_code=200, content=ark_view(rec))
 
     # ------------------------------------------------------------- 模型
-    @app.get("/async/v1/models")
-    async def list_models() -> dict:
-        """本服务对外宣告的能力清单（OpenAI 形态）。
+    @app.get("/v1/models")
+    async def list_models(credential: str = Depends(require_key)) -> dict:
+        """本服务对外宣告的能力清单（OpenAI 形态）。**需要 Bearer。**
+
+        🔴 **清单只有 `/v1/models` 这一条路径**（2026-09-23 起取消了 `/async/v1/models`）。
+        它与 `POST /v1/images/generations`（同步生成，创建+轮询合并）同属
+        `/v1` 的**同步语义**族；OpenAI 风格的客户端/插件按惯例探的就是
+        `/v1/models`。`/async` 前缀留给异步任务语义（受理/查询/删除），
+        两种语义不混在同一个前缀下。
 
         只列**没有已知缺陷**的能力；刻意缺席的（细节修复）不在这里 ——
-        那就是"制造假能力"。`jimeng-t2v` 已适配但未端到端实跑，
-        其 notes 里如实写明。
+        那就是"制造假能力"。
+        文生图族额外带 `upstream_models`（面板名 → 上游模型 → **按模型**的实测价）。
         """
         return {"object": "list", "data": models.catalog()}
 
     # ------------------------------------------------------------- 运维
     @app.get("/healthz")
     async def healthz() -> dict:
-        """存活探针。**零依赖、不触上游、不消耗积分。**"""
+        """存活探针。**零依赖、不触上游、不消耗积分。**
+
+        🔴 **刻意不鉴权**：它是容器 HEALTHCHECK 与编排层判活的入口，
+        要求带 Key 就等于"探针挂了服务才看起来挂"，会把故障定位引向错误方向。
+        它也**既不上报 span、也不留日志**（见 `observability.PROBE_PATHS`）。
+        """
         return {"status": "ok"}
 
     @app.get("/readyz")
@@ -440,6 +506,10 @@ def _install_routes(app: FastAPI) -> None:
         查两件真正决定"能不能接活"的事：任务库可连、上游凭据已配。
         注意它比 `/healthz` 贵（会 ping 一次 DB），所以**不要**拿它当容器
         HEALTHCHECK —— 那个用 `/healthz`。
+
+        与 `/healthz` 同样**刻意不鉴权**（编排层在凭据还没就位时就得能读它 ——
+        "未配置上游凭据"正是它要报的 503 之一）。响应里**不含任何密钥**，
+        DSN 是掩码后的。
         """
         svc: Service = request.app.state.service
         if not svc.store.ping():
@@ -455,8 +525,13 @@ def _install_routes(app: FastAPI) -> None:
         return JSONResponse(status_code=200, content={"status": "ready"})
 
     @app.get("/stats")
-    async def stats(request: Request) -> dict:
-        """运行状态（闸门统计 / 任务计数 / 能力表缓存 / 观测状态 / 存储健康）。"""
+    async def stats(request: Request, credential: str = Depends(require_key)) -> dict:
+        """运行状态（闸门统计 / 任务计数 / 能力表缓存 / 观测状态 / 存储健康）。
+
+        🔴 **2026-09-23 起要 Bearer**：它不是对外契约端点，但内容是内部的
+        （闸门计数、DSN 掩码、能力表缓存状态、协调器派发计数），
+        此前**完全开放** —— 而公网入口是 80 端口，等于把这些挂在公网上。
+        """
         svc: Service = request.app.state.service
         return {**svc.status(),
                 "coordinator": request.app.state.coordinator.stats(),

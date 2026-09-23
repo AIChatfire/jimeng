@@ -40,8 +40,18 @@ DEFAULT_UPSTREAM_MODEL = "high_aes_general_v50"
 #: 允许直接作为 `model` 写的上游 key。**只登记实测过的**：
 #: `high_aes_general_v30l:general_v3.0_18b` 实测 `ret=1006` 权益不足，
 #: 故不登记（写它会得到"未知模型"而不是一个会失败的模型）。
-#: 完整取值仍可由 `GET /async/v1/models` 从服务端能力表读回（见 capabilities.py）。
+#: 完整取值仍可由 `GET /v1/models` 从服务端能力表读回（见 capabilities.py）。
+#:
+#: 🔴 `high_aes_general_v50_flash`（**Seedream 5.0 Flash**）的证据等级与其余
+#: 不同，单独说明：它是 **2026-09-23 服务端能力表实读**新增的模型
+#: （`is_new_model: true`，`feats` 含 `new_model`/`t2i`/`byte_edit`，
+#: `generate_count_options` 1..4，默认 2k，benefit_type
+#: `image_basic_v50_flash_15k` / `image_basic_v50_flash_2k`，`amount` 均 1）。
+#: ⇒ 登记依据是**上游自己宣告**（"能读的就不许猜"），**不是端到端实跑**：
+#: 文档/notes 里必须标明这一点，别把它当"已验证"。
+#: 反例警示：v30l 那两条也是表里有的，但实跑 `ret=1006` —— 读得到 ≠ 用得了。
 UPSTREAM_MODEL_KEYS: tuple[str, ...] = (
+    "high_aes_general_v50_flash",
     "high_aes_general_v50",
     "high_aes_general_v50p_large",
     "high_aes_general_v43",
@@ -50,6 +60,126 @@ UPSTREAM_MODEL_KEYS: tuple[str, ...] = (
     "high_aes_general_v40l",
     "high_aes_general_v40",
 )
+
+
+def _norm_model_name(raw: str) -> str:
+    """把用户写的模型名规范化成查表键。
+
+    规则：小写 → 把**空格 / 下划线 / 点 / 中点 `·`** 一律换成 `-` → 折叠连续
+    `-` → 去掉首尾 `-`。⇒ `Seedream 5.0 Flash` / `seedream 5.0 flash` /
+    `SEEDREAM_5.0_FLASH` / `seedream-5-0-flash` 全部归一到 `seedream-5-0-flash`。
+
+    ⚠️ 规范化**只用于别名查表**：上游 key 分支仍是**逐字精确匹配**
+    （`HIGH_AES_GENERAL_V50` 依旧被判未知模型，见 docs/INTERFACE.md 的三条纪律）。
+    两套键不会互相污染 —— 上游 key 只含 `_` 和 `:`，规范化后不再等于任何一个 key。
+    """
+    s = (raw or "").strip().lower()
+    #: ⚠️ `·`(U+00B7) 与 `・`(U+30FB) 是**两个**不同字符 —— 面板分类名用的是后者，
+    #: 少写一个就会出现"看着一模一样、查表却查不中"的静默失效。
+    for ch in (" ", "_", ".", "·", "・", "．", "\u00a0"):
+        s = s.replace(ch, "-")
+    while "--" in s:
+        s = s.replace("--", "-")
+    return s.strip("-")
+
+
+#: **web 面板名 → 上游模型 key**。数据源 = 服务端能力表的 `model_name` /
+#: `generation_category_name`（2026-09-23 实读 10 条），**不是猜的**；
+#: 每种写法都给三条：完整名、版本短名、面板分类名。查表前先过 `_norm_model_name`。
+#:
+#: 🔴 三条红线：
+#: 1. **只在 t2i 族内换上游模型，绝不跨能力** —— 别名一旦改指到别的能力，
+#:    就是把既有调用方静默换到另一条链路（计费与手感都变）。
+#: 2. **只映射已登记进 `UPSTREAM_MODEL_KEYS` 的模型**。未登记的（3.0/3.1）
+#:    进 `UNSUPPORTED_WEB_MODELS`：点它的名要给**明确理由**，不许静默退化成默认模型。
+#: 3. **认得的面板名必须判在"占位名"之前**（`resolve` 里那条 `not is_placeholder`
+#:    的判断被显式放宽）—— 否则 `Seedream 5.0 Flash` 会被 `PLACEHOLDER_PREFIXES`
+#:    的 `seedream` 前缀吃掉，变成"调用方点了 Flash、拿到 Lite"。
+UPSTREAM_MODEL_ALIASES: dict[str, str] = {
+    # ---- Seedream 5.0 家族 ----
+    "seedream-5-0-pro": "high_aes_general_v50p_large",
+    "seedream-5-pro": "high_aes_general_v50p_large",
+    "5-0-pro": "high_aes_general_v50p_large",
+    "图片-5-0-pro": "high_aes_general_v50p_large",       # category: 图片 5.0 Pro
+    "seedream-5-0-flash": "high_aes_general_v50_flash",
+    "seedream-5-flash": "high_aes_general_v50_flash",
+    "5-0-flash": "high_aes_general_v50_flash",
+    "seedream-5-0-lite": "high_aes_general_v50",
+    "seedream-5-lite": "high_aes_general_v50",
+    "5-0-lite": "high_aes_general_v50",                  # category: 5.0 Lite
+    # ---- 4.x 家族 ----
+    "seedream-4-7": "high_aes_general_v43",
+    "4-7": "high_aes_general_v43",
+    "图片-4-7": "high_aes_general_v43",
+    "seedream-4-6": "high_aes_general_v42",
+    "4-6": "high_aes_general_v42",
+    "图片-4-6": "high_aes_general_v42",
+    "seedream-4-5": "high_aes_general_v40l",
+    "4-5": "high_aes_general_v40l",
+    "图片-4-5": "high_aes_general_v40l",
+    "seedream-4-1": "high_aes_general_v41",
+    "4-1": "high_aes_general_v41",
+    "图片-4-1": "high_aes_general_v41",
+    "seedream-4-0": "high_aes_general_v40",
+    "4-0": "high_aes_general_v40",
+    "图片-4-0": "high_aes_general_v40",
+}
+
+#: 面板上有、**本服务未登记**的模型名 → 未登记的理由（key 保留完整以便追溯）。
+#: 依据：`high_aes_general_v30l*` 系列实测 `ret=1006` 权益不足
+#: （见上方 `UPSTREAM_MODEL_KEYS` 注释与 `docs/UPSTREAM.md` §11）。
+UNSUPPORTED_WEB_MODELS: dict[str, str] = {
+    "seedream-3-1": "high_aes_general_v30l_art_fangzhou:general_v3.0_18b",
+    "3-1": "high_aes_general_v30l_art_fangzhou:general_v3.0_18b",
+    "图片-3-1": "high_aes_general_v30l_art_fangzhou:general_v3.0_18b",
+    "seedream-3-0": "high_aes_general_v30l:general_v3.0_18b",
+    "3-0": "high_aes_general_v30l:general_v3.0_18b",
+    "图片-3-0": "high_aes_general_v30l:general_v3.0_18b",
+}
+
+#: 上游 key → **面板正式名**（服务端能力表的 `model_name`，逐字照抄）。
+#: 单一真相：`GET /v1/models` 的 `upstream_models` 由它渲染，
+#: 门禁断言"已登记 key 集合 == 本表键集合"，防止两张表漂移。
+UPSTREAM_WEB_NAMES: dict[str, str] = {
+    "high_aes_general_v50p_large": "Seedream 5.0 Pro",
+    "high_aes_general_v50_flash": "Seedream 5.0 Flash",
+    "high_aes_general_v50": "Seedream 5.0 Lite",
+    "high_aes_general_v43": "Seedream 4.7",
+    "high_aes_general_v42": "Seedream 4.6",
+    "high_aes_general_v40l": "Seedream 4.5",
+    "high_aes_general_v41": "Seedream 4.1",
+    "high_aes_general_v40": "Seedream 4.0",
+}
+
+#: 上游模型 → **实测**单价（积分/张）。`None` = 未实测（**不等于免费**）。
+#:
+#: 🔴 为什么必须与能力级 `Capability.credits_measured` **分开**：
+#: `jimeng-t2i` 的能力级实测价是 **0** —— 那是 **Lite 口径**；而同一个 t2i 端点
+#: 换模型就换价：Flash 实测 **3**、Pro 实测 **8**。把能力级的值抄给每个上游模型，
+#: 等于对 Flash 报"免费"（那是会让调用方算错成本的那种错）。
+UPSTREAM_MODEL_CREDITS: dict[str, int | None] = {
+    "high_aes_general_v50_flash": 3,      # 2026-09-23 实跑（2k/1 张，三证吻合）
+    "high_aes_general_v50": 0,            # 2026-09-20 实测免费（Lite）
+    "high_aes_general_v50p_large": 8,     # 2026-09-20 实测（三尺寸同价）
+    "high_aes_general_v43": None,
+    "high_aes_general_v42": None,
+    "high_aes_general_v40l": None,
+    "high_aes_general_v41": None,
+    "high_aes_general_v40": None,
+}
+
+#: 文生图族才吃上游模型 —— 目录里只给这一个能力挂 `upstream_models`。
+_UPSTREAM_FAMILY = "t2i"
+
+#: 🔴 **提交路径完全相同的 t2v 变体**（彼此只差 `video_model`）。
+#:
+#: 新增 t2v 变体时**必须加进这个集合**：否则它会掉进 `Service._submit` 的
+#: 后编辑族分支（`else`），而那条分支要求 `jimeng_tool` —— 视频能力没有它，
+#: 于是建任务当场炸。2026-09-23 实测：`jimeng-t2v-fast` / `jimeng-t2v-pro`
+#: **正是这么坏的**（注册了、受理也通，一派发就 AssertionError，
+#: 还被误报成"上游不可用 可重试"）—— 这就是"视频从未端到端跑过"的真因。
+#: 现在由 `tests/test_video.py::test_every_capability_has_a_submit_route` 钉住。
+T2V_VARIANTS: frozenset[str] = frozenset({"t2v", "t2v-fast", "t2v-pro"})
 
 
 # ---------------------------------------------------------------------------
@@ -108,8 +238,16 @@ CAPABILITIES: tuple[Capability, ...] = (
         key="jimeng:t2i", name="t2i", title="文生图",
         accepts_image=False, image_required=False, prompt_required=True,
         credits_measured=0,
-        notes="上游模型 high_aes_general_v50；异步建任务→轮询，**建任务即计费**。"
-              "实测一次出图端到端 17.9-19s（1 张 2048×2048）。",
+        notes="上游模型 high_aes_general_v50（Seedream 5.0 Lite）；异步建任务→轮询，"
+              "**建任务即计费**。"
+              "实测一次出图端到端 17.9-19s（1 张 2048×2048）。"
+              "本能力也接受**直接写上游模型 key 或 web 面板名**来换模型，"
+              "已登记 8 个（每个的**实测单价见 catalog 的 `upstream_models`**——"
+              "能力级那个 0 只是 Lite 口径）：`high_aes_general_v50_flash`"
+              "（Seedream 5.0 Flash，3/张，2026-09-23 实跑）、"
+              "`high_aes_general_v50`（5.0 Lite，0，默认）、"
+              "`high_aes_general_v50p_large`（5.0 Pro，8/张）、"
+              "4.7 / 4.6 / 4.5 / 4.1 / 4.0（未测）。",
     ),
     Capability(
         key="jimeng:i2i", name="i2i", title="图生图（blend）",
@@ -178,26 +316,32 @@ CAPABILITIES: tuple[Capability, ...] = (
         key="jimeng:t2v-fast", name="t2v-fast",
         title="文生视频·Fast（Seedance 4.0 Vision）",
         accepts_image=False, image_required=False, prompt_required=True,
-        credits_measured=None, media="video",
+        credits_measured=30, media="video",
         video_model="dreamina_seedance_40_vision",
         notes="上游模型 dreamina_seedance_40_vision（网页端 Seedance 4.0 Vision，"
               "2026-09-20 晚 UI 抓包）。计费 benefit_type="
-              "**dreamina_seedance_20_fast_5s**（前缀带 dreamina_，照抄）；"
-              "UI 标 `useSeedanceFast5sFreeTrial: true`（5s 免费试用）—— "
-              "是否真免费**未对账**。已实抓档位仅 720p×5s/4:3。"
-              "提交侧按抓包适配，**端到端实跑未验证**。",
+              "**dreamina_seedance_20_fast_5s**（前缀带 dreamina_，照抄）。"
+              "**✅ 2026-09-23 端到端实跑验证**：720p × 5s × **16:9**（比例是"
+              "**提交侧亲传**）→ 93s 出片 **1280×720**（正是 16:9），"
+              "**实扣 30 积分**（余额 5962→5932 差分 + 消耗记录 "
+              "`视频生成720P 5秒 amount=30` + `submit_id` 三证吻合；回执 "
+              "forecast 156 高估 5.2 倍）。"
+              "⚠️ UI 标的 `useSeedanceFast5sFreeTrial: true` **没有生效** —— "
+              "5s 照样扣 30。",
     ),
     Capability(
         key="jimeng:t2v-pro", name="t2v-pro",
         title="文生视频·Pro（Seedance 4.0 Pro Vision）",
         accepts_image=False, image_required=False, prompt_required=True,
-        credits_measured=None, media="video",
+        credits_measured=70, media="video",
         video_model="dreamina_seedance_40_pro_vision",
         notes="上游模型 dreamina_seedance_40_pro_vision（网页端 "
               "Seedance 4.0 Pro Vision，2026-09-20 晚 UI 抓包）。计费 "
               "benefit_type=**seedance_20_pro_720p_output**（无 _5s 尾巴，照抄）。"
-              "已实抓档位仅 720p×5s/4:3。"
-              "提交侧按抓包适配，**端到端实跑未验证**。",
+              "**✅ 2026-09-23 端到端实跑验证**：720p × 5s × **16:9** → "
+              "167s 出片，**实扣 70 积分**（余额差分 + 消耗记录 "
+              "`视频生成 amount=70` + `submit_id` 三证吻合；回执 forecast 453 "
+              "高估 6.5 倍）。比 t2v-fast（30）贵 **2.3 倍**。",
     ),
     Capability(
         key="jimeng:vfi", name="vfi", title="视频补帧（插帧 insert_frame）",
@@ -304,8 +448,9 @@ def _hint() -> str:
     return (f"model 取值：{ids}；"
             f"也可只写能力名（t2i / i2i / hd / pro-hd / outpaint / t2v / "
             f"t2v-fast / t2v-pro / vfi / detail-fix）、"
-            f"中文别名，或直接写上游模型 key（如 {DEFAULT_UPSTREAM_MODEL}）。"
-            f"完整清单见 GET /async/v1/models")
+            f"中文别名、web 面板名（如 `Seedream 5.0 Flash` / `5.0 Lite` / `4.7`），"
+            f"或直接写上游模型 key（如 {DEFAULT_UPSTREAM_MODEL}）。"
+            f"完整清单见 GET /v1/models")
 
 
 def resolve(model: str | None, *, has_image: bool,
@@ -323,10 +468,21 @@ def resolve(model: str | None, *, has_image: bool,
     （`Capability.max_images`），**超出当场 400** —— 绝不静默丢掉多余的图。
 
     上游模型 key 只在文生图族有意义；其余能力返回 None（草稿构造里不带 `model`）。
+    **web 面板名**（`Seedream 5.0 Flash` / `5.0 Lite` / `4.7` …）等价于写上游 key，
+    归一见 `_norm_model_name` 与 `UPSTREAM_MODEL_ALIASES`。
     """
     raw = (model or "").strip()
+    norm = _norm_model_name(raw)
 
-    if raw and not is_placeholder(raw):
+    #: 🔴 别名与"未登记面板名"必须判在**占位判之前**：面板名 `Seedream 5.0 Flash`
+    #: 自带 `seedream` 前缀（在 `PLACEHOLDER_PREFIXES` 里），若先判占位就会被
+    #: 静默降级成默认模型 —— 表现为"调用方点了 Flash、拿到 Lite"。
+    #: 而 `doubao-seedream-5-0-pro-260628` 这类**带厂商前缀+日期后缀**的形态
+    #: 命不中别名，仍按占位处理（它们不代表调用意图，也**不能**被映射到收费档 ——
+    #: 那等于替调用方悄悄换到 8 积分/张的链路）。
+    if raw and (not is_placeholder(raw)
+                or norm in UPSTREAM_MODEL_ALIASES
+                or norm in UNSUPPORTED_WEB_MODELS):
         low = raw.lower()
         cap: Capability | None = None
         upstream_model: str | None = None
@@ -340,6 +496,16 @@ def resolve(model: str | None, *, has_image: bool,
         elif raw in UPSTREAM_MODEL_KEYS:
             cap = _BY_NAME["t2i"]
             upstream_model = raw
+        elif norm in UNSUPPORTED_WEB_MODELS:
+            # 面板上点得到、本服务**没登记** —— 给明确理由，不静默退化
+            raise InvalidParameterError(
+                f"{raw!r} 是即梦 web 面板上的模型（上游 key "
+                f"{UNSUPPORTED_WEB_MODELS[norm]}），但本服务**未登记**它："
+                f"该系列实测 `ret=1006` 权益不足（见 docs/UPSTREAM.md §11）。"
+                f"要用图像生成请改用已登记的模型。{_hint()}", param="model")
+        elif norm in UPSTREAM_MODEL_ALIASES:
+            cap = _BY_NAME["t2i"]
+            upstream_model = UPSTREAM_MODEL_ALIASES[norm]
         else:
             raise InvalidParameterError(
                 f"未知 model {raw!r}。{_hint()}", param="model")
@@ -404,16 +570,23 @@ def _check_shape(cap: Capability, *, raw: str, has_image: bool,
 
 
 def catalog() -> list[dict]:
-    """`GET /async/v1/models` 用：本服务对外宣告的模型清单。
+    """`GET /v1/models` 用：本服务对外宣告的模型清单。
 
     ⚠️ 只列**没有已知缺陷**的能力。刻意缺席的（如细节修复 `super_resolution`
     两次 `status=30 generate_failed`）不出现在这里 —— 那就是"制造假能力"。
     ⚠️ "已端到端验证"与"已适配"是两档：`jimeng-t2v` 提交侧已按实抓适配、
     但**未端到端实跑**（建任务即计费）—— 它的 notes 里如实写明，
     调用方自己决定要不要当第一个吃螃蟹的人。
+
+    `upstream_models`（**只有文生图族有**）：本能力接受的**上游模型选项**，
+    每项 `{key, web_name, credits_measured}`。`web_name` 就是即梦 web 面板上的
+    正式名（`Seedream 5.0 Flash` …），**可以直接当 `model` 传**（大小写与
+    `-`/`_`/空格/点 差异都会被归一，见 `_norm_model_name`）。
+    `credits_measured` 是**能力级**实测值，不是按模型分档的单价。
     """
-    return [
-        {
+    out: list[dict] = []
+    for c in CAPABILITIES:
+        item = {
             "id": c.api_id,
             "object": "model",
             "created": 0,
@@ -426,8 +599,16 @@ def catalog() -> list[dict]:
             "credits_measured": c.credits_measured,
             "notes": c.notes,
         }
-        for c in CAPABILITIES
-    ]
+        if c.name == _UPSTREAM_FAMILY:
+            item["upstream_models"] = [
+                {"key": k, "web_name": UPSTREAM_WEB_NAMES.get(k, ""),
+                 #: 🔴 用**按模型**的实测价，不是能力级的值 —— 见
+                 #: `UPSTREAM_MODEL_CREDITS` 的注释（能力级是 Lite 口径）
+                 "credits_measured": UPSTREAM_MODEL_CREDITS.get(k)}
+                for k in UPSTREAM_MODEL_KEYS
+            ]
+        out.append(item)
+    return out
 
 
 #: 刻意缺席的能力 —— 出现在文档与门禁里，不出现在 catalog 里。
@@ -438,4 +619,5 @@ __all__ = [
     "Capability", "CAPABILITIES", "REGISTRY", "ALIASES", "catalog",
     "resolve", "is_placeholder", "DELIBERATE_ABSENCES",
     "DEFAULT_UPSTREAM_MODEL", "UPSTREAM_MODEL_KEYS", "PLACEHOLDER_MODELS",
+    "UPSTREAM_MODEL_ALIASES", "UNSUPPORTED_WEB_MODELS", "UPSTREAM_WEB_NAMES",
 ]

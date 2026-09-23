@@ -115,6 +115,15 @@ class Settings:
     coordinator_tick: float = 1.0
     coordinator_lease: float = 30.0
 
+    # ------------------------------------------------------------ 同步接口
+    #: `POST /v1/images/generations`（创建 + 轮询合并）的**总等待预算**（秒）：
+    #: 预算内到终态就直接回最终体；超预算降级回 `202 + task_id`（调用方转异步轮询）。
+    #: 默认 300 是用户明确要求的墙钟上限。
+    #: 🔴 必须**小于** worker/网关的超时：`GUNICORN_TIMEOUT`（gunicorn_conf.py，
+    #: 默认 360）与生产 nginx 的 `proxy_read_timeout`（需 ≥ 300 + 余量）——
+    #: 否则跑满预算的请求会被掐断，客户端拿到的是断连而不是我们构造的降级响应。
+    sync_max_wait: float = 300.0
+
     # ------------------------------------------------------------ 持久化
     #: 任务库 DSN。生产用 PostgreSQL；`:memory:` 或文件路径（SQLite）留给测试与联调。
     task_db: str = "postgresql+psycopg://jimeng:jimeng@127.0.0.1:5432/jimeng"
@@ -204,6 +213,7 @@ class Settings:
             continue_enabled=_b("CONTINUE_ENABLED", False),
             coordinator_tick=_f("COORDINATOR_TICK", 1.0),
             coordinator_lease=_f("COORDINATOR_LEASE", 30.0),
+            sync_max_wait=_f("SYNC_MAX_WAIT", 300.0),
             task_db=_s("TASK_DB",
                        "postgresql+psycopg2://jimeng:jimeng@127.0.0.1:5432/jimeng"),
             task_retention_days=_i("TASK_RETENTION_DAYS", 7),
@@ -242,6 +252,8 @@ class Settings:
         if self.coordinator_lease < self.jimeng_poll_interval * 2:
             # 租约比一次轮询还短 ⇒ 每轮都换主，等于没有选主
             raise ConfigError("COORDINATOR_LEASE 必须 >= 2×JIMENG_POLL_INTERVAL")
+        if self.sync_max_wait <= 0:
+            raise ConfigError("SYNC_MAX_WAIT 必须 > 0")
 
         self.startup_warnings = []
         if not self.auth_enabled:
@@ -256,6 +268,21 @@ class Settings:
             self.startup_warnings.append(
                 f"JM_CONCURRENCY={self.jm_concurrency} 超过实测验证过的上限（4）。"
                 "上游是否容忍未知，且并发直接放大积分消耗速率与风控暴露面。")
+        # 同步预算 vs worker 超时的**交叉校验**（两个值都在 env 里，能对就对）。
+        # GUNICORN_TIMEOUT 不设时 gunicorn_conf.py 用默认 360（> 300 天然安全），
+        # 所以只校验"显式设了、且不大于同步预算"这种必然出事的组合。
+        gw_raw = _s("GUNICORN_TIMEOUT")
+        if gw_raw:
+            try:
+                gw = float(gw_raw)
+            except ValueError:
+                gw = 0.0
+            if 0 < gw <= self.sync_max_wait:
+                self.startup_warnings.append(
+                    f"GUNICORN_TIMEOUT={gw_raw} 不大于 SYNC_MAX_WAIT="
+                    f"{self.sync_max_wait}：跑满预算的同步请求会被 worker 判超时"
+                    f"杀掉（客户端拿到断连，而不是降级响应）。"
+                    f"请把 GUNICORN_TIMEOUT 提到同步预算之上。")
 
 
 __all__ = ["Settings", "ConfigError"]

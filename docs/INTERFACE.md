@@ -5,21 +5,115 @@
 
 ---
 
-## 0. 三条端点
+## 0. 端点
 
-| 方法 | 路径 | 状态码 | 用途 |
-|---|---|---|---|
-| `POST` | `/async/v1/images/generations` | `202` | 受理，**只回一个 `task_id`** |
-| `GET` | `/async/v1/images/generations/{task_id}` | `202`/`200` | 非终态回排队态；终态回结果 |
-| `GET` | `/async/v1/models` | `200` | 能力清单（OpenAI 形态） |
-| `DELETE` | `/async/v1/images/generations/{task_id}` | `200`/`400` | 删除**已终态**的任务 |
-| `GET` | `/async/v1/images/generations` | `200` | 本 Key 的任务列表 |
+| 方法 | 路径 | 鉴权 | 状态码 | 用途 |
+|---|---|---|---|---|
+| `POST` | `/async/v1/images/generations` | 🔒 | `202` | 受理，**只回一个 `task_id`** |
+| `GET` | `/async/v1/images/generations/{task_id}` | 🔒 | `202`/`200` | 非终态回排队态；终态回结果 |
+| `POST` | `/v1/images/generations` | 🔒 | `200`/`202`/`503` | **同步**出图：创建+轮询合并（≤300s），见 §0.5 |
+| `GET` | `/v1/models` | 🔒 | `200` | 能力清单（OpenAI 形态）；**只此一条路径** |
+| `DELETE` | `/async/v1/images/generations/{task_id}` | 🔒 | `200`/`400` | 删除**已终态**的任务 |
+| `GET` | `/async/v1/images/generations` | 🔒 | `200` | 本 Key 的任务列表 |
+| `POST` | `/async/v1/videos/generations` | 🔒 | `202` | 视频受理（t2v / t2v-fast / t2v-pro） |
+| `GET` | `/async/v1/videos/generations/{task_id}` | 🔒 | `202`/`200` | 视频查询 |
+| `DELETE` | `/async/v1/videos/generations/{task_id}` | 🔒 | `200`/`400` | 删除**已终态**的视频任务 |
+| `POST` | `/api/v3/contents/generations/tasks` | 🔒 | `200` | 火山方舟门面（创建） |
+| `GET` | `/api/v3/contents/generations/tasks/{id}` | 🔒 | `200` | 火山方舟门面（查询） |
 
-运维端点（**不属于对外契约**）：`GET /healthz`（零依赖，容器探活用）、
-`GET /readyz`（会 ping 一次库与凭据配置）、`GET /stats`。
+🔒 = **必须** `Authorization: Bearer <key>`（详见 §0.3）。
 
-鉴权：`Authorization: Bearer <key>`。`API_KEYS` 为空时**关闭鉴权**（仅限内网，
-启动会打 WARNING）。任务与 Key 指纹绑定。
+### 0.3 鉴权：**所有业务端点都要 Bearer**（2026-09-23 收紧）
+
+`Authorization: Bearer <key>`，与 `API_KEYS`（逗号分隔）白名单比对；比对通过后
+只保留 **Key 的 HMAC 指纹**（明文永不落库）。`API_KEYS` 为空 ⇒ 鉴权整体关闭
+（仅限内网，启动打 WARNING）。
+
+**内部映射：Key 指纹 → 任务归属。** 三类读写的可见范围**完全一致**：
+
+| 动作 | 无 Key | 无效 Key | 合法但非属主 | 属主 |
+|---|---|---|---|---|
+| 受理 / 列表 / 删除 | `401` | `401` | （列表只回自己的） | ✅ |
+| **查询单条（图片/视频/方舟）** | **`401`** | `401` | **`404`** | ✅ |
+| `GET /v1/models`、`/stats` | **`401`** | `401` | ✅（不分属主） | ✅ |
+
+🔴 **本次收紧的破坏性变更**：查询单条此前是"**`task_id` 即凭据**"（不带 Key 也能读，
+带别人的 Key 也能读）。取消它有两个理由：
+
+1. 可见范围不一致 —— 读能靠 id 分享、写/删不能，调用方很容易误判；
+2. `task_id` 一旦泄漏（贴进工单、聊天记录、日志）就等价于泄漏产物，
+   而它**没有有效期、也没法撤回**。
+
+⇒ 要分享产物请分享产物的 **`url`**，不要分享任务的 `task_id`。
+
+**"不存在"与"不属于你"刻意合并为同一个 `404`**：区分开就等于告诉别人
+"这个 id 存在"，那正是枚举的前置条件。
+
+**唯一的例外是探活端点**（刻意不鉴权，判活必须无凭据可用）：
+`GET /healthz`（容器 HEALTHCHECK）、`GET /readyz`（编排层判活，会 ping 一次库）。
+运维端点 `GET /stats` **要鉴权**（内容是内部的：闸门计数、DSN 掩码、协调器派发计数）。
+例外名单由 `tests/test_api.py::test_every_business_route_requires_a_bearer`
+钉死（**扫描全部方法** —— 2026-09-23 从"只看 GET"升级：POST/DELETE 才是
+会产生费用的写路径，只盯 GET 是盲区）—— **新加路由忘挂鉴权会当场红**。
+
+### 0.4 前缀即语义：`/v1/*` = 同步，`/async/*` = 异步（2026-09-23 起）
+
+🔴 **`/async/v1/models` 已取消** —— 请求它会得到 `404`。
+模型清单只有 `GET /v1/models` 这一条路径（**要 Bearer**，与 OpenAI 一致）。
+
+为什么模型清单进 `/v1`：它是**同步、无任务语义**的端点 —— 没有 `task_id`、
+没有轮询、不产生计费。OpenAI 风格的客户端/插件按惯例探的就是 `/v1/models`。
+反过来，**异步族（受理/查询/删除）必须留在 `/async/v1`**：它们是
+`202 + task_id` + 轮询的**异步任务**语义，挂到 `/v1` 会被误读成同步的
+OpenAI images/videos API —— `/async` 前缀本身就是那道护栏。
+
+⚠️ 这道护栏拦的是"**异步语义**挂错前缀"，**不是**"禁止同步端点进 `/v1`"——
+2026-09-23 新增的同步出图接口（§0.5）就是 `/v1` 的正式成员。
+
+两侧口径都由 `tests/test_api.py::test_models_endpoint_lives_only_under_v1` 钉死：
+`/v1/models` 必须在、`/async/v1/models` **必须不存在**（防止有人"顺手加回来"
+让两种前缀重新分叉），外加"`/v1` 下只允许白名单里的**同步**端点"的反向断言
+（白名单当前 = `/v1/models` + `/v1/images/generations`）。
+
+### 0.5 同步出图：`POST /v1/images/generations`（2026-09-23 新增）
+
+**创建 + 轮询合并进一个请求**：调用方发一次 POST，服务端在预算内等任务到终态，
+直接返回最终体 —— 不用再拿 `task_id` 去轮询。
+
+```
+POST /v1/images/generations          Authorization: Bearer <key>
+{"model": "jimeng-t2i", "prompt": "…", "image": [], "n": 1}
+```
+
+三种结局（**状态码判定，不需要读额外字段**）：
+
+| 结局 | 状态码 | 响应体 |
+|---|---|---|
+| 预算内到终态 | `200` | 与异步查询的终态体**逐键一致**（成功/失败/取消，见 §2） |
+| 预算耗尽仍在跑 | `202` | `{task_id, status}` + `Location: /async/v1/images/generations/{id}` |
+| 没有推进者 | `503` | `error.code = "sync_unavailable"` |
+
+* **预算** = `SYNC_MAX_WAIT`（默认 **300s**，墙钟总时长）：排队 + 建任务 +
+  上游生成 + 轮询全含在内。
+* 降级后任务**不受影响、不会被取消**（即梦没有取消端点）—— 拿 `202` 里的
+  `task_id` 走异步轮询即可，`Location` 头已经指向那里。这是**无缝降级**，
+  不是失败：调用方甚至可以把它当"少一步的异步受理"来用。
+* `503 sync_unavailable` 出现在协调器线程没在跑的部署形态（如
+  `COORDINATOR_ENABLED=0`）—— 没有推进者时同步等待注定白等，故**快速说清**。
+* 请求校验/降级/能力解析与异步受理**完全同一套**（同一个 `Service.create`），
+  报错逐字一致。
+* 内部链路：落库 → 叫醒协调器 → 轮询**本地库**直到终态（等待期间**零上游请求**）。
+
+**部署配套（上线前必看）**：请求会在服务端阻塞至多 300s ⇒
+
+| 层 | 要求 |
+|---|---|
+| gunicorn | `GUNICORN_TIMEOUT`（默认 **360**）必须 > `SYNC_MAX_WAIT`，否则 worker 会被判卡死杀掉 |
+| nginx | `proxy_read_timeout` 必须 ≥ 300 + 余量（默认 60s 会在中途**掐断**同步请求） |
+| 调用方 | HTTP 客户端读超时应 ≥ 305s，否则自己先断开 |
+
+⚠️ **什么时候别用它**：长排队/长生成（视频族、高并发下的后位任务）用异步族更合适 ——
+同步接口会占住一条 HTTP 连接等到底。它适合"交互式、要一步到位"的场景。
 
 ### 0.2 火山方舟（Ark）契约门面（2026-09-20 起）
 
@@ -89,7 +183,7 @@
 
 ```json
 {
-  "model": "jimeng-t2v",          // 可省略（视频族当前只有它）
+  "model": "jimeng-t2v-fast",     // 可省略（省略即 jimeng-t2v；另有 t2v-pro）
   "prompt": "一只猫在跳舞",        // 必填
   "resolution": "720p",           // 可省略，默认 720p（已实抓档位）
   "duration": 4,                  // 可省略，单位秒，默认 4（已实抓档位）
@@ -103,14 +197,35 @@
 
 视频端点的**硬边界**（与"不猜"纪律一致）：
 
-* `(resolution, duration)` 必须命中**实抓档位白名单**
-  （当前仅 `720p × 4s`），否则受理时 400 —— `benefit_type`/`amount`
-  是计费字段，没有抓包依据的档位拒绝构造；
+* `(model, resolution, duration)` 必须命中**实抓档位白名单**，否则受理时 400
+  —— `benefit_type`/`amount` 是计费字段，没有抓包依据的档位拒绝构造。
+  已实抓：`t2v`=`720p×{4,5}s`、`t2v-fast`=`720p×5s`、`t2v-pro`=`720p×5s`；
+  ⚠️ **`aspect_ratio` 不在白名单里**（它不参与计费），默认 16:9；
 * 视频草稿**没有张数字段**（实抓确认无 `gen_option`）⇒ `n>1` 按 1 处理
   并在 `degradations` 留痕；
 * `size` / `image` / `negative_prompt` 不属于视频端点，传了 400；
-* ⚠️ `jimeng-t2v` 提交侧已按实抓适配，但**未端到端实跑**（建任务即计费）；
-  产物解析为尽力而为（回包结构未实抓），解析不到按失败处理。
+* ✅ **三个视频能力都已在 2026-09-23 端到端实跑过**（实扣见下表）。
+
+### 0.3 视频实测单价（2026-09-23 真跑对账）
+
+档位一律 `720p × 5s × 16:9`；三证吻合 = 余额差分 + 消耗记录 + `submit_id`。
+
+| 能力 | 上游模型 | 出片 | 实扣 | 回执 forecast | 耗时 |
+|---|---|---|---|---|---|
+| `jimeng-t2v-fast` | `dreamina_seedance_40_vision` | 1280×720 | **30** | 156（高估 5.2×） | 93s |
+| `jimeng-t2v-pro` | `dreamina_seedance_40_pro_vision` | — | **70** | 453（高估 6.5×） | 167s |
+| `jimeng-t2v`（mini） | `dreamina_seedance_40_mini` | 1280×720 | **24**（2026-09-20，4s 档） | 166（高估 ~7×） | 114s |
+
+⚠️ 两条口径（都由实测推翻过）：
+
+1. 我们构造 `benefit_type` 时算的 `amount = 输出秒 + Σ输入视频秒`（≈1/秒）
+   **不是实扣**：5s 档实扣 30/70，而 `amount` 传的是 5。它是**预扣字段**，
+   真扣由上游定价 —— 要对账只能 `submit_id` + `user_credit_history`。
+2. `t2v-fast` 的 UI 标了 `useSeedanceFast5sFreeTrial: true`（5s 免费试用）
+   —— **没有生效**，5s 照样扣 30。
+
+**产物元数据**：视频产物带 `width` / `height` / `vid` / `item_id`
+（2026-09-23 实读：`1280×720` 与提交的 `16:9` 一致 ⇒ 比例**确实生效**）。
 
 ---
 
@@ -281,10 +396,42 @@ Authorization: Bearer <key>
 英文 `jimeng` / `text2image` / `image2image` / `upscale`；
 **别名大小写不敏感**。
 
-**上游模型 key —— 已登记的 7 个**（可直接当 `model` 传，等价于 `jimeng-t2i` + 该模型）：
+### 3.1 web 面板名（2026-09-23 起）
+
+**即梦网页上看到的名字可以直接当 `model` 传**，等价于 `jimeng-t2i` + 对应上游模型：
+
+| 面板名 | 等价于 |
+|---|---|
+| `Seedream 5.0 Flash` / `5.0 Flash` | `high_aes_general_v50_flash` |
+| `Seedream 5.0 Pro` / `5.0 Pro` / `图片 5.0 Pro` | `high_aes_general_v50p_large` |
+| `Seedream 5.0 Lite` / `5.0 Lite` | `high_aes_general_v50`（**默认**） |
+| `Seedream 4.7` / `4.7` / `图片 4.7` | `high_aes_general_v43` |
+| `Seedream 4.6` / `4.5` / `4.1` / `4.0`（及短名 `4.6`…） | 对应的 `v42` / `v40l` / `v41` / `v40` |
+
+**归一规则**：小写化后，把**空格 / `_` / `.` / `·`(U+00B7) / `・`(U+30FB)** 一律看作 `-`，
+并折叠连续 `-`。⇒ `Seedream 5.0 Flash` / `seedream 5.0 flash` /
+`SEEDREAM_5.0_FLASH` / `seedream-5-0-flash` 是同一个东西。
+
+⚠️ **四条边界**（都由门禁钉住）：
+
+1. **面板名只换"上游模型"，不会跨能力** —— 别指望 `Seedream 5.0 Flash` 帮你做图生图。
+2. **上游 key 仍是逐字精确匹配**（`HIGH_AES_GENERAL_V50P_LARGE` 会被判未知模型）；
+   规范化**只**用于面板名查表。
+3. **`Seedream 3.0` / `3.1` 明确拒绝**（400，报错里给出上游 key 与理由：
+   该系列实测 `ret=1006` 权益不足）—— 面板上点得到、本服务没登记时**不许静默退化**
+   成默认模型。
+4. **第三方 SDK 的 `doubao-seedream-5-0-pro-260628` 仍按占位名处理**（等价于没写
+   `model` ⇒ 默认 Lite）。**刻意不映射到 Pro**：那等于替调用方悄悄换到收费链路。
+
+`GET /v1/models` 的 **`jimeng-t2i`** 条目里带 `upstream_models`，
+逐项给出 `{key, web_name, credits_measured}` —— 调用方不必去别处对照名字。
+（`credits_measured` 是**能力级**实测值，**不是**按模型分档的单价。）
+
+**上游模型 key —— 已登记的 8 个**（可直接当 `model` 传，等价于 `jimeng-t2i` + 该模型）：
 
 | `model` 传这个 key | 上游名字 | 张数选项 | 实测单价 |
 |---|---|---|---|
+| `high_aes_general_v50_flash` 🆕 | **Seedream 5.0 Flash** | **1..4** | 未测 |
 | `high_aes_general_v50`（**默认**） | Seedream 5.0 **Lite** | 1..8 | **0（免费）** |
 | `high_aes_general_v50p_large` | **Seedream 5.0 Pro** | **1..4** | **8/张** |
 | `high_aes_general_v43` | Seedream 4.7 | 1..8 | 未测 |
@@ -302,9 +449,16 @@ Authorization: Bearer <key>
    1:1 / 3:4 / 16:9 三种尺寸同价；账单按 `submit_id` 对上、余额差分吻合）。
    Lite 下 t2i/i2i/hd 实测实扣 0。
 
-上游实际有 **9 个**模型：上表 7 个之外还有 **Seedream 3.0 / 3.1**
+上游实际有 **10 个**模型：上表 8 个之外还有 **Seedream 3.0 / 3.1**
 （key 带冒号：`high_aes_general_v30l:general_v3.0_18b` 等）—— **本服务未登记**，
 传它们会被拒为未知模型。
+
+🆕 `high_aes_general_v50_flash`（**Seedream 5.0 Flash**）是 **2026-09-23** 服务端能力表
+实读到的**新模型**（`is_new_model: true`）—— 登记依据是**上游自己宣告**
+（"能读的就不许猜"），**不是端到端实跑**，故**不报单价**。
+它与 Lite 的分工：官方 tip 是"轻量化版 Seedream 5.0 Pro，更快更便宜"，
+默认 2k，benefit_type `image_basic_v50_flash_2k` / `_15k`。
+复现方式：`python scripts/dump_video_models.py --new`（只读、零成本）。
 
 **占位名**（`auto` / `dall-e-3` / `gpt-image-1` / `seedream-*` …）等价于"没写 `model`"，
 走默认推导 —— 第三方 SDK 常硬编码这些值，它们不代表调用意图。
@@ -316,7 +470,7 @@ Authorization: Bearer <key>
 
 **`jimeng-detail-fix`（细节修复）不注册**：两次真实提交都返回
 `status=30 generate_failed`，且**照样计费**。按「不制造假能力」摘除 ——
-它不出现在 `/async/v1/models`，请求它会被拒为未知模型。
+它不出现在 `/v1/models`，请求它会被拒为未知模型。
 工具描述仍留在 `client.POST_EDIT_TOOLS` 供将来续查。
 
 ---

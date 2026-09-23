@@ -7,9 +7,11 @@
 """
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
-from tests.conftest import AUTH, AUTH_B, KEY_B, ok_state
+from tests.conftest import AUTH, AUTH_B, KEY_B, failed_state, ok_state
 
 BASE = "/async/v1/images/generations"
 
@@ -292,7 +294,7 @@ def test_wrong_key_is_401(client):
 
 
 def test_models_endpoint_lists_only_verified_capabilities(client):
-    data = client.get("/async/v1/models").json()
+    data = client.get("/v1/models", headers=AUTH).json()
     ids = {m["id"] for m in data["data"]}
     # jimeng-t2v / jimeng-vfi：已适配（提交侧实抓）但未端到端实跑 —— notes 里如实写明
     assert ids == {"jimeng-t2i", "jimeng-i2i", "jimeng-hd",
@@ -300,6 +302,91 @@ def test_models_endpoint_lists_only_verified_capabilities(client):
                    "jimeng-omni-video", "jimeng-detail-fix",
                    "jimeng-t2v-fast", "jimeng-t2v-pro"}
     assert "detail" not in ids, "旧的工具名不对外"
+
+
+#: `/v1` 前缀下**允许**的端点 —— 全部是**同步语义**（一次请求一个最终响应）。
+#: 2026-09-23 从 `{"/v1/models"}` 扩到当前集合：新增了**同步生成**端点
+#: （创建+轮询合并），它同样属于"同步、无 `202 + task_id` 轮询语义"的正牌成员。
+#: **异步**族（受理/查询/删除）必须留在 `/async/v1`（护栏拦的是"异步语义挂 /v1"）。
+_V1_SYNC_ENDPOINTS = frozenset({"/v1/models", "/v1/images/generations"})
+
+
+def test_models_endpoint_lives_only_under_v1(client):
+    """模型清单**只在 `/v1/models`**；`/v1` 下只放**同步语义**端点（白名单钉死）。
+
+    这条门禁是**双向**的：
+      · `/v1/models` 必须在（且带 Bearer 时 200）；
+      · `/async/v1/models` 必须**不存在** —— 否则有人"顺手加回来"就又成了双前缀，
+        两边的文档/门禁/调用方认知会重新分叉。
+    反向断言：`/v1` 下只允许白名单里的端点。生成/查询/删除的**异步**语义
+    （`202 + task_id` + 轮询）挂到 `/v1` 会被误读成同步 OpenAI images/videos
+    API —— `/async` 前缀就是那道护栏。而**同步生成端点**
+    （`POST /v1/images/generations`，创建+轮询合并）本来就是同步语义，
+    放 `/v1` 是正确的归属，不是护栏要拦的东西。
+    """
+    ok = client.get("/v1/models", headers=AUTH)
+    assert ok.status_code == 200, ok.text
+
+    gone = client.get("/async/v1/models", headers=AUTH)
+    assert gone.status_code == 404, \
+        f"/async/v1/models 应当已取消，实得 {gone.status_code}"
+
+    paths = {r.path for r in client.app.routes}
+    assert "/v1/models" in paths
+    assert "/async/v1/models" not in paths
+    leaked = {p for p in paths if p.startswith("/v1/")} - _V1_SYNC_ENDPOINTS
+    assert not leaked, \
+        f"/v1 下只允许同步语义端点（白名单）：{sorted(leaked)}"
+
+
+#: FastAPI 自带的接口文档路由 —— 它们**不是**本服务的业务端点，
+#: 天然没有业务鉴权（`/docs` 暴露整个 API 形态，属于**部署层**决定要不要关，
+#: 见 README 的边界一节）。
+_FRAMEWORK_ROUTES = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect",
+                               "/redoc"})
+
+
+def test_every_business_route_requires_a_bearer(client):
+    """🔴 **所有业务端点（任何方法）都必须挂 `require_key`** —— 唯一例外是探活端点。
+
+    为什么要有这条**结构性**门禁（而不是只测几条具体路径）：靠人记着"新加路由
+    时别忘了挂依赖"是记不住的。2026-09-23 收紧鉴权时就是这个原因暴露出来的 ——
+    查单条的 GET 一直是"可选鉴权"（`task_id` 即凭据），`/v1/models` 与 `/stats`
+    更是**完全开放**，而公网入口就是 80 端口。
+
+    🔴 本次从"只看 GET"升级到**全方法**：新增的同步生成端点
+    （`POST /v1/images/generations`）不在旧的扫描面里 —— 只盯 GET 的门禁，
+    对 POST/DELETE/PUT 全是盲区，而它们才是会产生费用的写路径。
+    判据只认路由级依赖表里有 `require_key`。
+
+    探活例外：`/healthz`（容器 HEALTHCHECK）与 `/readyz`（编排层判活）
+    必须在**没有任何凭据**时可用 —— 判活失败要说清是服务的问题，
+    不能因为"没带 Key"而看起来像挂了。
+    """
+    from app.observability import PROBE_PATHS
+
+    assert set(PROBE_PATHS) == {"/healthz", "/readyz"}, \
+        "探活路径表变了 —— 这里的不鉴权例外名单要跟着改"
+
+    open_paths: set[str] = set()
+    for route in client.app.routes:
+        path = getattr(route, "path", "")
+        methods = set(getattr(route, "methods", []) or ())
+        if not path.startswith("/") or not methods:
+            continue
+        if path in PROBE_PATHS or path in _FRAMEWORK_ROUTES:
+            continue
+        dep = getattr(route, "dependant", None)
+        if dep is None:
+            # 非 FastAPI 业务路由（Starlette 原生 Route/Mount 等）—— 不适用本门禁；
+            # 若真有人用它挂业务端点，契约用例（如 /v1/models）会先红。
+            continue
+        deps = {d.call.__name__ for d in dep.dependencies}
+        if "require_key" not in deps:
+            open_paths.add(path)
+
+    assert not open_paths, \
+        f"这些端点没挂鉴权（新加的？）：{sorted(open_paths)}"
 
 
 def test_healthz_is_dependency_free_and_needs_no_auth(client):
@@ -329,6 +416,143 @@ def test_unconfigured_upstream_is_503_not_401(client_factory):
     r = c.post(BASE, json={"model": "jimeng-t2i", "prompt": "x"}, headers=AUTH)
     assert r.status_code == 503
     assert r.json()["error"]["code"] == "upstream_not_configured"
+
+
+# ---------------------------------------------------------------------------
+# 同步生成：POST /v1/images/generations（创建+轮询合并）
+# ---------------------------------------------------------------------------
+
+SYNC = "/v1/images/generations"
+
+
+class _InlineCoordinator:
+    """把协调器换成"`wake()` 时就地推进"的替身 —— 同步接口用例专用。
+
+    为什么需要它：同步端点在**一个请求内**等到终态，而测试纪律是
+    "协调器不启线程、用例显式 tick"（见 conftest 纪律 #2）。这个替身把
+    两者接起来：请求里调 `wake()` 时直接跑 N 轮 `tick()`，等待循环的第一轮
+    查库就能看到终态 —— 确定性最高，不引入后台线程的时序不确定性。
+    """
+
+    def __init__(self, real: Any, *, advances: int = 3,
+                 running: bool = True) -> None:
+        self.real = real
+        self.advances = advances
+        self._running = running
+        self.wakes = 0
+
+    @property
+    def running(self) -> bool:
+        return self._running
+
+    def wake(self) -> None:
+        self.wakes += 1
+        for _ in range(self.advances):
+            self.real.tick()
+
+    def stats(self) -> dict:
+        return self.real.stats()
+
+    def __getattr__(self, name: str) -> Any:
+        # 其余接口（stop/start/…）转发给真协调器 —— 用例只替换
+        # running/wake/stats 三个，lifespan 退出时的 stop() 也能照常工作。
+        return getattr(self.real, name)
+
+
+@pytest.fixture
+def sync_client(client, client_state):
+    """默认 app 的"同步版"：协调器换成 inline 替身（wake 即推进）。"""
+    client_state.coordinator = _InlineCoordinator(client_state.coordinator)
+    return client
+
+
+def test_sync_single_call_returns_final_result(sync_client, client_state,
+                                               fake_jimeng):
+    """一次 POST 拿到最终结果 —— 这就是"创建+轮询合并"的全部意义。"""
+    fake_jimeng.states = [ok_state(["https://cdn/a.png", "https://cdn/b.png"])]
+    r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x",
+                                     "n": 2}, headers=AUTH)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    # 与异步查询成功体**逐键一致**：同一个 `view()` 出口，不许长出第二套形状
+    assert set(body) == {"status", "data", "created", "usage"}
+    assert body["status"] == "success"
+    assert [d["url"] for d in body["data"]] == ["https://cdn/a.png",
+                                                "https://cdn/b.png"]
+    assert client_state.coordinator.wakes == 1, "受理后应叫醒协调器"
+
+
+def test_sync_failure_is_a_200_with_failure_status(sync_client, fake_jimeng):
+    """任务失败也是"完整的答案"：直接回 `failure` 体，调用方无需再轮询。"""
+    fake_jimeng.states = [failed_state("generate_failed")]
+    r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
+                         headers=AUTH)
+    assert r.status_code == 200, r.text
+    assert r.json()["status"] == "failure"
+    assert r.json()["error"]
+
+
+def test_sync_timeout_degrades_to_async_polling(client_factory):
+    """预算耗尽 ⇒ 202 + task_id + Location 指向异步端点；任务不受影响。
+
+    这就是"超时降级"路径：调用方无缝转异步轮询 —— 任务不会被取消
+    （即梦根本没有取消端点），只是这一个 HTTP 请求不再等它。
+    """
+    import time as _time
+
+    c = client_factory(sync_max_wait=0.05)
+    st = c.app.state
+    # advances=0 ⇒ wake() 不推进 ⇒ 任务停在 queued，预算一到就降级
+    st.coordinator = _InlineCoordinator(st.coordinator, advances=0)
+
+    t0 = _time.monotonic()
+    r = c.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"}, headers=AUTH)
+    elapsed = _time.monotonic() - t0
+
+    assert r.status_code == 202, r.text
+    body = r.json()
+    assert body["status"] == "queued"
+    tid = body["task_id"]
+    assert r.headers["location"] == f"/async/v1/images/generations/{tid}"
+    # 🔴 防"配置没生效、真等 300s"把用例挂死：耗时必须远小于默认预算
+    assert elapsed < 5, f"降级应当及时，实耗 {elapsed:.1f}s"
+
+    # 降级后任务还在（没被取消/删除），异步端点照常可轮询
+    got = c.get(f"/async/v1/images/generations/{tid}", headers=AUTH)
+    assert got.status_code == 202
+    assert got.json()["status"] == "queued"
+
+
+def test_sync_503_without_a_running_coordinator(client):
+    """没有推进者 ⇒ **快速 503**，而不是白等一整个预算。
+
+    夹具默认 `COORDINATOR_ENABLED=0` ⇒ 协调器线程没起 ⇒ running=False。
+    这个部署形态下任务根本不会被推进，同步等待注定熬到超时 —— 快速说清。
+    同时断言：**没有落下任何任务**（503 发生在受理之前）。
+    """
+    before = client.get(BASE, headers=AUTH).json()["total"]
+    r = client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"},
+                    headers=AUTH)
+    assert r.status_code == 503, r.text
+    err = r.json()["error"]
+    assert err["code"] == "sync_unavailable"
+    assert "协调器" in err["message"]
+    after = client.get(BASE, headers=AUTH).json()["total"]
+    assert after == before, "503 发生在受理之前，不该留下孤儿任务"
+
+
+def test_sync_requires_bearer(sync_client):
+    r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x"})
+    assert r.status_code == 401
+
+
+def test_sync_validates_like_the_async_endpoint(sync_client):
+    """参数校验复用同一套（同一个 `Service.create`）—— 报错逐字一致。"""
+    r = sync_client.post(SYNC, json={"model": "jimeng-t2i", "prompt": "x",
+                                     "image": "https://a/b.png"}, headers=AUTH)
+    assert r.status_code == 400
+    assert "必须是**数组**" in r.json()["error"]["message"] or \
+        "必须是数组" in r.json()["error"]["message"]
 
 
 _ = (pytest, KEY_B)

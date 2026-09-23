@@ -324,7 +324,7 @@ def test_video_end_to_end_success(app_and_client, fake_jimeng, client_state):
     task_id = r.json()["task_id"]
     for _ in range(2):
         client_state.coordinator.tick()
-    r = client.get(f"/async/v1/videos/generations/{task_id}")
+    r = client.get(f"/async/v1/videos/generations/{task_id}", headers=AUTH)
     assert r.status_code == 200
     payload = r.json()
     assert payload["data"] == [{"url": "https://tos.example.com/v.mp4"}]
@@ -333,15 +333,18 @@ def test_video_end_to_end_success(app_and_client, fake_jimeng, client_state):
 
 
 def test_models_catalog_lists_video_capability(client):
-    r = client.get("/async/v1/models")
+    r = client.get("/v1/models", headers=AUTH)
     ids = {m["id"]: m for m in r.json()["data"]}
-    # 三个视频生成模型都在（mini 已真跑；fast/pro 已按抓包适配）
+    # 三个视频生成能力都在，且**都已经端到端实跑过**（2026-09-23 补齐 fast/pro）
     for mid in ("jimeng-t2v", "jimeng-t2v-fast", "jimeng-t2v-pro"):
         assert ids[mid]["media"] == "video"
-    # 诚实边界写进了 notes：t2v 已真跑验证（含实扣）
+    # 诚实边界写进 notes：实跑记录与**实扣**都要在
     assert "真跑验证" in ids["jimeng-t2v"]["notes"]
-    assert "端到端实跑未验证" in ids["jimeng-t2v-fast"]["notes"]
-    assert "端到端实跑未验证" in ids["jimeng-t2v-pro"]["notes"]
+    assert "2026-09-23 端到端实跑验证" in ids["jimeng-t2v-fast"]["notes"]
+    assert "2026-09-23 端到端实跑验证" in ids["jimeng-t2v-pro"]["notes"]
+    # 实扣值必须报成实测（不是 None、也不是 forecast）
+    assert ids["jimeng-t2v-fast"]["credits_measured"] == 30
+    assert ids["jimeng-t2v-pro"]["credits_measured"] == 70
 
 
 # ---------------------------------------------------------------------------
@@ -742,3 +745,68 @@ def test_detail_fix_default_routing_kept_t2i(client):
     r = client.post("/async/v1/images/generations", headers=AUTH,
                     json={"prompt": "x"})
     assert r.status_code == 202
+
+
+def test_every_capability_has_a_submit_route():
+    """**注册表里每个能力都必须有提交路径** —— 这是 2026-09-23 那个真 bug 的门禁。
+
+    症状：能力在 `models.CAPABILITIES` 里注册了、`/v1/models` 也宣告了、受理也通，
+    但 `Service._submit` 没有它的分支 ⇒ 任务在**派发那一刻**炸。
+    `jimeng-t2v-fast` / `jimeng-t2v-pro` 就是这么坏的（掉进后编辑族 `else`，
+    在那里 `assert cap.jimeng_tool` —— 视频能力没有它）。
+    更糟的是它被兜底逻辑报成"上游不可用·**可重试**"，把排障方向带偏。
+
+    纯静态对照：改注册表 / 改路由表任一边忘了同步，这里都会红。
+    """
+    from app.models import CAPABILITIES, T2V_VARIANTS
+    from app.service import SUBMIT_ROUTES
+
+    names = {c.name for c in CAPABILITIES}
+    assert not (names - SUBMIT_ROUTES), \
+        f"这些能力没有提交实现：{sorted(names - SUBMIT_ROUTES)}"
+    assert not (SUBMIT_ROUTES - names), \
+        f"路由表里有注册表没有的能力（改完注册表忘删了？）：{sorted(SUBMIT_ROUTES - names)}"
+    assert T2V_VARIANTS <= SUBMIT_ROUTES, "t2v 变体必须共用同一条视频提交路径"
+
+
+@pytest.mark.parametrize("api_id", ["jimeng-t2v", "jimeng-t2v-fast", "jimeng-t2v-pro"])
+def test_each_t2v_variant_dispatches_with_its_own_video_model(
+        app_and_client, fake_jimeng, client_state, api_id):
+    """三个 t2v 变体走**同一条**提交路径，但各带各的 `video_model`（计费档位按它查）。"""
+    from app.models import _BY_API_ID
+
+    _, client, _ = app_and_client
+    r = client.post("/async/v1/videos/generations", headers=AUTH,
+                    json={"model": api_id, "prompt": "一只猫在跳舞",
+                          "resolution": "720p", "duration": 5,
+                          "aspect_ratio": "16:9"})
+    assert r.status_code == 202, r.text
+    client_state.coordinator.tick()
+
+    calls = fake_jimeng.of("submit_video")
+    assert len(calls) == 1, f"{api_id} 没走到视频提交路径：{fake_jimeng.calls}"
+    assert calls[0]["model"] == _BY_API_ID[api_id].video_model
+    assert calls[0]["resolution"] == "720p"
+    assert calls[0]["duration_ms"] == 5000
+    assert calls[0]["aspect_ratio"] == "16:9"
+    rec = client_state.service.store.get(r.json()["task_id"])
+    assert rec.status == "in_progress", rec.status
+
+
+def test_unwired_capability_is_reported_as_internal_not_as_upstream(client_state):
+    """接线遗漏必须报成**内部错误·不可重试**，不许伪装成"上游不可用·可重试"。"""
+    from app.errors import CapabilityNotWiredError
+    from app.models import Capability
+    from app.store import TaskRecord
+
+    svc = client_state.service
+    cap = Capability(key="jimeng:ghost", name="ghost", title="幽灵能力（未接线）",
+                     accepts_image=False, image_required=False)
+    rec = TaskRecord(task_id="jimeng_ghost", credential_id="c",
+                     model="jimeng-ghost", cap_key="jimeng:ghost",
+                     status="queued", prompt="p")
+    with pytest.raises(CapabilityNotWiredError) as e:
+        svc._submit(rec, cap, [])
+    assert e.value.retryable is False, "内部接线 bug 重试没有意义"
+    assert e.value.err_code == "capability_not_wired"
+    assert e.value.status_code == 500

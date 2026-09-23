@@ -42,7 +42,8 @@ import time
 from typing import Any, Literal, Optional
 
 from loguru import logger
-from sqlalchemy import JSON, Column, Engine, Index, func, text
+from sqlalchemy import JSON, Column, Engine, Index, func, inspect, text
+from sqlalchemy.dialects import postgresql
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlmodel import Field, Session, SQLModel, create_engine, select
@@ -52,6 +53,26 @@ from sqlmodel import Field, Session, SQLModel, create_engine, select
 JSON_COL = JSON().with_variant(JSONB(), "postgresql")
 
 _DSN_PASSWORD_RE = re.compile(r"(?P<head>://[^:/@]+:)(?P<pw>[^@]*)@")
+
+
+def _scalar_default(col: Any) -> str | None:
+    """取列的**标量**默认值并渲染成 SQL 字面量；没有（或不是标量）返回 None。
+
+    只认 Python 侧声明过的标量默认（`Field(default=0)` / `default=""` …）。
+    `default_factory`（`list` / `dict`）**刻意不认** —— 给 JSON 列编一个
+    `DEFAULT '[]'` 看似方便，实际会掩盖"这列本该有值却没有"的数据问题。
+    """
+    d = getattr(col, "default", None)
+    if d is None or not getattr(d, "is_scalar", False):
+        return None
+    arg = d.arg
+    if isinstance(arg, bool):
+        return "TRUE" if arg else "FALSE"
+    if isinstance(arg, (int, float)):
+        return str(arg)
+    if isinstance(arg, str):
+        return "'" + arg.replace("'", "''") + "'"
+    return None
 
 
 def mask_dsn(dsn: str) -> str:
@@ -263,24 +284,51 @@ class TaskStore:
     # -------------------------------------------------------------- 迁移/维护
 
     def _ensure_video_columns(self) -> None:
-        """视频任务的两列（`duration_ms` / `aspect_ratio`）**启动期幂等补列**。
+        """启动期**幂等补齐任务表缺的列** —— 从模型元数据机械派生，不再手工枚举。
 
-        🔴 为什么放这里而不是留给运维手工 ALTER：`create_all` **只建表不加列**
-        —— 已有库上直接加字段，症状是 `store.patch()` 报
-        `column does not exist`，而且只在视频任务上炸（图片链路全绿），
-        极难第一时间定位。这条线此前靠"两库手工 ALTER"的运维纪律兜着，
-        实践证明容易忘 ⇒ 现在由代码自己保证，`ADD COLUMN IF NOT EXISTS`
-        幂等且零代价（已存在时 PG 直接跳过）。
+        🔴 为什么放这里而不是留给运维手工 ALTER：`SQLModel.metadata.create_all()`
+        **只建表、不加列**。已有库上给模型加字段，症状是 `store.patch()` 报
+        `column does not exist`，而且**只在新字段被写到时才炸**（图片链路全绿），
+        极难第一时间定位。
+
+        🔴 为什么改成**机械派生**：原先这张清单是手写的，只列了视频三列，
+        于是后加的 `upstream_history_id` / `draft_json` / `continuations`
+        漏在外面 —— 本地开发库 `jimeng` 一跑受理就炸（2026-09-23 实测）。
+        "记得手工 ALTER"这条纪律**再一次**被证明会忘，所以现在让代码自己保证：
+        遍历 `TaskRecord.__table__.columns`，模型加字段 ⇒ 下次启动自动补。
+
+        · `ADD COLUMN IF NOT EXISTS` 幂等，已存在时 PG 直接跳过（零代价）；
+        · 非空列带**模型声明的标量默认值**一起给出（`NOT NULL DEFAULT 0`
+          对已有行安全；不带 DEFAULT 的 `NOT NULL` 在有数据的表上会直接失败）；
+        · 非空但默认值是 `default_factory` 的列（`image_refs` / `images` /
+          `degradations` 这类 JSON 列）**不敢瞎给默认值** ⇒ 只在真缺列时
+          **响亮报警**，让人来做 —— 静默补一个空值会掩盖数据问题。
         与 `normalize_status_case` 同一取向：**启动时无条件跑一遍**。
         """
-        stmts = (
-            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS duration_ms INT",
-            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS aspect_ratio VARCHAR",
-            "ALTER TABLE tasks ADD COLUMN IF NOT EXISTS extra_json TEXT",
-        )
+        table = TaskRecord.__tablename__
+        dialect = postgresql.dialect()
+        #: ⚠️ **必须先查实际存在的列**：只按"模型里非空却没有标量默认值"来判定，
+        #: 会把 `task_id` / `image_refs` / `images` 这些**早就存在**的列也报成"缺列"
+        #: （2026-09-23 实测：启动日志刷了一条完全虚假的 ERROR）。
+        existing = {col["name"] for col in inspect(self.engine).get_columns(table)}
+        missing_notnull: list[str] = []
         with self.engine.begin() as c:
-            for s in stmts:
-                c.execute(text(s))
+            for col in TaskRecord.__table__.columns:
+                if col.name in existing:
+                    continue
+                ddl = f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {col.name} " \
+                      f"{col.type.compile(dialect)}"
+                default = _scalar_default(col)
+                if col.nullable is False:
+                    if default is None:
+                        missing_notnull.append(col.name)
+                        continue
+                    ddl += f" NOT NULL DEFAULT {default}"
+                c.execute(text(ddl))
+        for name in missing_notnull:
+            logger.error(
+                "任务表缺列且无法自动补：{}（非空、且没有标量默认值）。"
+                "请手工迁移后重启 —— 该链路会一直报 column does not exist。", name)
 
     def normalize_status_case(self) -> int:
         """把历史行的大写状态归一化成小写。返回改动行数。

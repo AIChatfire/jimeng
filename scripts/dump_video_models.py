@@ -9,7 +9,14 @@
 用法：
     python scripts/dump_video_models.py            # 打印视频模型摘要
     python scripts/dump_video_models.py --all      # 打印全部模型
+    python scripts/dump_video_models.py --new      # **新模型巡检**：只列 is_new_model
     python scripts/dump_video_models.py --raw out.json  # 原始响应落盘
+
+🔴 `--new` 是**巡检入口**：上游加了新模型时，`model_list` 里那条会带
+`is_new_model: true`。**它筛的是图片模型** —— 视频模型不在本响应里
+（服务端按场景单独下发，只能靠补抓提交包，见 `docs/UPSTREAM.md` §13）。
+发现新模型后按 `app/models.py::UPSTREAM_MODEL_KEYS` 登记，
+张数选项同步 `client.COUNT_OPTIONS_BY_MODEL`。
 
 凭据从环境变量 / .env 取（JIMENG_COOKIE 或 JIMENG_SESSIONID）。
 """
@@ -44,9 +51,35 @@ def load_env(path: Path) -> dict[str, str]:
     return out
 
 
+def _key_of(it: dict) -> str:
+    return (it.get("model_req_key") or it.get("model_key")
+            or it.get("model") or it.get("key") or "")
+
+
+def _benefit_type(it: dict) -> str:
+    """取计费档位名（服务端声明，**非实测**）—— 只在巡检摘要里展示。"""
+    cc = it.get("commercial_config") or {}
+    img = cc.get("image_model_commerce_config") or cc.get("commerce_info_map") or {}
+    base = (img.get("base") or {}) if isinstance(img, dict) else {}
+    default = (base.get("default") or {}) if isinstance(base, dict) else {}
+    bt = default.get("benefit_type")
+    return str(bt) if bt else "—"
+
+
+def _line(it: dict) -> str:
+    """一行摘要（巡检用：全 JSON 太长，扫一眼就够判断要不要登记）。"""
+    return (f"{_key_of(it):<40} | {str(it.get('model_name') or '?'):<22} | "
+            f"new={bool(it.get('is_new_model'))!s:<5} | "
+            f"n={it.get('generate_count_options') or '—'} | "
+            f"res={it.get('default_resolution_type') or '—'} | "
+            f"{_benefit_type(it)}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--all", action="store_true", help="打印全部模型，不只视频")
+    ap.add_argument("--new", action="store_true",
+                    help="**新模型巡检**：只列服务端标了 is_new_model 的模型（一行一条）")
     ap.add_argument("--raw", metavar="PATH", help="原始响应 JSON 落盘")
     args = ap.parse_args()
 
@@ -77,16 +110,24 @@ def main() -> int:
     for it in models:
         if not isinstance(it, dict):
             continue
-        key = (it.get("model_req_key") or it.get("model_key")
-               or it.get("model") or it.get("key") or "")
+        if args.new:
+            if not it.get("is_new_model"):
+                continue
+            shown += 1
+            print(_line(it))
+            continue
+        key = _key_of(it)
         low = key.lower()
         if not args.all and not any(h in low for h in VIDEO_HINTS):
             continue
         shown += 1
         print("-" * 72)
         print(json.dumps(it, ensure_ascii=False, indent=2)[:4000])
-    if not args.all and not shown:
-        print("（没有命中视频关键词的模型 —— 换 --all 看全量，能力表可能按场景下发）")
+    if not shown:
+        if args.new:
+            print("（服务端本次没有标 is_new_model 的模型）")
+        elif not args.all:
+            print("（没有命中视频关键词的模型 —— 换 --all 看全量，能力表可能按场景下发）")
     return 0
 
 

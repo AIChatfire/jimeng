@@ -1,16 +1,18 @@
 # jimeng-service
 
-即梦（`jimeng.jianying.com`）图片生成的**异步**出口。参考 `doubao-stream` 的
-`/v1/images` 接口形态，做成 `POST` 受理 → `GET` 轮询的两段式。
+即梦（`jimeng.jianying.com`）图片/视频生成的出口。参考 `doubao-stream` 的
+`/v1/images` 接口形态：默认两段式（`POST` 受理 → `GET` 轮询），
+图片族另有**同步一步式**（创建+轮询合并，≤300s，见下表第二行）。
 
 ```
 POST /async/v1/images/generations        → 202 {"task_id": "jimeng_…"}     只回一个 id
 GET  /async/v1/images/generations/{id}   → 202 排队态 / 200 {data,created,usage}
+POST /v1/images/generations              → 200 终态体 / 202 降级 / 503     同步：创建+轮询合并（≤300s）
 POST /async/v1/videos/generations        → 202 文生视频（t2v）/ 补帧（vfi + source_task_id）
 GET  /async/v1/videos/generations/{id}   → 202 排队态 / 200 {data,created,usage.videos}
 POST /api/v3/contents/generations/tasks  → 200 {"id": …}  火山方舟原生契约门面（视频）
 GET  /api/v3/contents/generations/tasks/{id} → 200 方舟查询形态（queued/running/succeeded/failed）
-GET  /async/v1/models                    → 能力清单
+GET  /v1/models                          → 能力清单（只此一条路径；/async 那份已取消）
 ```
 
 契约全文见 **[`docs/INTERFACE.md`](docs/INTERFACE.md)**（冻结）；上游契约见
@@ -106,6 +108,12 @@ Application → Cookies → `sessionid`。
 即梦没有回调，只能自己轮询。⇒ 协调器**不是可选增强，是链路的一环**：
 没有它，任务永远停在 `queued`（连建任务都不会发生），超时看门狗也永不触发。
 
+⚠️ **同步接口（`POST /v1/images/generations`）不改变这条主线**：它同样只落库，
+等待期间**只查本地库** —— "建任务"与"轮询上游"仍然全部由协调器做。
+它把"调用方原本要做的多次轮询"折叠进一个请求里，而不是抢协调器的活；
+正因如此，没有协调器在跑的部署里它会**快速 503**（`sync_unavailable`），
+而不是白等一整个预算。
+
 ### 2.2 并发上限放在库里数，不放在信号量里
 
 `JM_CONCURRENCY` 的判据是 `count(status='in_progress')`。
@@ -128,7 +136,14 @@ Application → Cookies → `sessionid`。
 - `API_KEYS` 为空 ⇒ **鉴权整体关闭**，请求算作 `anonymous`；启动会打 WARNING。
 - 通过后 Key 被换成**不可逆指纹** `credential_id = HMAC-SHA256(secret, key)`，
   `secret` 首次启动随机生成并存在任务库 `meta` 表 ⇒ **明文 Key 永不落库**。
-- 任务与该指纹绑定：换一把 Key 读别人的任务 ⇒ **404，且不发上游请求**（本地拦死）。
+- 任务与该指纹绑定：换一把 Key 读/删别人的任务 ⇒ **404，且不发上游请求**（本地拦死）。
+- 🔴 **2026-09-23 收紧：所有业务端点（任何方法）都要 Bearer**，含**全部 GET**
+  （`/v1/models`、任务查询、`/stats`）。此前"查询单条可不带 Key（`task_id` 即凭据）"
+  的口径**已取消** —— 可见范围与写/删不一致，且 `task_id` 泄漏即等价于产物泄漏
+  （无有效期、无法撤回）。分享产物请用产物 `url`。
+  **唯一例外是探活端点** `/healthz` `/readyz`（判活必须无凭据可用）。
+  门禁：`tests/test_api.py::test_every_business_route_requires_a_bearer`
+  （扫描**全部方法** —— POST/DELETE 才是会产生费用的写路径，只盯 GET 是盲区）。
 
 **上游（本服务 → 即梦）**
 
@@ -151,7 +166,7 @@ Application → Cookies → `sessionid`。
 ### 2.5 不制造假能力
 
 - 细节修复（`super_resolution`）实测两次 `generate_failed` ⇒ **不注册**，
-  也不出现在 `/async/v1/models`（见 `app/models.py::DELIBERATE_ABSENCES`）；
+  也不出现在 `/v1/models`（见 `app/models.py::DELIBERATE_ABSENCES`）；
 - 未配凭据时 `POST` 回 **503** 而不是假装受理；
 - 上游凭据失效也是 **503**（部署问题），不是 401（调用方的问题）。
 
@@ -182,8 +197,12 @@ logfire 侧**全量上报**上下游明细：原始请求/响应、`upstream_sub
 1. 🔴 **"被接受" ≠ "能跑通"。** 上游返回 `ret=0` 只说明请求被受理，
    任务仍可能终态 `status=30 generate_failed`，**而且照样计费**。
    ⇒ 判成败**只看 `task.status`**，不看 `ret`。（细节修复就是这么白花 2×16 积分的。）
-2. 🔴 **别按名字选工具。** `pro-hd`（"智能超清"）91 积分只出 2160²，
-   而 `hd`（"超清"）9 积分出 4096²。
+2. 🔴 **别按名字选工具。** `hd`（"超清"）**实测免费**、出 **4096²**；
+   而 `pro-hd`（"智能超清"）只出 2160² 且**未测单价**（旧 forecast 报 91，
+   实测高估 4~12 倍，别信）。名字里的"更高级"是错觉。
+   ⚠️ 同族还有个**按模型换价**的坑：`jimeng-t2i` 的能力级单价是 **0（Lite 口径）**，
+   但换上游模型就换价 —— Flash **实测 3/张**、Pro **实测 8/张**。
+   按模型的实测价看 `/v1/models` 里 `jimeng-t2i` 的 `upstream_models`。
 3. 🔴 **别用经验值替代可读的服务端数据。** 张数上界曾按"用户经验 1–4"写死成 4，
    而服务端声明默认模型是 **1..8**。现在运行期零成本读 `get_common_config`。
 
@@ -272,14 +291,17 @@ python scripts/e2e.py --cookie-file … --phases generate \
 
 | 阶段 | 花积分 | 做什么 |
 |---|---|---|
-| `models` | ❌ | `/async/v1/models` 契约自检 |
+| `models` | ❌ | `/v1/models` 契约自检 |
 | `accept` | ❌ | `POST` 受理并断言**只回一个 task_id**（协调器没启 ⇒ 零上游往返） |
 | `upload` | ❌ | **真打上游**跑火山 ImageX 四段式 + `get_image_by_uri` 免费验真 + 缓存命中 |
 | `dry` | ❌ | `submit(dry_run=True)` 走完草稿构造与张数吸附，**不发请求** |
 | `generate` | 🔴 | 真建任务 + 轮询到终态，**必须 `--allow-real-submit`** |
 
 `generate` 单独隔出来，是因为建任务是**计费动作**，且即梦**失败了也照样扣积分**。
-实测单价：`hd` 9 · `outpaint` 28 · `i2i` 40 · `t2i` 44 · `pro-hd` 91。
+单价**不写死在这里** —— 由 `generate` 阶段现读 `/v1/models` 的
+`credits_measured`（`null` = 未实测，**不等于免费**）。
+（原先这里抄的是上游 `forecast_generate_cost`：`hd` 9 · `outpaint` 28 · `i2i` 40 ·
+`t2i` 44 · `pro-hd` 91 —— 实测**高估 4~12 倍**，已作废。）
 
 ### 接线门禁（`tests/test_wiring.py` + `ruff.toml`）
 

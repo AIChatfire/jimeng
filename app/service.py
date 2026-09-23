@@ -32,6 +32,7 @@ from . import models
 from .config import Settings
 from .errors import (
     AdapterError,
+    CapabilityNotWiredError,
     CapabilityUnavailableError,
     ContentPolicyError,
     InvalidParameterError,
@@ -72,6 +73,20 @@ from .upstream.jimeng.capabilities import ModelConfigCache
 from .upstream.jimeng.client import CODES_SECURITY
 
 log = logging.getLogger(__name__)
+
+#: `Service._submit` **认得的能力名** —— 唯一真相，门禁拿它对照能力注册表。
+#:
+#: 为什么要有这张表：能力在 `models.CAPABILITIES` 里注册、受理也通，**但 `_submit`
+#: 没有对应分支**时，任务会在派发那一刻炸——而这条路径此前表现为一个
+#: "上游不可用·可重试"的假象（见 `CapabilityNotWiredError`）。
+#: 现在 `tests/test_video.py::test_every_capability_has_a_submit_route` 直接对照：
+#: 注册表里出现新名字而这里没跟上 ⇒ 当场红。
+SUBMIT_ROUTES: frozenset[str] = frozenset({
+    "t2i", "i2i", "hd", "pro-hd", "outpaint",   # 图片族（后三者走后编辑族分支）
+    "detail-fix",
+    "t2v", "t2v-fast", "t2v-pro",               # 三者共用一条路径（T2V_VARIANTS）
+    "vfi", "omni-video",
+})
 
 #: 受理请求允许的字段。
 ACCEPTED_FIELDS = frozenset({
@@ -267,6 +282,12 @@ UPLOAD_MAX_ATTEMPTS = 3
 #: 一个任务最多**自动续生成**几次（action=2）。硬封顶：续生成是计费动作，
 #: 不能让它变成无底洞；到顶就退回「用成功的图补齐」并如实写明。
 CONTINUE_MAX = 3
+
+#: 同步接口（`POST /v1/images/generations`）等待终态时的**库轮询间隔**（秒）。
+#: 0.5s ⇒ 任务完成后最多再等半秒就被调用方看到；300s 预算下最多 600 次
+#: 主键查询（PG 上微秒级，代价可忽略）。刻意不做成配置项：它是纯效率参数，
+#: 多一个旋钮就多一份"以为调了会生效"的假配置面。
+SYNC_WAIT_POLL_INTERVAL = 0.5
 
 
 class Service:
@@ -792,26 +813,23 @@ class Service:
 
     # ------------------------------------------------------------------ 查询
 
-    def get_for_credential(self, task_id: str, credential: str | None) -> TaskRecord:
-        """按 id 取任务。
+    def get_for_credential(self, task_id: str, credential: str) -> TaskRecord:
+        """按 id 取任务 —— **内部映射：API Key 指纹 → 任务归属**。
 
-        · `credential` 给了 ⇒ 走**属主校验**（取不到一律 404，见 `get_scoped`）；
-        · `credential is None` ⇒ **只按 id 取（免鉴权读）**。
+        `credential` **必填**（2026-09-23 收紧）：走 `store.get_scoped()`，
+        取不到一律 404。此前允许 `None`（"免鉴权读、只按 id 取"），
+        由 HTTP 层在"没带 Authorization"时传入；那条放宽口径已取消，
+        这里也就不再保留那个分支 —— 留着就是一条**没有 HTTP 入口却仍然存在**的活口子，
+        将来有人把某个 GET 的依赖改回可选就会静默复现。
 
-        🔴 为什么 `None` 可以放行：`task_id` 是 128 位随机（`jimeng_<uuid4 hex>`），
-        **不可猜**，而且**只在受理时返回给带 Key 的调用方** ⇒ id 本身就是凭据
-        （调用方能把这个链接直接分享出去）。
-
-        ⚠️ 这是**刻意放宽**的边界，所以另外两处**不放宽**：
-        `delete_for_credential` 与 `list_for_credential` 仍然强制鉴权 ——
-        否则拿到一个 id 的人可以删任务、或枚举别人的任务。
+        ⚠️ "不存在"与"不属于当前 Key"**刻意合并成同一个 404**：
+        区分开就等于告诉别人"这个 id 是存在的"，那正是枚举的前置条件。
 
         🔴 **本地拦，不问上游**：放行到上游就是用错的钥匙去查，
         返回的 404/空**无法区分**"任务真没了"与"钥匙不对"，
         而且把跨凭证隔离交给了别人的实现去兜。
         """
-        rec = (self.store.get_scoped(task_id, credential) if credential
-               else self.store.get(task_id))
+        rec = self.store.get_scoped(task_id, credential)
         if rec is None:
             raise TaskNotFoundError(
                 f"任务 {task_id} 不存在，或不属于当前 API Key。")
@@ -848,6 +866,38 @@ class Service:
                       for r in recs],
             "total": len(recs),
         }
+
+    # ------------------------------------------------------------------ 同步等待
+
+    def wait_terminal(self, task_id: str, credential: str, *,
+                      max_wait: float) -> TaskRecord:
+        """在 `max_wait` 预算内等待任务到**终态**；超预算就返回当时的记录。
+
+        🔴 这是同步接口（`POST /v1/images/generations`）的等待实现 ——
+        它**只查本地库**，从不直接驱动上游：任务的推进始终由协调器线程做
+        （见 `coordinator.py` 的模块 docstring，建任务是计费动作，必须走闸门），
+        等待方只是把"调用方原本要做的多次轮询"折叠进一个 HTTP 请求里。
+
+        返回**超时时的记录**而不是抛错：预算耗尽不是错误、是降级信号 ——
+        调用方按 `view()` 的 202 语义处理（拿 `task_id` 转异步轮询）；
+        任务也**不会**被取消（上游没有取消端点，它本来就在继续跑）。
+
+        前提：有推进者在跑（`Coordinator.running`）—— HTTP 层在进来之前
+        已经断言过；没有推进者时等满预算也是白等，那里会快速 503。
+        """
+        t0 = time.monotonic()
+        deadline = t0 + max_wait
+        while True:
+            rec = self.get_for_credential(task_id, credential)
+            remaining = deadline - time.monotonic()
+            if rec.terminal or remaining <= 0:
+                # 终态与"预算耗尽"合并成同一个返回点：两者对调用方都是
+                # "拿去用 `view()` 看"——区别只在 200 还是 202。
+                OBS.info("sync wait finished", task_id=task_id, status=rec.status,
+                         waited_s=round(time.monotonic() - t0, 3),
+                         timed_out=not rec.terminal)
+                return rec
+            time.sleep(min(SYNC_WAIT_POLL_INTERVAL, remaining))
 
     # ------------------------------------------------------------------ 推进
 
@@ -1269,9 +1319,12 @@ class Service:
                 rec.prompt, model=model_key, size=size, count=rec.n or 1,
                 negative_prompt=rec.negative_prompt, seed=rec.seed,
                 count_options=opts)
-        elif cap.name == "t2v":
-            # 文生视频：模型与计费档位由 client.submit_video 按白名单定，
+        elif cap.name in models.T2V_VARIANTS:
+            # 文生视频族（t2v / t2v-fast / t2v-pro）：三者**提交路径完全相同**，
+            # 只差 `video_model`；模型与计费档位由 client.submit_video 按白名单定，
             # 张数恒 1（草稿无 gen_option，受理时已降级留痕）。
+            # 🔴 别写成 `cap.name == "t2v"` —— 那样新变体会掉进后编辑族分支
+            # 并在 `jimeng_tool` 上炸（见 models.T2V_VARIANTS 的注释）。
             sid = self.client.submit_video(
                 rec.prompt,
                 model=cap.video_model or DEFAULT_VIDEO_MODEL,
@@ -1355,15 +1408,22 @@ class Service:
             opts = self.cfg.count_options(DEFAULT_MODEL) if self.cfg else None
             sid = self.client.blend(rec.prompt, image_uris=image_uris, size=size,
                                     count=rec.n or 1, count_options=opts)
-        else:
+        elif cap.jimeng_tool:
             # 后编辑族（hd / pro-hd / outpaint）：上游用单个 `origin_image` 承载输入图，
             # 但**张数同样是 `abilities.gen_option.gen_count`**（组件级字段）⇒ 一并传。
-            assert cap.jimeng_tool
             assert len(image_uris) == 1, "后编辑族只接受 1 张输入图（受理时已校验）"
             opts = self.cfg.count_options(DEFAULT_MODEL) if self.cfg else None
             sid = self.client.edit(cap.jimeng_tool, image_uri=image_uris[0],
                                    size=size, count=rec.n or 1,
                                    count_options=opts)
+        else:
+            # 🔴 接线遗漏：能力**注册了**、`_submit` 却没有对应分支。
+            # 绝不 `assert`（见 CapabilityNotWiredError 的注释：AssertionError 会被
+            # 当成"上游异常·可重试"，把排障方向带偏，还白涨 attempts）。
+            raise CapabilityNotWiredError(
+                f"能力 {cap.api_id}（{cap.name}）没有提交实现 —— 本服务的接线遗漏，"
+                f"不是上游问题。请补 `Service._submit` 分支，并同步 "
+                f"`models.T2V_VARIANTS` 与 `SUBMIT_ROUTES`。", upstream="jimeng")
         # 客户端侧还可能产生吸附告警（如 t2i 的张数），一并留痕
         extra = [w for w in (self.client.last_warnings or []) if w]
         if extra:

@@ -310,6 +310,7 @@ def _uid() -> str:
 #: `high_aes_general_v50`（默认模型）服务端声明的是 **1..8** ——
 #: 教训是**别用经验值替代可读的服务端数据**。
 COUNT_OPTIONS_BY_MODEL: dict[str, tuple[int, ...]] = {
+    "high_aes_general_v50_flash": (1, 2, 3, 4),
     "high_aes_general_v50": (1, 2, 3, 4, 5, 6, 7, 8),
     "high_aes_general_v50p_large": (1, 2, 3, 4),
     "high_aes_general_v43": (1, 2, 3, 4, 5, 6, 7, 8),

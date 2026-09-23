@@ -25,8 +25,13 @@ workers = int(os.environ.get("WORKERS", "1"))
 # 就会在启动时炸掉，且**本地跑得好好的**（本地 venv 里那个版本还在）。
 worker_class = "uvicorn_worker.UvicornWorker"
 
-# 上游生成是异步的，单次请求本身很轻（受理即返回），但保险起见留足余量
-timeout = int(os.environ.get("GUNICORN_TIMEOUT", "300"))
+# 🔴 必须**大于**同步接口的等待预算（SYNC_MAX_WAIT，默认 300s）：
+#   同步端点（POST /v1/images/generations，创建+轮询合并）最长阻塞 300s，
+#   若这里等于 300，跑满预算的请求会被 master 判"卡死 worker"杀掉 ——
+#   客户端拿到断连，而我们构造的降级响应（202 + task_id）根本发不出去。
+#   360 = 300 预算 + 60s 余量（响应发送、连接关闭、日志 flush）。
+#   ⚠️ 生产 nginx 侧的 proxy_read_timeout 同样必须 ≥ 300 + 余量。
+timeout = int(os.environ.get("GUNICORN_TIMEOUT", "360"))
 graceful_timeout = 90
 keepalive = 5
 
