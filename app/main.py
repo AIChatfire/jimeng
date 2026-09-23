@@ -8,11 +8,11 @@
 POST   /async/v1/images/generations         受理，只回一个 task_id
 GET    /async/v1/images/generations/{id}    非终态回排队态；终态回 {data, created, usage}
 POST   /v1/images/generations               同步：创建+轮询合并，预算内直接回结果
-GET    /v1/models                           模型清单（OpenAI 形态）
+GET    /v1/models                           模型清单（OpenAI 形态）—— 🔓 免鉴权
 ```
 
 🔴 **前缀即语义**（2026-09-23 起）：`/v1/*` = 同步语义，`/async/*` = 异步任务语义。
-  · `GET /v1/models` —— 同步、无任务语义（OpenAI 风格客户端按惯例探它）；
+  · `GET /v1/models` —— 同步、无任务语义；**免鉴权**（发现性端点，见该路由 docstring）；
   · `POST /v1/images/generations` —— **真同步**生成：创建+轮询合并进一个请求，
     预算内（`SYNC_MAX_WAIT`，默认 300s）直接回最终结果；超预算降级回
     `202 + task_id`，调用方无缝转异步轮询。
@@ -132,9 +132,12 @@ def require_key(request: Request) -> str:
     🔴 **所有业务端点（任何方法）都走它** —— 2026-09-23 收紧了此前的
     "GET 单条任务可不带 Key（`task_id` 即凭据）"放宽口径；门禁已从"只看 GET"
     升级为**全方法**扫描（POST/DELETE 才是会产生费用的写路径），理由见
-    `get_generation` 的 docstring。运维探针 `/healthz` `/readyz` 是**唯一**
-    的不鉴权例外（判活必须无凭据可用），由
-    `tests/test_api.py::test_every_business_route_requires_a_bearer` 钉死。
+    `get_generation` 的 docstring。**不鉴权的例外有两个**：
+      · `/healthz` `/readyz` —— 判活必须无凭据可用；
+      · `/v1/models` —— 发现性端点（2026-09-23 用户指令）：客户端在配置 Key
+        之前就该能探清单（内容不含任何任务/凭据/内部状态）。
+    例外名单由 `tests/test_api.py::test_every_business_route_requires_a_bearer`
+    钉死。
     """
     settings: Settings = request.app.state.settings
     key = _bearer(request)
@@ -473,14 +476,19 @@ def _install_routes(app: FastAPI) -> None:
 
     # ------------------------------------------------------------- 模型
     @app.get("/v1/models")
-    async def list_models(credential: str = Depends(require_key)) -> dict:
-        """本服务对外宣告的能力清单（OpenAI 形态）。**需要 Bearer。**
+    async def list_models() -> dict:
+        """本服务对外宣告的能力清单（OpenAI 形态）。**刻意公开：不需要 Bearer。**
 
         🔴 **清单只有 `/v1/models` 这一条路径**（2026-09-23 起取消了 `/async/v1/models`）。
         它与 `POST /v1/images/generations`（同步生成，创建+轮询合并）同属
         `/v1` 的**同步语义**族；OpenAI 风格的客户端/插件按惯例探的就是
-        `/v1/models`。`/async` 前缀留给异步任务语义（受理/查询/删除），
-        两种语义不混在同一个前缀下。
+        `/v1/models`。
+
+        🔴 **2026-09-23 起不鉴权（用户指令）**：它是**发现性端点**——客户端在
+        配置 Key 之前先探"这服务有什么能力"是常规做法，而且内容只有能力的
+        公开描述（没有任何任务、凭据、内部状态）。**其余端点仍一律要 Bearer**
+        （含全部 GET）。例外名单的钉死处：`tests/test_api.py` 的
+        `test_every_business_route_requires_a_bearer`（`_PUBLIC_PATHS`）。
 
         只列**没有已知缺陷**的能力；刻意缺席的（细节修复）不在这里 ——
         那就是"制造假能力"。

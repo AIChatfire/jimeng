@@ -135,8 +135,8 @@ STS 双检锁 + 内容哈希→uri 缓存 + in-flight 去重（并发同内容 8
 
 | 工具 | `generate_type` | `postedit_param.generate_type` | 实测 |
 |---|---|---|---|
-| 超清 | `normal_hd` | 13 | ✅ 实扣见过 **1**（forecast 报 9），2048² → **4096²** |
-| 智能超清 | `pro_hd` | 35 | ✅ → 2160²（又贵又小）；forecast 报 91，**实扣未测** |
+| 超清 | `normal_hd` | 13 | ✅ 2048² → **4096²**；forecast 报 9，**实扣 0（免费）**（余额差分多次未见变化；旧的"实扣见过 1"系 pro-hd 记录误归，2026-09-23 已核） |
+| 智能超清 | `pro_hd` | 35 | ✅ → 2160²；**实扣 1**（2026-09-22 消耗记录 `智能超清2.0-2k amount=1` + submit_id 归属核实）；forecast 报 91，**高估 91 倍** |
 | 扩图 | `painting` | 8 | ✅ → **4 张** 4000²（张数由上游定）；forecast 报 28，**实扣未测** |
 | 细节修复 | `super_resolution` | 2 | ✅ **item 引用形态 + 免费**（2026-09-20 路 A）；upload 形态 ❌ 两次 failed |
 

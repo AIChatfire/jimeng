@@ -6,7 +6,7 @@
   POST /async/v1/images/generations        受理，只回一个 task_id
   GET  /async/v1/images/generations/{id}   非终态回排队态；终态回 {data, created, usage}
   POST /v1/images/generations              同步：创建+轮询合并（预算内直接回结果）
-  GET  /v1/models                          能力清单（**只有这一条路径**）
+  GET  /v1/models                          能力清单（**只有这一条路径**；免鉴权）
 """
 
 __version__ = "0.1.6"

@@ -12,7 +12,7 @@
 | `POST` | `/async/v1/images/generations` | 🔒 | `202` | 受理，**只回一个 `task_id`** |
 | `GET` | `/async/v1/images/generations/{task_id}` | 🔒 | `202`/`200` | 非终态回排队态；终态回结果 |
 | `POST` | `/v1/images/generations` | 🔒 | `200`/`202`/`503` | **同步**出图：创建+轮询合并（≤300s），见 §0.5 |
-| `GET` | `/v1/models` | 🔒 | `200` | 能力清单（OpenAI 形态）；**只此一条路径** |
+| `GET` | `/v1/models` | 🔓 | `200` | 能力清单（OpenAI 形态）；**只此一条路径**、**免鉴权** |
 | `DELETE` | `/async/v1/images/generations/{task_id}` | 🔒 | `200`/`400` | 删除**已终态**的任务 |
 | `GET` | `/async/v1/images/generations` | 🔒 | `200` | 本 Key 的任务列表 |
 | `POST` | `/async/v1/videos/generations` | 🔒 | `202` | 视频受理（t2v / t2v-fast / t2v-pro） |
@@ -21,7 +21,8 @@
 | `POST` | `/api/v3/contents/generations/tasks` | 🔒 | `200` | 火山方舟门面（创建） |
 | `GET` | `/api/v3/contents/generations/tasks/{id}` | 🔒 | `200` | 火山方舟门面（查询） |
 
-🔒 = **必须** `Authorization: Bearer <key>`（详见 §0.3）。
+🔒 = **必须** `Authorization: Bearer <key>`（详见 §0.3）；
+🔓 = **免鉴权**（刻意公开的发现性端点，仅 `/v1/models`，见 §0.3）。
 
 ### 0.3 鉴权：**所有业务端点都要 Bearer**（2026-09-23 收紧）
 
@@ -35,7 +36,8 @@
 |---|---|---|---|---|
 | 受理 / 列表 / 删除 | `401` | `401` | （列表只回自己的） | ✅ |
 | **查询单条（图片/视频/方舟）** | **`401`** | `401` | **`404`** | ✅ |
-| `GET /v1/models`、`/stats` | **`401`** | `401` | ✅（不分属主） | ✅ |
+| `GET /v1/models` | **`200`（公开）** | `200` | ✅（不分属主） | ✅ |
+| `GET /stats` | **`401`** | `401` | ✅（不分属主） | ✅ |
 
 🔴 **本次收紧的破坏性变更**：查询单条此前是"**`task_id` 即凭据**"（不带 Key 也能读，
 带别人的 Key 也能读）。取消它有两个理由：
@@ -49,17 +51,23 @@
 **"不存在"与"不属于你"刻意合并为同一个 `404`**：区分开就等于告诉别人
 "这个 id 存在"，那正是枚举的前置条件。
 
-**唯一的例外是探活端点**（刻意不鉴权，判活必须无凭据可用）：
-`GET /healthz`（容器 HEALTHCHECK）、`GET /readyz`（编排层判活，会 ping 一次库）。
+**不鉴权的例外有两类**（其余端点一律要 Bearer）：
+1. **探活**（判活必须无凭据可用）：`GET /healthz`（容器 HEALTHCHECK）、
+   `GET /readyz`（编排层判活，会 ping 一次库）。
+2. **发现性端点 `GET /v1/models`** —— 2026-09-23 起**免鉴权**（用户指令）：
+   客户端在配置 Key **之前**先探"这服务有什么能力"是常规做法，内容只有
+   能力的公开描述、不含任何任务/凭据/内部状态。
 运维端点 `GET /stats` **要鉴权**（内容是内部的：闸门计数、DSN 掩码、协调器派发计数）。
 例外名单由 `tests/test_api.py::test_every_business_route_requires_a_bearer`
-钉死（**扫描全部方法** —— 2026-09-23 从"只看 GET"升级：POST/DELETE 才是
-会产生费用的写路径，只盯 GET 是盲区）—— **新加路由忘挂鉴权会当场红**。
+钉死（`_PUBLIC_PATHS` + `PROBE_PATHS`；**扫描全部方法** —— 2026-09-23 从
+"只看 GET"升级：POST/DELETE 才是会产生费用的写路径，只盯 GET 是盲区）
+—— **新加路由忘挂鉴权会当场红**。
 
 ### 0.4 前缀即语义：`/v1/*` = 同步，`/async/*` = 异步（2026-09-23 起）
 
 🔴 **`/async/v1/models` 已取消** —— 请求它会得到 `404`。
-模型清单只有 `GET /v1/models` 这一条路径（**要 Bearer**，与 OpenAI 一致）。
+模型清单只有 `GET /v1/models` 这一条路径（**免鉴权**，2026-09-23 用户指令；
+其余端点仍一律要 Bearer）。
 
 为什么模型清单进 `/v1`：它是**同步、无任务语义**的端点 —— 没有 `task_id`、
 没有轮询、不产生计费。OpenAI 风格的客户端/插件按惯例探的就是 `/v1/models`。
@@ -292,7 +300,8 @@ Content-Type: application/json
 | `negative_prompt` | 否 | 仅文生图生效 |
 
 \* `image` 为空时 `model` 可省；带 `image` 时**必须显式指定** —— 四个能力都能接，
-而它们的单价差可达 10 倍，替你挑等于替你做决定。
+而它们的**实扣并不相同**（hd 0 / i2i 0 / pro-hd 1 积分；outpaint 未对账），
+替你挑等于替你做决定。
 
 ### 关于「认得但做不到」的字段
 

@@ -315,7 +315,7 @@ def test_models_endpoint_lives_only_under_v1(client):
     """模型清单**只在 `/v1/models`**；`/v1` 下只放**同步语义**端点（白名单钉死）。
 
     这条门禁是**双向**的：
-      · `/v1/models` 必须在（且带 Bearer 时 200）；
+      · `/v1/models` 必须在，且**免鉴权也 200**（2026-09-23 起刻意公开）；
       · `/async/v1/models` 必须**不存在** —— 否则有人"顺手加回来"就又成了双前缀，
         两边的文档/门禁/调用方认知会重新分叉。
     反向断言：`/v1` 下只允许白名单里的端点。生成/查询/删除的**异步**语义
@@ -326,6 +326,12 @@ def test_models_endpoint_lives_only_under_v1(client):
     """
     ok = client.get("/v1/models", headers=AUTH)
     assert ok.status_code == 200, ok.text
+    # 🔓 2026-09-23 用户指令：免鉴权。不带任何凭据也必须 200，且内容与带 Key 一致 ——
+    # 它是发现性端点，客户端要在配置 Key 之前先探"这服务有什么能力"。
+    anon = client.get("/v1/models")
+    assert anon.status_code == 200, \
+        f"/v1/models 应免鉴权（发现性端点），实得 {anon.status_code}"
+    assert anon.json() == ok.json(), "带不带 Key 拿到的清单必须一致"
 
     gone = client.get("/async/v1/models", headers=AUTH)
     assert gone.status_code == 404, \
@@ -345,23 +351,32 @@ def test_models_endpoint_lives_only_under_v1(client):
 _FRAMEWORK_ROUTES = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect",
                                "/redoc"})
 
+#: 🔓 **刻意公开的业务端点**（不挂 `require_key`）—— 2026-09-23 用户指令：
+#: `/v1/models` 是**发现性端点**（客户端在配置 Key 之前先探"这服务有什么能力"
+#: 是常规做法），内容只有能力的公开描述、不含任何任务/凭据/内部状态。
+#: ⚠️ 往这里加东西 = 对公网免鉴权，每一项都必须有一个说得出口的理由。
+_PUBLIC_PATHS = frozenset({"/v1/models"})
+
 
 def test_every_business_route_requires_a_bearer(client):
-    """🔴 **所有业务端点（任何方法）都必须挂 `require_key`** —— 唯一例外是探活端点。
+    """🔴 **所有业务端点（任何方法）都必须挂 `require_key`** —— 例外 = 探活 + 白名单。
 
     为什么要有这条**结构性**门禁（而不是只测几条具体路径）：靠人记着"新加路由
     时别忘了挂依赖"是记不住的。2026-09-23 收紧鉴权时就是这个原因暴露出来的 ——
     查单条的 GET 一直是"可选鉴权"（`task_id` 即凭据），`/v1/models` 与 `/stats`
     更是**完全开放**，而公网入口就是 80 端口。
 
-    🔴 本次从"只看 GET"升级到**全方法**：新增的同步生成端点
+    🔴 从"只看 GET"升级到**全方法**：新增的同步生成端点
     （`POST /v1/images/generations`）不在旧的扫描面里 —— 只盯 GET 的门禁，
     对 POST/DELETE/PUT 全是盲区，而它们才是会产生费用的写路径。
     判据只认路由级依赖表里有 `require_key`。
 
-    探活例外：`/healthz`（容器 HEALTHCHECK）与 `/readyz`（编排层判活）
-    必须在**没有任何凭据**时可用 —— 判活失败要说清是服务的问题，
-    不能因为"没带 Key"而看起来像挂了。
+    两类例外：
+      · **探活**：`/healthz`（容器 HEALTHCHECK）与 `/readyz`（编排层判活）
+        必须在**没有任何凭据**时可用 —— 判活失败要说清是服务的问题，
+        不能因为"没带 Key"而看起来像挂了；
+      · **白名单**（`_PUBLIC_PATHS`）：`/v1/models` 是发现性端点，刻意公开
+        （2026-09-23 用户指令）。
     """
     from app.observability import PROBE_PATHS
 
@@ -374,7 +389,8 @@ def test_every_business_route_requires_a_bearer(client):
         methods = set(getattr(route, "methods", []) or ())
         if not path.startswith("/") or not methods:
             continue
-        if path in PROBE_PATHS or path in _FRAMEWORK_ROUTES:
+        if path in PROBE_PATHS or path in _FRAMEWORK_ROUTES \
+                or path in _PUBLIC_PATHS:
             continue
         dep = getattr(route, "dependant", None)
         if dep is None:

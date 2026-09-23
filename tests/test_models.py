@@ -24,15 +24,17 @@ def test_no_image_defaults_to_t2i_unambiguously():
 def test_with_image_refuses_to_guess():
     """带图时四个能力都能接 ⇒ **必须报错**，不能替调用方挑。
 
-    它们的单价差可达 10 倍（hd 9 / outpaint 28 / i2i 40 / pro-hd 91），
+    它们的花费并不相同（实扣：hd 0 / i2i 0 / pro-hd 1；outpaint 未对账），
     挑错等于替调用方做了他没做的决定。
+    ⚠️ 消息里的量级必须是**实扣口径**（曾误用 forecast 的 9 / 28 / 40 / 91）。
     """
     with pytest.raises(InvalidParameterError) as e:
         resolve(None, has_image=True)
     msg = e.value.message
     for api_id in ("jimeng-i2i", "jimeng-hd", "jimeng-pro-hd", "jimeng-outpaint"):
         assert api_id in msg, f"错误信息里必须列出候选，缺 {api_id}"
-    assert "9" in msg and "91" in msg, "应给出单价量级，让人知道选择的代价"
+    assert "实扣" in msg and "pro-hd 1" in msg, \
+        "应给出**实扣**量级（forecast 不许进对外消息），让人知道选择的代价"
 
 
 @pytest.mark.parametrize("written,expect", [
@@ -240,6 +242,30 @@ def test_every_capability_has_measured_credits_where_claimed():
         f"Lite 上实测免费的应如实报 0，实得 {free}"
     for c in CAPABILITIES:
         assert c.notes, f"{c.api_id} 缺少依据说明"
+
+
+def test_credits_measured_reflects_actual_charges_not_forecasts():
+    """🔴 单价字段只放**实扣**（记录 / 余额差分核实），forecast 预报一律不进字段。
+
+    2026-09-23 修正（两处历史混淆）：
+      · `jimeng-hd` 曾被记成"实扣 1"—— 复核发现那条 `amount=1` 的消耗记录
+        （`智能超清2.0-2k`）经 submit_id 归属核实属于 **pro-hd** ⇒ hd 维持
+        "实扣 0（免费）"，pro-hd 从"未测"升级为**实扣 1**。
+      · `jimeng-t2v` 的 notes 早已写明"实扣 24"（2026-09-20 三证），
+        但字段一直是 `None` ⇒ 本次回填。
+    ⇒ 本用例把四个"容易被 forecast 再次污染"的点钉死。
+    """
+    by = {c.api_id: c for c in CAPABILITIES}
+    assert by["jimeng-hd"].credits_measured == 0, \
+        "hd 实扣 0（免费）；勿按回执 forecast 9 改"
+    assert by["jimeng-pro-hd"].credits_measured == 1, \
+        "pro-hd 实扣 1（9-22 消耗记录 + submit_id 归属核实）"
+    assert by["jimeng-outpaint"].credits_measured is None, \
+        "outpaint 实扣未对账 ⇒ 保持 None（None ≠ 免费，更 ≠ forecast 28）"
+    assert by["jimeng-t2v"].credits_measured == 24, "t2v 实扣 24（9-20 三证对账）"
+    for api_id in ("jimeng-hd", "jimeng-pro-hd", "jimeng-outpaint", "jimeng-t2v"):
+        assert ("forecast" in by[api_id].notes) or ("预报" in by[api_id].notes), \
+            f"{api_id} 的 notes 必须点明 forecast/预报口径（防再被当实扣）"
 
 
 def test_new_upstream_model_flash_is_registered_with_declared_count_options():

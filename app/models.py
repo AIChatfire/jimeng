@@ -21,8 +21,8 @@
 没写 `model` 时：
   · 无输入图 → 只有 `jimeng-t2i` 能接 ⇒ 默认它；
   · 带输入图 → `i2i` / `hd` / `pro-hd` / `outpaint` 四个都能接 ⇒ **明确报错**，
-    而不是随便挑一个。挑错等于替调用方做了他没做的决定，而**每个决定的花费差 10 倍**
-    （实测：`hd` 9 积分 / `outpaint` 28 / `i2i` 40 / `pro-hd` **91**）。
+    而不是随便挑一个。挑错等于替调用方做了他没做的决定，而**各家的花费并不相同**
+    （实扣：`hd` 0 / `i2i` 0 / `pro-hd` 1 积分；`outpaint` 未对账）。
 """
 from __future__ import annotations
 
@@ -274,34 +274,39 @@ CAPABILITIES: tuple[Capability, ...] = (
               "（描述要怎么改）——这是它与后编辑三工具的关键区别。"
               "支持**多张垫图**（最多 4 张，超出会明确报错）。"
               "支持**指定张数** `n`（走 `abilities.gen_option.gen_count`）。"
-              "⚠️ 实测**积分与张数不成正比**：n=1 实测 59 积分、n=4 实测 55 积分，"
-              "所以别按「张数 × 单价」估算成本。",
+              "⚠️ 上游**预报**积分与张数不成正比：n=1 报 59 / n=4 报 55 —— 那是 "
+              "`forecast`（高估口径），**实扣为 0**（免费，账号所有者确认）⇒ "
+              "别把预报当账单，也别按「张数 × 单价」估算成本。",
     ),
     Capability(
         key="jimeng:hd", name="hd", title="超清（SuperDefinition）",
         accepts_image=True, image_required=True, prompt_required=False,
         jimeng_tool="normal_hd", credits_measured=0,
-        notes="实测 2048×2048 → **4096×4096**，**9 积分**。同一族里最便宜的，"
-              "且出图最大 —— 别按名字选工具。",
+        notes="实测 2048×2048 → **4096×4096**；**实扣 0（免费）**"
+              "（余额差分多次未见变化）。回执 forecast 报 9 —— **预报不作数**。"
+              "同一族里最便宜的，且出图最大 —— 别按名字选工具。",
     ),
     Capability(
         key="jimeng:pro-hd", name="pro-hd", title="智能超清（ProHD）",
         accepts_image=True, image_required=True, prompt_required=False,
-        jimeng_tool="pro_hd", credits_measured=None,
-        notes="实测 2048×2048 → **2160×2160**，**91 积分**。"
-              "**又贵又小**（超清 4096 只要 9 积分）。",
+        jimeng_tool="pro_hd", credits_measured=1,
+        notes="实测 2048×2048 → **2160×2160**；**实扣 1 积分**"
+              "（2026-09-22 消耗记录 `智能超清2.0-2k amount=1`，submit_id 归属已核实）。"
+              "回执 forecast 报 91 —— **高估 91 倍**，别拿它算账。"
+              "**又贵又小**（超清 4096 反而免费）。",
     ),
     Capability(
         key="jimeng:outpaint", name="outpaint", title="扩图（OutPaint）",
         accepts_image=True, image_required=True, prompt_required=False,
         jimeng_tool="outpaint", credits_measured=None,
-        notes="实测一次出 **4 张 4000×4000**，**与请求张数无关**（由上游决定），"
-              "按 4 张计费 28 积分。",
+        notes="实测一次出 **4 张 4000×4000**，**与请求张数无关**（由上游决定）。"
+              "⚠️ 回执 forecast 预报 28 积分（按 4 张）—— **实扣未对账**，"
+              "未验证前不报数（字段保持 `None`，`None` ≠ 免费）。",
     ),
     Capability(
         key="jimeng:t2v", name="t2v", title="文生视频（Seedance）",
         accepts_image=False, image_required=False, prompt_required=True,
-        credits_measured=None, media="video",
+        credits_measured=24, media="video",
         video_model="dreamina_seedance_40_mini",
         notes="上游模型 dreamina_seedance_40_mini（网页端 Seedance 4.0 Mini，t2v）。"
               "**✅ 2026-09-20 真跑验证**（114s 出片 1280×720，实扣 24；"
@@ -539,7 +544,7 @@ def resolve(model: str | None, *, has_image: bool,
     raise InvalidParameterError(
         f"未指定 model，且{kind}时本服务有多个能力可选（"
         f"{', '.join(c.api_id for c in cands)}），无法确定用哪个 —— "
-        f"它们的单价差可达 10 倍（hd 9 / outpaint 28 / i2i 40 / pro-hd 91 积分），"
+        f"它们的花费并不相同（实扣：hd 0 / i2i 0 / pro-hd 1 积分；outpaint 未对账），"
         f"故不替你挑。请显式指定 model。",
         param="model")
 

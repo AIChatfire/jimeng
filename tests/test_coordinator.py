@@ -428,7 +428,7 @@ def test_post_edit_family_routes_to_the_right_tool(client, client_state,
                                                    model, expect_tool):
     """后编辑四工具**共享同一端点**，差异只在 `generate_type` 字符串。
 
-    路由选错工具 = 花了 91 积分却以为在做超清（或反之）。
+    路由选错工具 = 按 pro-hd（实扣 1）计费却以为在做超清（hd 实扣 0）（或反之）。
     """
     fake_jimeng.states = [ok_state(["https://cdn/a.png"])]
     data_uri = ("data:image/png;base64,"
@@ -756,14 +756,21 @@ def test_credits_warning_fires_for_unmeasured_capability(client, client_state,
                                                          fake_jimeng, fake_uploader):
     """🔴 **实扣未实测的能力**，任务成功时必须有一条 WARNING（别等翻账单才发现）。
 
-    ⚠️ 这条原先拿 `jimeng-i2i` 当例子（我当时按一条 `amount=12` 的消耗记录把它记成
-    "实扣 12"），但**账号所有者确认 i2i 实际也免费** ⇒ 它已改为 `credits_measured=0`
-    （不告警）。于是"要告警"的样本换成 **`jimeng-pro-hd`（未测 ⇒ 无法排除扣费 ⇒ 报）**。
+    ⚠️ 样本换过两次（每次都是因为"未测"被证伪）：
+      · 最初用 `jimeng-i2i`（当时按一条 `amount=12` 的记录误记"实扣 12"）——
+        账号所有者确认 i2i 免费 ⇒ 改成 0（不再适合当样本）；
+      · 随后用 `jimeng-pro-hd` —— 2026-09-23 查到它的实扣记录
+        （`智能超清2.0-2k amount=1`，submit_id 归属核实到 9-22 的 pro-hd 任务）
+        ⇒ 已改为 `credits_measured=1`（走"实测会扣"分支，仍会报警，
+        但不再是"未测"样本）。
+    **现行样本 = `jimeng-outpaint`**（实扣未对账 ⇒ 无法排除扣费 ⇒ 必须报警）。
+    ⚠️ 区分"未测"（`None`，必须报）与"实测 0"（免费，不报）—— 后者由
+    `test_credits_warning_is_silent_for_measured_free_capability` 守着。
     """
     fake_jimeng.states = [submitted_state(), ok_state(["https://cdn/a.png"])]
     prod = ("https://p26-dreamina-sign.byteimg.com/tos-cn-i-tb4s082cfz/"
             + "7" * 32 + "~tplv-x.png?sig=1")
-    _create(client, model="jimeng-pro-hd", image=[prod])
+    _create(client, model="jimeng-outpaint", image=[prod])
 
     msgs = _capture_warnings(lambda: _tick_until_terminal(client_state))
 

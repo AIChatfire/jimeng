@@ -12,7 +12,7 @@ POST /async/v1/videos/generations        → 202 文生视频（t2v）/ 补帧�
 GET  /async/v1/videos/generations/{id}   → 202 排队态 / 200 {data,created,usage.videos}
 POST /api/v3/contents/generations/tasks  → 200 {"id": …}  火山方舟原生契约门面（视频）
 GET  /api/v3/contents/generations/tasks/{id} → 200 方舟查询形态（queued/running/succeeded/failed）
-GET  /v1/models                          → 能力清单（只此一条路径；/async 那份已取消）
+GET  /v1/models                          → 能力清单（只此一条路径；/async 那份已取消；🔓 免鉴权）
 ```
 
 契约全文见 **[`docs/INTERFACE.md`](docs/INTERFACE.md)**（冻结）；上游契约见
@@ -138,12 +138,15 @@ Application → Cookies → `sessionid`。
   `secret` 首次启动随机生成并存在任务库 `meta` 表 ⇒ **明文 Key 永不落库**。
 - 任务与该指纹绑定：换一把 Key 读/删别人的任务 ⇒ **404，且不发上游请求**（本地拦死）。
 - 🔴 **2026-09-23 收紧：所有业务端点（任何方法）都要 Bearer**，含**全部 GET**
-  （`/v1/models`、任务查询、`/stats`）。此前"查询单条可不带 Key（`task_id` 即凭据）"
+  （任务查询、`/stats`）。此前"查询单条可不带 Key（`task_id` 即凭据）"
   的口径**已取消** —— 可见范围与写/删不一致，且 `task_id` 泄漏即等价于产物泄漏
   （无有效期、无法撤回）。分享产物请用产物 `url`。
-  **唯一例外是探活端点** `/healthz` `/readyz`（判活必须无凭据可用）。
+  **例外有两类**：探活端点 `/healthz` `/readyz`（判活必须无凭据可用）+
+  **发现性端点 `/v1/models`**（2026-09-23 起免鉴权：客户端在配置 Key 之前
+  先探"这服务有什么能力"是常规做法，内容不含任务/凭据）。
   门禁：`tests/test_api.py::test_every_business_route_requires_a_bearer`
-  （扫描**全部方法** —— POST/DELETE 才是会产生费用的写路径，只盯 GET 是盲区）。
+  （`_PUBLIC_PATHS` + 探活名单；扫描**全部方法** —— POST/DELETE 才是会产生费用的
+  写路径，只盯 GET 是盲区）。
 
 **上游（本服务 → 即梦）**
 
