@@ -11,11 +11,13 @@
 本服务的上游是**即梦网页协议**（sessionid，免费/低价额度），不是方舟。
 门面只对齐**契约形态**，计费与能力边界都是即梦侧的：
 
-· 模型名 `doubao-seedance-*` → 映射到 `jimeng-t2v`（即梦 Seedance 4.0 Mini），
-  **降级留痕**（请求的模型 ≠ 实际服务的模型，必须让调用方看见）；
-· `content[]`：`text` ⇒ 文生视频（t2v）；带 `image_url`/`video_url`/`audio_url`
-  ⇒ 翻译成即梦**全能参考**（omni_reference，material_list+meta_list）——
-  方舟的角色语义（first_frame 等）不逐一对应，降级留痕；
+· 模型名 `doubao-seedance-*` → **按档位保守分流**（`ARK_MODEL_ROUTES`：
+  2.0 mini→t2v / 2.0 fast→t2v-fast / 2.0 标准档→t2v-pro / 2.5→2.5 样片；
+  未识别的方舟名按默认档 t2v 兜底），每条映射在 `degradations`
+  **响亮留痕**（请求的模型 ≠ 实际服务的模型，必须让调用方看见）；
+· `content[]`：`text` ⇒ 按模型分流；带 `image_url`/`video_url`/`audio_url`
+  ⇒ 翻译成即梦**全能参考**（jimeng-omni-video，omni_reference，
+  material_list+meta_list）—— 素材语义覆盖模型分流，同样留痕；
 · `ratio "adaptive"` → 16:9 降级留痕；
 · `duration`/`resolution` 过即梦计费档位白名单（720p×4s/5s）；
 · `watermark` / `generate_audio` / `return_last_frame` / `callback_url` /
@@ -38,10 +40,27 @@ from typing import Any
 from .errors import InvalidParameterError
 from .store import TaskRecord
 
-#: 方舟模型名前缀 → 本服务能力。`doubao-seedance-*` 全家都映射到 t2v
-#: （即梦侧实际服务的模型以 `degradations` 说明为准）。
+#: 方舟模型名前缀 → 本服务能力（**保守分流**，2026-09-24 起）。
+#:
+#: 🔴 不再"全家降级到同一个 t2v"——Seedance 本身是全能参考模型，
+#: 各档位是**独立计费的链路**，映射错了等于替调用方换档。对齐依据 =
+#: 即梦侧 key 实读（docs/UPSTREAM.md §16）：2.0 mini=`40_mini`、
+#: 2.0 Fast VIP=`40_vision`、2.0 VIP=`40_pro_vision`、2.5=`45_pro_draft`。
+#: 方舟与即梦计费体系独立（token vs 积分），每条映射都在 `degradations`
+#: **响亮留痕**，实际服务的模型以留痕说明为准。
 ARK_MODEL_PREFIX = "doubao-seedance"
-ARK_TARGET_MODEL = "jimeng-t2v"
+ARK_DEFAULT_MODEL = "jimeng-t2v"
+ARK_MODEL_ROUTES: tuple[tuple[str, str, str], ...] = (
+    # (方舟名前缀, 本服务能力, 留痕里的即梦侧说明)
+    ("doubao-seedance-2-0-mini", "jimeng-t2v",
+     "即梦 Seedance 2.0 mini（720p × 4s/5s）"),
+    ("doubao-seedance-2-0-fast", "jimeng-t2v-fast",
+     "即梦 Seedance 2.0 Fast（720p × 5s，与方舟 fast 档同源）"),
+    ("doubao-seedance-2-0", "jimeng-t2v-pro",
+     "即梦 Seedance 2.0 VIP（720p × 5s，与方舟 2.0 标准档对齐）"),
+    ("doubao-seedance-2-5", "jimeng-t2v-2.5-draft",
+     "即梦 Seedance 2.5 样片（480p × 5s；2.5 正式版 1080p/4~30s 未接入）"),
+)
 
 #: 方舟状态 ⇄ 本服务任务状态。**只映射，不创造**。
 STATUS_TO_ARK: dict[str, str] = {
@@ -75,6 +94,22 @@ _ARK_UNSUPPORTED: dict[str, str] = {
 _ARK_TEXT_TYPES = {"text"}
 
 
+def resolve_ark_model(model: str) -> tuple[str, str]:
+    """方舟模型名 → (本服务能力 api_id, 即梦侧说明)。
+
+    前缀**长者优先**（`doubao-seedance-2-0-fast` 必须判在
+    `doubao-seedance-2-0` 之前，否则 fast 会被标准档吃掉）。
+    """
+    low = (model or "").strip().lower()
+    if low == ARK_DEFAULT_MODEL:
+        return ARK_DEFAULT_MODEL, "即梦 Seedance 2.0 mini（720p × 4s/5s）"
+    for prefix, cap_id, note in ARK_MODEL_ROUTES:
+        if low.startswith(prefix):
+            return cap_id, note
+    return (ARK_DEFAULT_MODEL,
+            "即梦 Seedance 2.0 mini（未识别的方舟模型名按默认档兜底）")
+
+
 def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
     """方舟创建请求 → 本服务视频受理体 + 降级说明。
 
@@ -88,10 +123,10 @@ def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str
         raise InvalidParameterError("缺少 model（如 doubao-seedance-2-0-mini-260615）",
                                     param="model")
     low = model.lower()
-    if not (low == ARK_TARGET_MODEL or low.startswith(ARK_MODEL_PREFIX)):
+    if not (low == ARK_DEFAULT_MODEL or low.startswith(ARK_MODEL_PREFIX)):
         raise InvalidParameterError(
-            f"model {model!r} 本服务不支持。支持的模型：{ARK_TARGET_MODEL}（即梦 "
-            f"Seedance t2v）或任何 doubao-seedance-*（映射到前者，降级留痕）。",
+            f"model {model!r} 本服务不支持。支持的模型：任何 doubao-seedance-*"
+            f"（按档位分流到对应即梦链路）或 {ARK_DEFAULT_MODEL}。",
             param="model")
 
     content = body.get("content")
@@ -100,10 +135,9 @@ def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str
             "content 必须是非空数组（方舟形态：[{type: text, text: ...}, ...]）",
             param="content")
     degradations: list[str] = []
-    if low != ARK_TARGET_MODEL:
-        degradations.append(
-            f"模型 {model} 已映射到 {ARK_TARGET_MODEL}"
-            f"（即梦 Seedance 4.0 Mini，t2v）—— 实际服务的模型以本说明为准。")
+    _, side_note = resolve_ark_model(model)
+    degradations.append(
+        f"model {model} 按「{side_note}」服务 —— 即梦侧实际模型与计费档位以本说明为准。")
     prompt_parts: list[str] = []
     images: list[str] = []
     videos: list[str] = []
@@ -148,7 +182,10 @@ def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str
         raise InvalidParameterError("content 里缺少 text（prompt 不能为空）",
                                     param="content")
 
-    our: dict[str, Any] = {"model": ARK_TARGET_MODEL,
+    # 🔴 `model` **原样保留方舟名**（2026-09-24 用户拍板"全部用方舟 model"）——
+    # 内部能力解析在受理端（Service.create 的视频段）完成，`jimeng-*`
+    # 内部名不出现在门面链路上。
+    our: dict[str, Any] = {"model": model,
                            "prompt": "\n".join(prompt_parts)}
     if images:
         our["image"] = images
@@ -156,7 +193,30 @@ def translate_ark_create(body: dict[str, Any]) -> tuple[dict[str, Any], list[str
         our["video"] = videos
     if audios:
         our["audio"] = audios
-    if images or videos or audios:
+    # 视频生视频（补帧/vfi）的**显式信号**：source_task_id / target_fps。
+    # 方舟契约没有补帧概念，本服务以这两个字段表达"视频生视频 = 插帧"意图；
+    # 受理端据此把请求路由到补帧链路（单 video_url 或直接引用源任务）。
+    if body.get("source_task_id") is not None or body.get("target_fps") is not None:
+        if images or audios or len(videos) > 1:
+            raise InvalidParameterError(
+                "补帧（视频生视频）只接受 1 条 video_url 素材，且不能与 "
+                "image_url / audio_url 混用；引用本服务产物请用 source_task_id。",
+                param="video")
+        our["model"] = "jimeng-vfi"
+        if body.get("source_task_id") is not None:
+            our["source_task_id"] = str(body["source_task_id"])
+            if videos:
+                our.pop("video", None)
+                degradations.append(
+                    "source_task_id 与 video_url 同时给出 ⇒ 以源任务为准，"
+                    "video_url 已忽略。")
+        if body.get("target_fps") is not None:
+            our["target_fps"] = int(body["target_fps"])
+        degradations.append(
+            "source_task_id/target_fps 指定 ⇒ 走**补帧**链路（视频生视频："
+            "插帧到 60fps，内容不变）—— 方舟契约没有补帧概念，这是本服务的"
+            "扩展语义；补帧不重画内容，与全能参考（模仿参考生成新片）不同。")
+    elif images or videos or audios:
         degradations.append(
             f"参考素材已翻译为即梦**全能参考**（{len(images)} 图 / {len(videos)} 视频 / "
             f"{len(audios)} 音频）：方舟的角色语义（first_frame 等）不逐一对应，"
@@ -235,4 +295,5 @@ def ark_task_view(rec: TaskRecord) -> dict[str, Any]:
 
 
 __all__ = ["translate_ark_create", "ark_task_view", "STATUS_TO_ARK",
-           "ARK_MODEL_PREFIX", "ARK_TARGET_MODEL"]
+           "ARK_MODEL_PREFIX", "ARK_DEFAULT_MODEL", "ARK_MODEL_ROUTES",
+           "resolve_ark_model"]

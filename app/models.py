@@ -179,7 +179,7 @@ _UPSTREAM_FAMILY = "t2i"
 #: **正是这么坏的**（注册了、受理也通，一派发就 AssertionError，
 #: 还被误报成"上游不可用 可重试"）—— 这就是"视频从未端到端跑过"的真因。
 #: 现在由 `tests/test_video.py::test_every_capability_has_a_submit_route` 钉住。
-T2V_VARIANTS: frozenset[str] = frozenset({"t2v", "t2v-fast", "t2v-pro"})
+T2V_VARIANTS: frozenset[str] = frozenset({"t2v", "t2v-fast", "t2v-pro", "t2v-2.5-draft"})
 
 
 # ---------------------------------------------------------------------------
@@ -349,6 +349,27 @@ CAPABILITIES: tuple[Capability, ...] = (
               "高估 6.5 倍）。比 t2v-fast（30）贵 **2.3 倍**。",
     ),
     Capability(
+        key="jimeng:t2v-2.5-draft", name="t2v-2.5-draft",
+        title="文生视频·2.5 样片（Seedance 2.5 Draft 480P）",
+        accepts_image=False, image_required=False, prompt_required=True,
+        credits_measured=45, media="video",
+        video_model="dreamina_seedance_45_pro_draft",
+        notes="上游模型 dreamina_seedance_45_pro_draft（网页端 "
+              "『即梦 Seedance 2.5 (样片模式)』，2026-09-24 UI 实读）。"
+              "**✅ 2026-09-24 端到端真跑 + 三证对账**：480p × 5s × 4:3 → "
+              "**实扣 45 积分**（余额差分 + 消耗记录 `Seedance2.5` amount=45 "
+              "+ submit_id 三证吻合；提交包预扣 amount=5 只是占位）。"
+              "提交包与 t2v 同构（aigc_draft/generate），差异："
+              "min_version 3.3.28 / min_features AIGC_Video_Seedance25ResultAction / "
+              "is_draft_mode=true / 计费 benefit_type="
+              "**seedance_25_draft_480p_no_input_video_output**（照抄）。"
+              "样片 = 先出 480P 低清版，网页端确认后升级高清正片（本服务只出样片）。"
+              "⚠️ `dreamina_seedance_45_pro`（2.5 正式版 480p/720p/1080p）"
+              "**刻意未登记**：benefit_type 无提交包依据，按纪律拒绝猜。"
+              "UI 命名对照：2.0 mini=40_mini / 2.0 Fast VIP=40_vision / "
+              "2.0 VIP=40_pro_vision（9-20 的 4.0 Vision 改名，key 未变）。",
+    ),
+    Capability(
         key="jimeng:vfi", name="vfi", title="视频补帧（插帧 insert_frame）",
         accepts_image=False, image_required=False, prompt_required=False,
         credits_measured=None, media="video",
@@ -361,7 +382,8 @@ CAPABILITIES: tuple[Capability, ...] = (
               "提交侧已按 2026-09-20 实抓适配；**端到端实跑未验证**，"
               "结果解析同 t2v（尽力而为）。draft min_version 3.1.0，"
               "父组件为源任务草稿原样重放（实抓里连组件 id 都没变）。"
-              "Ark 方舟契约没有补帧概念 —— 该能力只在 /async/v1/videos 提供。",
+              "Ark 方舟契约没有补帧概念 —— 且 2026-09-24 视频端点收敛到"
+              "方舟门面后，本能力暂无 HTTP 入口（内部链路保留，待补帧入口设计）。",
     ),
     Capability(
         key="jimeng:detail-fix", name="detail-fix", title="细节修复（SuperResolution）",
@@ -516,8 +538,9 @@ def resolve(model: str | None, *, has_image: bool,
                 f"未知 model {raw!r}。{_hint()}", param="model")
         assert cap is not None
         if (cap.media == "video") != video:
-            where = "视频接口 /async/v1/videos/generations" if cap.media == "video" \
-                else "图片接口 /async/v1/images/generations"
+            where = ("方舟视频门面 /api/v3/contents/generations/tasks"
+                     if cap.media == "video"
+                     else "图片接口 /async/v1/images/generations")
             raise InvalidParameterError(
                 f"model {raw!r}（{cap.title}）属于{'视频' if cap.media == 'video' else '图片'}族，"
                 f"请走 {where}。", param="model")
@@ -574,25 +597,39 @@ def _check_shape(cap: Capability, *, raw: str, has_image: bool,
             param="image")
 
 
+#: 🔴 **视频族对外一律方舟模型名**（2026-09-24 用户拍板"全部用方舟 model"）：
+#: `jimeng-t2v` 等内部名退为**路由别名**（受理仍接受，文档不再宣传）。
+#: `jimeng-omni-video` / `jimeng-vfi` 不单列 —— 它们是**请求形态**不是模型
+#: （前者 = 门面 content[] 带素材；后者 = 带 `source_task_id`/`target_fps`）。
+ARK_PUBLIC_MODEL_ID: dict[str, str] = {
+    "jimeng-t2v": "doubao-seedance-2-0-mini-260615",
+    "jimeng-t2v-fast": "doubao-seedance-2-0-fast-260128",
+    "jimeng-t2v-pro": "doubao-seedance-2-0-260128",
+    "jimeng-t2v-2.5-draft": "doubao-seedance-2-5-260628",
+}
+
+
 def catalog() -> list[dict]:
     """`GET /v1/models` 用：本服务对外宣告的模型清单。
 
     ⚠️ 只列**没有已知缺陷**的能力。刻意缺席的（如细节修复 `super_resolution`
     两次 `status=30 generate_failed`）不出现在这里 —— 那就是"制造假能力"。
-    ⚠️ "已端到端验证"与"已适配"是两档：`jimeng-t2v` 提交侧已按实抓适配、
-    但**未端到端实跑**（建任务即计费）—— 它的 notes 里如实写明，
-    调用方自己决定要不要当第一个吃螃蟹的人。
 
-    `upstream_models`（**只有文生图族有**）：本能力接受的**上游模型选项**，
-    每项 `{key, web_name, credits_measured}`。`web_name` 就是即梦 web 面板上的
-    正式名（`Seedream 5.0 Flash` …），**可以直接当 `model` 传**（大小写与
-    `-`/`_`/空格/点 差异都会被归一，见 `_norm_model_name`）。
-    `credits_measured` 是**能力级**实测值，不是按模型分档的单价。
+    🔴 视频族条目的 `id` 是**方舟模型名**（调用方直接当 `model` 传给门面
+    `/api/v3/contents/generations/tasks`）；内部能力名在 `internal_id` 字段
+    留作排查对照。全能参考（带素材）与补帧（source_task_id/target_fps）是
+    方舟门面的**请求形态**，不单列条目。
     """
     out: list[dict] = []
     for c in CAPABILITIES:
+        if c.media == "video":
+            if c.name in ("omni-video", "vfi"):
+                continue          # 请求形态，不单列（见 docstring）
+            public_id = ARK_PUBLIC_MODEL_ID[c.api_id]
+        else:
+            public_id = c.api_id
         item = {
-            "id": c.api_id,
+            "id": public_id,
             "object": "model",
             "created": 0,
             "owned_by": "jimeng",
@@ -603,6 +640,7 @@ def catalog() -> list[dict]:
             "requires_prompt": c.prompt_required,
             "credits_measured": c.credits_measured,
             "notes": c.notes,
+            "internal_id": c.api_id,
         }
         if c.name == _UPSTREAM_FAMILY:
             item["upstream_models"] = [

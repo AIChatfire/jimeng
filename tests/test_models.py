@@ -211,10 +211,16 @@ def test_catalog_hides_deliberately_absent_capabilities():
     # 2026-09-20 引用形态真跑成功后**转正**（免费，两证吻合）。
     assert DELIBERATE_ABSENCES == {}, "缺席必须被显式记录，不是忘了"
     # 五个已端到端验证过的能力都在；t2v/vfi/omni/detail-fix 见各自 notes
-    assert ids == {c.api_id for c in CAPABILITIES}
-    assert len(ids) == 11
-    assert {"jimeng-t2v", "jimeng-t2v-fast", "jimeng-t2v-pro", "jimeng-vfi",
-            "jimeng-omni-video", "jimeng-detail-fix"} <= ids
+    from app.models import ARK_PUBLIC_MODEL_ID
+    expect = {ARK_PUBLIC_MODEL_ID.get(c.api_id, c.api_id) for c in CAPABILITIES
+              if not (c.media == "video" and c.name in ("omni-video", "vfi"))}
+    assert ids == expect
+    assert len(ids) == 10
+    # 🔴 视频族对外用方舟模型名（内部名在 internal_id）；omni/vfi 是请求形态不单列
+    assert {"doubao-seedance-2-0-mini-260615", "doubao-seedance-2-0-fast-260128",
+            "doubao-seedance-2-0-260128", "doubao-seedance-2-5-260628"} <= ids
+    assert not ({"jimeng-t2v", "jimeng-t2v-fast", "jimeng-t2v-pro",
+                 "jimeng-t2v-2.5-draft", "jimeng-omni-video", "jimeng-vfi"} & ids)
 
 
 def test_detail_fix_tool_description_is_kept_for_future_investigation():

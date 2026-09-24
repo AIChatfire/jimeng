@@ -255,16 +255,31 @@ def test_resolve_keeps_image_pool_untouched():
 # ---------------------------------------------------------------------------
 
 
+def _ark(text: str, **extra: Any) -> dict[str, Any]:
+    """方舟门面受理体：content[] + 可选档位字段（2026-09-24 起视频唯一入口）。
+
+    🔴 方舟契约 `model` **必填**（缺了门面当场 400）—— 默认带 mini 档。
+    """
+    body: dict[str, Any] = {"model": "doubao-seedance-2-0-mini-260615",
+                            "content": [{"type": "text", "text": text}]}
+    body.update(extra)
+    return body
+
+
+ARK_CREATE = "/api/v3/contents/generations/tasks"
+
+
 def test_video_accept_and_dispatch(app_and_client, fake_jimeng, client_state):
-    """受理 → 协调器派发：假上游收到 submit_video，参数透传正确。"""
+    """门面受理 → 协调器派发：假上游收到 submit_video，参数透传正确。"""
     _, client, _ = app_and_client
-    r = client.post("/async/v1/videos/generations", headers=AUTH,
-                    json={"prompt": "一只猫在跳舞", "resolution": "720p",
-                          "duration": 4, "aspect_ratio": "16:9", "seed": 7})
-    assert r.status_code == 202
+    r = client.post(ARK_CREATE, headers=AUTH,
+                    json=_ark("一只猫在跳舞", model="doubao-seedance-2-0-mini-260615",
+                              resolution="720p", duration=4,
+                              ratio="16:9", seed=7))
+    assert r.status_code == 200
     body = r.json()
-    assert set(body) == {"task_id"}               # 只回一个 id
-    task_id = body["task_id"]
+    assert set(body) == {"id"}                    # 方舟只回一个 id
+    task_id = body["id"]
 
     client_state.coordinator.tick()               # 第 1 轮：建任务
     calls = fake_jimeng.of("submit_video")
@@ -277,74 +292,90 @@ def test_video_accept_and_dispatch(app_and_client, fake_jimeng, client_state):
     assert call["seed"] == 7
     rec = client_state.service.store.get(task_id)
     assert rec.status == "in_progress"
+    # rec.model 存解析后的内部能力（对外查询回 extra_json.ark_model 原样方舟名）
     assert rec.model == "jimeng-t2v"
     assert rec.duration_ms == 4000
     assert rec.aspect_ratio == "16:9"
+    # 分流留痕：方舟名 → 即梦侧档位（不出现内部名）
+    assert any("doubao-seedance-2-0-mini-260615" in d and "mini" in d
+               for d in rec.degradations)
 
 
 def test_video_defaults_and_n_degradation(app_and_client, fake_jimeng, client_state):
     """不传可选参数 ⇒ 取实抓档位；n>1 ⇒ 降级留痕（草稿无张数字段）。"""
     _, client, _ = app_and_client
-    r = client.post("/async/v1/videos/generations", headers=AUTH,
-                    json={"prompt": "x", "n": 3})
-    assert r.status_code == 202
+    r = client.post(ARK_CREATE, headers=AUTH, json=_ark("x"))
+    assert r.status_code == 200
     client_state.coordinator.tick()
     call = fake_jimeng.of("submit_video")[0]
     assert call["resolution"] == "720p"
     assert call["duration_ms"] == 4000
     assert call["aspect_ratio"] == "16:9"
-    rec = client_state.service.store.get(r.json()["task_id"])
+    rec = client_state.service.store.get(r.json()["id"])
     assert rec.n == 1
-    assert any("n=3" in d and "n=1" in d for d in rec.degradations)
+    # n 已无 HTTP 入口（方舟契约没有张数字段），受理层留痕逻辑仍要在：
+    from conftest import KEY_A
+    cred = client_state.service.credential_of(KEY_A)
+    rec2 = client_state.service.create({"prompt": "x", "n": 3},
+                                       credential=cred, video=True)
+    assert rec2.n == 1
+    assert any("n=3" in d and "n=1" in d for d in rec2.degradations)
 
 
 def test_video_rejects_unverified_tier_at_accept(client):
     """没抓包依据的档位在**受理时**就 400 —— 不进队列、不碰上游、不扣积分。"""
-    r = client.post("/async/v1/videos/generations", headers=AUTH,
-                    json={"prompt": "x", "resolution": "1080p"})
+    r = client.post(ARK_CREATE, headers=AUTH,
+                    json=_ark("x", resolution="1080p"))
     assert r.status_code == 400
     assert "抓包" in r.json()["error"]["message"]
 
 
 def test_video_rejects_image_fields_on_video_endpoint_and_vice_versa(client):
-    r = client.post("/async/v1/videos/generations", headers=AUTH,
-                    json={"prompt": "x", "size": "2048x2048"})
-    assert r.status_code == 400
+    # 视频门面：size 不属于方舟契约 → 降级留痕（认得但做不到），不 400
+    r = client.post(ARK_CREATE, headers=AUTH,
+                    json=_ark("x", size="2048x2048"))
+    assert r.status_code == 200
+    # 图片端点带视频字段 ⇒ 依旧 400
     r = client.post("/async/v1/images/generations", headers=AUTH,
                     json={"prompt": "x", "duration": 4})
     assert r.status_code == 400
 
 
 def test_video_end_to_end_success(app_and_client, fake_jimeng, client_state):
-    """派发 → 轮询到成功：响应形状 usage.videos（不是 images）。"""
+    """派发 → 轮询到成功：门面查询返回方舟形态（content.video_url）。"""
     _, client, _ = app_and_client
     fake_jimeng.states = [ok_state(["https://tos.example.com/v.mp4"], cost=4)]
-    r = client.post("/async/v1/videos/generations", headers=AUTH,
-                    json={"prompt": "x"})
-    task_id = r.json()["task_id"]
+    r = client.post(ARK_CREATE, headers=AUTH, json=_ark("x"))
+    task_id = r.json()["id"]
     for _ in range(2):
         client_state.coordinator.tick()
-    r = client.get(f"/async/v1/videos/generations/{task_id}", headers=AUTH)
+    r = client.get(f"{ARK_CREATE}/{task_id}", headers=AUTH)
     assert r.status_code == 200
     payload = r.json()
-    assert payload["data"] == [{"url": "https://tos.example.com/v.mp4"}]
-    assert payload["usage"]["videos"] == 1
-    assert "images" not in payload["usage"]
+    assert payload["status"] == "succeeded"
+    assert payload["content"] == {"video_url": "https://tos.example.com/v.mp4"}
+    assert "forecast_credits" in payload["usage"]
 
 
 def test_models_catalog_lists_video_capability(client):
     r = client.get("/v1/models", headers=AUTH)
-    ids = {m["id"]: m for m in r.json()["data"]}
-    # 三个视频生成能力都在，且**都已经端到端实跑过**（2026-09-23 补齐 fast/pro）
-    for mid in ("jimeng-t2v", "jimeng-t2v-fast", "jimeng-t2v-pro"):
-        assert ids[mid]["media"] == "video"
+    items = {m["id"]: m for m in r.json()["data"]}
+    # 🔴 视频族对外**一律方舟模型名**（2026-09-24 拍板）；omni/vfi 是请求形态不单列
+    for mid in ("doubao-seedance-2-0-mini-260615",
+                "doubao-seedance-2-0-fast-260128",
+                "doubao-seedance-2-0-260128",
+                "doubao-seedance-2-5-260628"):
+        assert items[mid]["media"] == "video"
+        assert items[mid]["id"].startswith("doubao-seedance")
+    assert "jimeng-t2v" not in items
     # 诚实边界写进 notes：实跑记录与**实扣**都要在
-    assert "真跑验证" in ids["jimeng-t2v"]["notes"]
-    assert "2026-09-23 端到端实跑验证" in ids["jimeng-t2v-fast"]["notes"]
-    assert "2026-09-23 端到端实跑验证" in ids["jimeng-t2v-pro"]["notes"]
+    assert "真跑验证" in items["doubao-seedance-2-0-mini-260615"]["notes"]
+    assert "端到端实跑验证" in items["doubao-seedance-2-0-fast-260128"]["notes"]
+    assert "端到端实跑验证" in items["doubao-seedance-2-0-260128"]["notes"]
     # 实扣值必须报成实测（不是 None、也不是 forecast）
-    assert ids["jimeng-t2v-fast"]["credits_measured"] == 30
-    assert ids["jimeng-t2v-pro"]["credits_measured"] == 70
+    assert items["doubao-seedance-2-0-fast-260128"]["credits_measured"] == 30
+    assert items["doubao-seedance-2-0-260128"]["credits_measured"] == 70
+    assert items["doubao-seedance-2-5-260628"]["credits_measured"] == 45
 
 
 # ---------------------------------------------------------------------------
@@ -507,12 +538,17 @@ def test_submit_vfi_dry_run_never_sends():
 
 
 def test_vfi_end_to_end(app_and_client, fake_jimeng, client_state):
-    """t2v 成功 → 用它的产物补帧：引用三件套自动透传给假上游。"""
+    """t2v 成功 → 用它的产物补帧：引用三件套自动透传给假上游。
+
+    🔴 2026-09-24 视频端点收敛到方舟门面后，vfi **没有 HTTP 入口**
+    （方舟契约无补帧概念）—— 受理走 service.create 直调验证内部链路。
+    """
+    from conftest import KEY_A
+
     _, client, _ = app_and_client
     fake_jimeng.states = [_video_ok_state()]
-    r = client.post("/async/v1/videos/generations", headers=AUTH,
-                    json={"prompt": "iphone100"})
-    src_id = r.json()["task_id"]
+    r = client.post(ARK_CREATE, headers=AUTH, json=_ark("iphone100"))
+    src_id = r.json()["id"]
     for _ in range(2):
         client_state.coordinator.tick()               # 源任务到 success
     src = client_state.service.store.get(src_id)
@@ -520,13 +556,12 @@ def test_vfi_end_to_end(app_and_client, fake_jimeng, client_state):
     assert src.images[0]["vid"] == VID and src.images[0]["item_id"] == ITEM_ID
     assert src.upstream_history_id == HIST and src.draft_json
 
-    # 补帧受理：不带 model（source_task_id 即路由到 vfi）、不带 prompt（沿用源）
+    # 补帧受理（service 直调）：source_task_id 即路由到 vfi、prompt 沿用源
     fake_jimeng.states = [_video_ok_state()]
-    r2 = client.post("/async/v1/videos/generations", headers=AUTH,
-                     json={"source_task_id": src_id, "target_fps": 60})
-    assert r2.status_code == 202
-    vfi_id = r2.json()["task_id"]
-    rec = client_state.service.store.get(vfi_id)
+    cred = client_state.service.credential_of(KEY_A)
+    rec = client_state.service.create(
+        {"source_task_id": src_id, "target_fps": 60},
+        credential=cred, video=True)
     assert rec.model == "jimeng-vfi"
     assert rec.prompt == "iphone100"                  # 沿用源任务提示词
     assert any("沿用源视频任务的提示词" in d for d in rec.degradations)
@@ -543,27 +578,27 @@ def test_vfi_end_to_end(app_and_client, fake_jimeng, client_state):
     assert call["source_submit_id"] == "upstream-submit-id-0"
 
 
-def test_vfi_requires_source(app_and_client, client):
-    """不给 source_task_id / 源不存在 / 源未成功 —— 都在受理时 400。"""
-    _, client0, _ = app_and_client
-    r = client0.post("/async/v1/videos/generations", headers=AUTH,
-                     json={"model": "jimeng-vfi", "prompt": "x"})
-    assert r.status_code == 400
-    assert "source_task_id" in r.json()["error"]["message"]
+def test_vfi_requires_source(app_and_client, client_state):
+    """不给 source_task_id / 源不存在 / 源未成功 —— 都在受理时 400（service 层）。"""
+    from conftest import KEY_A
+    from app.errors import AdapterError
 
-    r = client0.post("/async/v1/videos/generations", headers=AUTH,
-                     json={"source_task_id": "jimeng_nope", "prompt": "x"})
-    assert r.status_code == 400
-    assert "不存在" in r.json()["error"]["message"]
+    svc = client_state.service
+    cred = svc.credential_of(KEY_A)
+    with pytest.raises(AdapterError, match="source_task_id"):
+        svc.create({"model": "jimeng-vfi", "prompt": "x"},
+                   credential=cred, video=True)
+
+    with pytest.raises(AdapterError, match="不存在"):
+        svc.create({"source_task_id": "jimeng_nope", "prompt": "x"},
+                   credential=cred, video=True)
 
     # 源任务是排队中的（非 success）⇒ 拒绝
-    r = client0.post("/async/v1/videos/generations", headers=AUTH,
-                     json={"prompt": "src"})
-    src_id = r.json()["task_id"]
-    r = client0.post("/async/v1/videos/generations", headers=AUTH,
-                     json={"source_task_id": src_id})
-    assert r.status_code == 400
-    assert "已成功" in r.json()["error"]["message"]
+    _, client, _ = app_and_client
+    r = client.post(ARK_CREATE, headers=AUTH, json=_ark("src"))
+    src_id = r.json()["id"]
+    with pytest.raises(AdapterError, match="已成功"):
+        svc.create({"source_task_id": src_id}, credential=cred, video=True)
 
 
 # ---------------------------------------------------------------------------
@@ -658,17 +693,22 @@ def test_submit_omni_commerce_amount():
 
 def test_omni_end_to_end(app_and_client, fake_jimeng, fake_uploader,
                          fake_vod, client_state):
-    """视频端点带 video/audio/image 素材 → 路由到全能参考 → 假上传器接线。"""
+    """门面带 image/video/audio 素材 → 素材语义覆盖模型分流 → 全能参考。"""
     _, client, _ = app_and_client
     fake_jimeng.states = [_video_ok_state()]
-    r = client.post("/async/v1/videos/generations", headers=AUTH,
-                    json={"prompt": "用参考视频的构图，图片做首帧",
-                          "image": [IMG_REF], "video": [VID_REF],
-                          "audio": [VID_REF], "duration": 5})
-    assert r.status_code == 202, r.text
-    task_id = r.json()["task_id"]
+    r = client.post(ARK_CREATE, headers=AUTH,
+                    json={"model": "doubao-seedance-2-0-260128", "content": [
+                        {"type": "text", "text": "用参考视频的构图，图片做首帧"},
+                        {"type": "image_url", "image_url": {"url": IMG_REF}},
+                        {"type": "video_url", "video_url": {"url": VID_REF}},
+                        {"type": "audio_url", "audio_url": {"url": VID_REF}},
+                    ], "duration": 5})
+    assert r.status_code == 200, r.text
+    task_id = r.json()["id"]
     rec = client_state.service.store.get(task_id)
+    # rec.model 存受理端解析后的内部能力（对外查询回 extra_json.ark_model 原样方舟名）
     assert rec.model == "jimeng-omni-video"
+    assert any("全能参考" in d for d in rec.degradations)
     client_state.coordinator.tick()
     call = fake_jimeng.of("submit_video_omni")[0]
     mats = call["materials"]
@@ -769,28 +809,32 @@ def test_every_capability_has_a_submit_route():
     assert T2V_VARIANTS <= SUBMIT_ROUTES, "t2v 变体必须共用同一条视频提交路径"
 
 
-@pytest.mark.parametrize("api_id", ["jimeng-t2v", "jimeng-t2v-fast", "jimeng-t2v-pro"])
+@pytest.mark.parametrize("ark_model,api_id", [
+    ("doubao-seedance-2-0-mini-260615", "jimeng-t2v"),
+    ("doubao-seedance-2-0-fast-260128", "jimeng-t2v-fast"),
+    ("doubao-seedance-2-0-260128", "jimeng-t2v-pro"),
+])
 def test_each_t2v_variant_dispatches_with_its_own_video_model(
-        app_and_client, fake_jimeng, client_state, api_id):
-    """三个 t2v 变体走**同一条**提交路径，但各带各的 `video_model`（计费档位按它查）。"""
+        app_and_client, fake_jimeng, client_state, ark_model, api_id):
+    """方舟名分流：各档走**同一条**提交路径，但各带各的 `video_model`（计费按它查）。"""
     from app.models import _BY_API_ID
 
     _, client, _ = app_and_client
-    r = client.post("/async/v1/videos/generations", headers=AUTH,
-                    json={"model": api_id, "prompt": "一只猫在跳舞",
-                          "resolution": "720p", "duration": 5,
-                          "aspect_ratio": "16:9"})
-    assert r.status_code == 202, r.text
+    r = client.post(ARK_CREATE, headers=AUTH,
+                    json=_ark("一只猫在跳舞", model=ark_model,
+                              resolution="720p", duration=5, ratio="16:9"))
+    assert r.status_code == 200, r.text
     client_state.coordinator.tick()
 
     calls = fake_jimeng.of("submit_video")
-    assert len(calls) == 1, f"{api_id} 没走到视频提交路径：{fake_jimeng.calls}"
+    assert len(calls) == 1, f"{ark_model} 没走到视频提交路径：{fake_jimeng.calls}"
     assert calls[0]["model"] == _BY_API_ID[api_id].video_model
     assert calls[0]["resolution"] == "720p"
     assert calls[0]["duration_ms"] == 5000
     assert calls[0]["aspect_ratio"] == "16:9"
-    rec = client_state.service.store.get(r.json()["task_id"])
+    rec = client_state.service.store.get(r.json()["id"])
     assert rec.status == "in_progress", rec.status
+    assert rec.model == api_id
 
 
 def test_unwired_capability_is_reported_as_internal_not_as_upstream(client_state):

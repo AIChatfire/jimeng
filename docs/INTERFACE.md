@@ -15,14 +15,17 @@
 | `GET` | `/v1/models` | 🔓 | `200` | 能力清单（OpenAI 形态）；**只此一条路径**、**免鉴权** |
 | `DELETE` | `/async/v1/images/generations/{task_id}` | 🔒 | `200`/`400` | 删除**已终态**的任务 |
 | `GET` | `/async/v1/images/generations` | 🔒 | `200` | 本 Key 的任务列表 |
-| `POST` | `/async/v1/videos/generations` | 🔒 | `202` | 视频受理（t2v / t2v-fast / t2v-pro） |
-| `GET` | `/async/v1/videos/generations/{task_id}` | 🔒 | `202`/`200` | 视频查询 |
-| `DELETE` | `/async/v1/videos/generations/{task_id}` | 🔒 | `200`/`400` | 删除**已终态**的视频任务 |
-| `POST` | `/api/v3/contents/generations/tasks` | 🔒 | `200` | 火山方舟门面（创建） |
-| `GET` | `/api/v3/contents/generations/tasks/{id}` | 🔒 | `200` | 火山方舟门面（查询） |
+| `POST` | `/api/v3/contents/generations/tasks` | 🔒 | `200` | **视频唯一入口**：火山方舟契约（创建）。按方舟模型名分流档位；带素材走全能参考 |
+| `GET` | `/api/v3/contents/generations/tasks/{id}` | 🔒 | `200` | 火山方舟契约（查询） |
 
 🔒 = **必须** `Authorization: Bearer <key>`（详见 §0.3）；
 🔓 = **免鉴权**（刻意公开的发现性端点，仅 `/v1/models`，见 §0.3）。
+
+> 🔴 **2026-09-24 破坏性变更**：原生 `/async/v1/videos/generations` 三路由
+> （受理/查询/删除）已**整体移除**，视频一律走方舟门面（`POST/GET
+> /api/v3/contents/generations/tasks`）。方舟 `model` **必填**（如
+> `doubao-seedance-2-0-mini-260615`），按名分流到对应即梦档位并在
+> `degradations` 留痕；带素材（image_url/video_url/audio_url）⇒ 全能参考。
 
 ### 0.3 鉴权：**所有业务端点都要 Bearer**（2026-09-23 收紧）
 
@@ -147,17 +150,20 @@ POST /v1/images/generations          Authorization: Bearer <key>
   token 口径，伪造数字等于说谎；预估积分以扩展字段 `usage.forecast_credits`
   给出（仅成功任务）。
 
-### 0.3 全能参考 / 补帧（仅 /async/v1/videos 提供）
+### 0.3 全能参考 / 补帧（方舟门面形态）
 
-**全能参考视频**（`jimeng-omni-video`，带素材即默认路由到它）：
+**全能参考视频**（门面带素材 ⇒ 自动路由到 `jimeng-omni-video`，素材语义覆盖模型分流）：
 
 ```json
 {
-  "prompt": "用参考视频的构图，图片做首帧",  // 必填（指令）
-  "image": ["https://…/a.png"],            // 可选，参考图（走 ImageX）
-  "video": ["https://…/v.mp4"],            // 可选，参考视频（走 VOD → vid）
-  "audio": ["https://…/a.mp3"],            // 可选，参考音频（走 VOD → vid）
-  "resolution": "720p", "duration": 5      // 已实抓档位：720p×4s/5s
+  "model": "doubao-seedance-2-0-260128",       // 方舟名必填；带素材被全能参考覆盖并留痕
+  "content": [
+    {"type": "text", "text": "用参考视频的构图，图片做首帧"},   // 必填（指令）
+    {"type": "image_url", "image_url": {"url": "https://…/a.png"}},  // 可选（走 ImageX）
+    {"type": "video_url", "video_url": {"url": "https://…/v.mp4"}},  // 可选（走 VOD → vid）
+    {"type": "audio_url", "audio_url": {"url": "https://…/a.mp3"}}   // 可选（走 VOD → vid）
+  ],
+  "resolution": "720p", "duration": 5
 }
 ```
 
@@ -167,62 +173,78 @@ POST /v1/images/generations          Authorization: Bearer <key>
   实扣以积分消耗记录为准；
 * 提交侧已按实抓逐字段适配，**端到端实跑未验证**（15.35 积分级）。
 
-**视频补帧**（`jimeng-vfi`）：
-
-```json
-{ "source_task_id": "jimeng_…", "target_fps": 60 }   // model/prompt 可省略
-```
-
-* `source_task_id` 必填：指向本服务一个**已成功的 t2v 任务**（同 API Key）
-  —— 补帧要引用源视频的 `vid`/`item_id`/`origin_history_id`，
-  只有走本服务产物链才拿得到；
-* `prompt` 省略 ⇒ 沿用源任务提示词（降级留痕）；`resolution`/`duration`
-  必须**与源任务一致**（实抓形态是沿用，改档位没有抓包依据）；
-* 提交包计费字段 `amount=0`（UI 口径免费，未对账）；
-* Ark 方舟契约没有补帧概念，该能力不进门面。
-
-| 方法 | 路径 | 状态码 | 用途 |
-|---|---|---|---|
-| `POST` | `/async/v1/videos/generations` | `202` | 受理，**只回一个 `task_id`** |
-| `GET` | `/async/v1/videos/generations/{task_id}` | `202`/`200` | 非终态回排队态；终态回结果 |
-| `DELETE` | `/async/v1/videos/generations/{task_id}` | `200`/`400` | 删除**已终态**的任务 |
-
-受理体：
+**视频生视频 / 补帧**（门面显式信号 ⇒ `jimeng-vfi`）：方舟契约没有补帧概念，
+本服务用 **`target_fps` 或 `source_task_id` 字段**表达"视频生视频 = 插帧"意图：
 
 ```json
 {
-  "model": "jimeng-t2v-fast",     // 可省略（省略即 jimeng-t2v；另有 t2v-pro）
-  "prompt": "一只猫在跳舞",        // 必填
-  "resolution": "720p",           // 可省略，默认 720p（已实抓档位）
-  "duration": 4,                  // 可省略，单位秒，默认 4（已实抓档位）
-  "aspect_ratio": "16:9",         // 可省略，默认 16:9（唯一有实抓样本的比例）
-  "seed": 123                     // 可选整数
+  "model": "doubao-seedance-2-0-260128",       // 方舟名必填；有 vfi 信号即被覆盖
+  "content": [
+    {"type": "text", "text": "把这段视频补到 60fps"},
+    {"type": "video_url", "video_url": {"url": "https://…/v.mp4"}}   // 本地/外部视频
+  ],
+  "target_fps": 60                              // 信号①：插帧目标帧率（默认 60）
 }
 ```
 
-成功响应：`{"data": [{"url": "…mp4"}], "created": …, "usage": {"videos": 1}}`
-—— 量词是 **`usage.videos`**，不是 `images`。
+* 两种形态：**本地视频**（`content[]` 恰好 1 条 `video_url` + `target_fps`，
+  实测档位 720p×4s——resolution/duration 省略让服务取默认）或
+  **引用产物**（`source_task_id` 指向本服务已成功的视频任务，prompt/resolution/
+  duration 沿用源任务）；
+* 补帧**不重画内容**（同一视频插到 60fps），与全能参考（模仿参考生成新片）
+  语义不同——想"模仿参考视频的动作"不要加 `target_fps`；
+* 素材混用（图/音频/多视频）+ vfi 信号 ⇒ 400；留痕说明走的是补帧链路。
 
-视频端点的**硬边界**（与"不猜"纪律一致）：
+**方舟门面受理体**（视频唯一入口；🔴 2026-09-24 起对外**全部方舟模型名**，
+`jimeng-*` 内部名已从清单/文档退场，仅作路由别名兼容）：
 
-* `(model, resolution, duration)` 必须命中**实抓档位白名单**，否则受理时 400
+```json
+{
+  "model": "doubao-seedance-2-0-mini-260615",  // **必填**，按名分流（下表）
+  "content": [{"type": "text", "text": "一只猫在跳舞"}],   // 必填，text 合成 prompt
+  "resolution": "720p",           // 可省略，默认 720p（已实抓档位）
+  "duration": 4,                  // 可省略，单位秒，默认 4（mini 档）
+  "ratio": "16:9",                // 方舟字段名；"adaptive" → 16:9 降级留痕
+  "seed": 123                     // 可选整数；-1 等价未传
+}
+```
+
+成功响应（方舟形态）：`{"id": "jimeng_…", "status": "succeeded",
+"content": {"video_url": "…mp4"}, "usage": {"forecast_credits": …},
+"degradations": [映射留痕]}`。
+
+**方舟模型名 → 即梦档位分流**（每条映射在 `degradations` 响亮留痕；
+依据 = 即梦侧 key 实读，见 `docs/UPSTREAM.md` §16）：
+
+| 方舟 model | 本服务能力 | 即梦侧实际档位 |
+|---|---|---|
+| `doubao-seedance-2-0-mini-*` | `jimeng-t2v` | Seedance 2.0 mini（720p×4s/5s） |
+| `doubao-seedance-2-0-fast-*` | `jimeng-t2v-fast` | Seedance 2.0 Fast（720p×5s） |
+| `doubao-seedance-2-0-*`（其余） | `jimeng-t2v-pro` | Seedance 2.0 VIP（720p×5s） |
+| `doubao-seedance-2-5-*` | `jimeng-t2v-2.5-draft` | 2.5 样片（480p×5s；正式版未接入） |
+| 其它 `doubao-seedance-*` | `jimeng-t2v`（兜底留痕） | 同 mini 档 |
+| （任意方舟名）+ `target_fps`/`source_task_id` | `jimeng-vfi` | 补帧（视频生视频，插帧 60fps） |
+| （任意方舟名）+ 素材素材 | `jimeng-omni-video` | 全能参考（模仿参考生成新片） |
+
+视频的**硬边界**（与"不猜"纪律一致）：
+
+* `(能力, resolution, duration)` 必须命中**实抓档位白名单**，否则受理时 400
   —— `benefit_type`/`amount` 是计费字段，没有抓包依据的档位拒绝构造。
-  已实抓：`t2v`=`720p×{4,5}s`、`t2v-fast`=`720p×5s`、`t2v-pro`=`720p×5s`；
-  ⚠️ **`aspect_ratio` 不在白名单里**（它不参与计费），默认 16:9；
-* 视频草稿**没有张数字段**（实抓确认无 `gen_option`）⇒ `n>1` 按 1 处理
-  并在 `degradations` 留痕；
-* `size` / `image` / `negative_prompt` 不属于视频端点，传了 400；
-* ✅ **三个视频能力都已在 2026-09-23 端到端实跑过**（实扣见下表）。
+  已实抓：`t2v`=`720p×{4,5}s`、`t2v-fast`=`720p×5s`、`t2v-pro`=`720p×5s`、
+  `t2v-2.5-draft`=`480p×5s`；`aspect_ratio` 不在白名单里（不参与计费）；
+* 视频草稿**没有张数字段**（实抓确认无 `gen_option`）⇒ 一次一条；
+* ✅ **四个视频能力中三个已在 2026-09-23/24 端到端实跑过**（实扣见下表）。
 
-### 0.3 视频实测单价（2026-09-23 真跑对账）
+### 0.3 视频实测单价（2026-09-23/24 真跑对账）
 
-档位一律 `720p × 5s × 16:9`；三证吻合 = 余额差分 + 消耗记录 + `submit_id`。
+三证吻合 = 余额差分 + 消耗记录 + `submit_id`。
 
 | 能力 | 上游模型 | 出片 | 实扣 | 回执 forecast | 耗时 |
 |---|---|---|---|---|---|
 | `jimeng-t2v-fast` | `dreamina_seedance_40_vision` | 1280×720 | **30** | 156（高估 5.2×） | 93s |
 | `jimeng-t2v-pro` | `dreamina_seedance_40_pro_vision` | — | **70** | 453（高估 6.5×） | 167s |
 | `jimeng-t2v`（mini） | `dreamina_seedance_40_mini` | 1280×720 | **24**（2026-09-20，4s 档） | 166（高估 ~7×） | 114s |
+| `jimeng-t2v-2.5-draft` | `dreamina_seedance_45_pro_draft` | 480p 样片 | **45**（2026-09-24，两次） | 316（高估 7.0×） | 156s |
 
 ⚠️ 两条口径（都由实测推翻过）：
 

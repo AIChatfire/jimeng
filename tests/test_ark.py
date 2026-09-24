@@ -33,10 +33,11 @@ def test_translate_minimal_create():
         "model": ARK_MODEL,
         "content": [{"type": "text", "text": "一只猫"}],
     })
-    assert our["model"] == "jimeng-t2v"
+    # 🔴 方舟名**原样保留**（内部能力解析在受理端）—— 对外只有方舟 model
+    assert our["model"] == ARK_MODEL
     assert our["prompt"] == "一只猫"
-    # 模型名映射必须降级留痕（请求的 ≠ 实际服务的）
-    assert any("doubao-seedance-2-0-mini-260615" in d and "jimeng-t2v" in d
+    # 分流留痕：方舟名 → 即梦侧实际档位（不出现内部能力名）
+    assert any("doubao-seedance-2-0-mini-260615" in d and "mini" in d
                for d in deg)
 
 
@@ -201,4 +202,50 @@ def test_ark_create_and_poll(app_and_client, fake_jimeng, client_state):
     assert v["status"] == "succeeded"
     assert v["content"]["video_url"] == "https://tos.example.com/v.mp4"
     # 模型映射降级必须在查询里可见
-    assert any("jimeng-t2v" in d for d in v.get("degradations", []))
+    # 模型分流留痕必须在查询里可见（方舟名 → 即梦侧档位说明）
+    assert any("mini" in d for d in v.get("degradations", []))
+
+
+def test_ark_vfi_signal_routes_to_frame_interpolation(app_and_client, fake_jimeng,
+                                                       client_state):
+    """门面 vfi 入口：content[] 带 video_url + target_fps（视频生视频 = 插帧）。
+
+    方舟契约没有补帧概念 —— 本服务以 `source_task_id`/`target_fps` 作为
+    显式信号把请求路由到补帧链路（单视频、内容不变，与全能参考不同）。
+    """
+    from app.upstream.jimeng import GeneratedImage, TaskState
+
+    vid = "v02870g10004danqpu27dld82i49g5r0"
+    vid_ref = "data:video/mp4;base64," + __import__("base64").b64encode(
+        b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom" + b"\x00" * 64).decode()
+
+    def _video_ok() -> TaskState:
+        st = TaskState(submit_id="up-submit-vfi-src", status=50,
+                       status_name="success", finished=True, failed=False, cost=4)
+        st.images = [GeneratedImage(url="https://tos.example.com/v.mp4",
+                                    width=1280, height=720, format="mp4",
+                                    item_id="7687552710358420760", vid=vid,
+                                    note="视频产物")]
+        st.history_record_id = "44854324452620"
+        return st
+
+    _, client, _ = app_and_client
+    fake_jimeng.states = [_video_ok()]
+    r = client.post("/api/v3/contents/generations/tasks", headers=AUTH,
+                    json={"model": ARK_MODEL,
+                          "content": [
+                              {"type": "text", "text": "把这段视频补到 60fps"},
+                              {"type": "video_url",
+                               "video_url": {"url": vid_ref}},
+                          ],
+                          "target_fps": 60})
+    assert r.status_code == 200, r.text
+    rec = client_state.service.store.get(r.json()["id"])
+    assert rec.model == "jimeng-vfi"
+    assert rec.extra_json and "local_video" in rec.extra_json
+    assert any("补帧" in d for d in rec.degradations)
+
+    client_state.coordinator.tick()
+    call = fake_jimeng.of("submit_video_vfi")[0]
+    assert call["target_fps"] == 60
+    assert call["vid"]                              # 本地视频经 VOD 上传 → vid

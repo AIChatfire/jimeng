@@ -296,11 +296,15 @@ def test_wrong_key_is_401(client):
 def test_models_endpoint_lists_only_verified_capabilities(client):
     data = client.get("/v1/models", headers=AUTH).json()
     ids = {m["id"] for m in data["data"]}
-    # jimeng-t2v / jimeng-vfi：已适配（提交侧实抓）但未端到端实跑 —— notes 里如实写明
+    # 🔴 2026-09-24：视频族对外**一律方舟模型名**（内部名退为路由别名，
+    # 只出现在条目的 internal_id 字段）；全能参考/补帧是请求形态不单列。
     assert ids == {"jimeng-t2i", "jimeng-i2i", "jimeng-hd",
-                   "jimeng-pro-hd", "jimeng-outpaint", "jimeng-t2v", "jimeng-vfi",
-                   "jimeng-omni-video", "jimeng-detail-fix",
-                   "jimeng-t2v-fast", "jimeng-t2v-pro"}
+                   "jimeng-pro-hd", "jimeng-outpaint",
+                   "jimeng-detail-fix",
+                   "doubao-seedance-2-0-mini-260615",
+                   "doubao-seedance-2-0-fast-260128",
+                   "doubao-seedance-2-0-260128",
+                   "doubao-seedance-2-5-260628"}
     assert "detail" not in ids, "旧的工具名不对外"
 
 

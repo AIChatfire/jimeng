@@ -8,10 +8,9 @@
 POST /async/v1/images/generations        → 202 {"task_id": "jimeng_…"}     只回一个 id
 GET  /async/v1/images/generations/{id}   → 202 排队态 / 200 {data,created,usage}
 POST /v1/images/generations              → 200 终态体 / 202 降级 / 503     同步：创建+轮询合并（≤300s）
-POST /async/v1/videos/generations        → 202 文生视频（t2v）/ 补帧（vfi + source_task_id）
-GET  /async/v1/videos/generations/{id}   → 202 排队态 / 200 {data,created,usage.videos}
-POST /api/v3/contents/generations/tasks  → 200 {"id": …}  火山方舟原生契约门面（视频）
+POST /api/v3/contents/generations/tasks  → 200 {"id": …}  **视频唯一入口**：火山方舟原生契约
 GET  /api/v3/contents/generations/tasks/{id} → 200 方舟查询形态（queued/running/succeeded/failed）
+POST /async/v1/videos/generations        → （已移除，2026-09-24：视频一律走方舟门面）
 GET  /v1/models                          → 能力清单（只此一条路径；/async 那份已取消；🔓 免鉴权）
 ```
 

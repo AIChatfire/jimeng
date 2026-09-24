@@ -553,3 +553,55 @@ python scripts/dump_video_models.py --all --raw /tmp/cfg.json
 任务表 `images` 列里的视频元素：
 `{url, vid, width, height, format, item_id}`（`parse_task` 尽力而为解析，
 2026-09-23 首次实读到完整形态）。
+
+## 16. 视频模型面板全量侦察（2026-09-24，UI 实读零成本）
+
+方法：bsk 驱动已登录网页端，`/ai-tool/generate/?type=video` 打开"选择模型"面板，
+逐个点选模型后读 `localStorage.dreamina__generator_video_modelKey`
+（**页面自己写的当前模型 key**，不是猜测）；档位来自各模型的参数弹层
+（radiogroup 实读）。**未点生成、零积分消耗**。
+
+### 面板名 → 上游 key → 火山方舟 Model ID 对照
+
+| 即梦面板名（2026-09-24 UI） | 上游 key（UI 实读） | 档位（UI 实读） | 方舟 Model ID（官方文档） | 本服务 |
+|---|---|---|---|---|
+| 即梦 Seedance 2.5 | `dreamina_seedance_45_pro` | 比例 6 档；**480P/720P/1080P**；张数 1–4 | `doubao-seedance-2-5-260628`（480p/720p/1080p，4~30s） | ❌ 未登记 |
+| 即梦 Seedance 2.5 (样片模式) | `dreamina_seedance_45_pro_draft` | 固定 480P 样片，确认后出高清正片；张数 1–4 | （方舟无样片概念） | ❌ 未登记 |
+| 即梦 Seedance 2.0 VIP | `dreamina_seedance_40_pro_vision` | 720P（同 t2v-pro） | `doubao-seedance-2-0-260128`? | ✅ `jimeng-t2v-pro`（实扣 70） |
+| 即梦 Seedance 2.0 Fast VIP | `dreamina_seedance_40_vision` | 720P（同 t2v-fast） | `doubao-seedance-2-0-fast-260128`? | ✅ `jimeng-t2v-fast`（实扣 30） |
+| 即梦 Seedance 2.0 mini | `dreamina_seedance_40_mini` | 720P × 4s/5s（实跑对账） | `doubao-seedance-2-0-mini-260615` | ✅ `jimeng-t2v`（实扣 24） |
+| 即梦 Seedance 2.0 | `dreamina_seedance_40_pro` | 比例 6 档；仅 720P | （疑对齐方舟 2.0 标准档） | ❌ 未登记 |
+| 即梦 Seedance 2.0 Fast | `dreamina_seedance_40` | 比例 6 档；仅 720P | （疑对齐方舟 2.0 fast） | ❌ 未登记 |
+| 即梦 Seedance 1.0 / 1.0 Fast | 未抓到（面板需滚动） | — | `doubao-seedance-1-0-pro-250528` / `-pro-fast-251015` | ❌ 未登记 |
+
+### 三个结论
+
+1. **UI 改版重命名（key 未变）**：9-20 抓包时的"Seedance 4.0 Vision / Pro Vision"
+   现在面板显示为"**Seedance 2.0 Fast VIP / VIP**"，上游 key 仍是
+   `40_vision` / `40_pro_vision` —— 本服务 t2v-fast / t2v-pro 登记继续有效，
+   文档里的"网页端叫 4.0 Vision"要读成旧 UI 名。
+2. **"VIP"是即梦会员通道概念，方舟没有对应档**：面板上非 VIP 的
+   "2.0 Fast"(`40`) / "2.0"(`40_pro`) 是普通通道；与本服务已登记 key 不同。
+3. **对照列带 `?` 的是命名推断**（按方舟档位规则对齐），不是同key实证；
+   方舟按 token 计费、即梦按积分计费，两边计费体系独立。
+
+### 待办（要接 2.5 的前置）
+
+- [x] 2.5 样片提交包补抓（2026-09-24：`aigc_draft/generate` 全量 payload，
+      benefit_type=`seedance_25_draft_480p_no_input_video_output`、预扣 amount=5）
+- [x] 真跑对账计费（2026-09-24 两次：网页端 + 适配器端到端，**均实扣 45**，
+      余额 5831→5786→5741，submit_id 三证吻合）
+- [ ] 1.0 / 1.0 Fast 的 key（面板滚动后实读）
+- [ ] `dreamina_seedance_45_pro`（2.5 正式版）提交包补抓 —— UI 实读
+      480p/720p/1080p 三档（720p 预显 100 积分），benefit_type 未知未登记
+
+### 适配器落地（2026-09-24）
+
+* 新能力 **`jimeng-t2v-2.5-draft`**（`dreamina_seedance_45_pro_draft`，credits_measured=45）：
+  480p × 5s 单档；端到端真跑 156s 出片 success。
+* 提交差异（vs t2v）：`min_version "3.3.28"`、
+  `min_features ["AIGC_Video_Seedance25ResultAction"]`、
+  `video_gen_inputs[0].is_draft_mode: true`、metrics `videoStage:"draft"`。
+* `VIDEO_RESOLUTIONS` 增 `"480p"`（实抓小写）。样片产物 = 480P 低清版，
+  网页端"确认升级高清正片"流程本服务未适配。
+* 探针：`scripts/probe_t2v_25_draft.py`（**计费动作**，跑一次扣 45）。

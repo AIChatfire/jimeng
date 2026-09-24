@@ -29,6 +29,7 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from . import models
+from .ark import resolve_ark_model
 from .config import Settings
 from .errors import (
     AdapterError,
@@ -84,7 +85,7 @@ log = logging.getLogger(__name__)
 SUBMIT_ROUTES: frozenset[str] = frozenset({
     "t2i", "i2i", "hd", "pro-hd", "outpaint",   # 图片族（后三者走后编辑族分支）
     "detail-fix",
-    "t2v", "t2v-fast", "t2v-pro",               # 三者共用一条路径（T2V_VARIANTS）
+    "t2v", "t2v-fast", "t2v-pro", "t2v-2.5-draft",  # 共用一条路径（T2V_VARIANTS）
     "vfi", "omni-video",
 })
 
@@ -412,8 +413,8 @@ class Service:
             misplaced = sorted(set(body) & VIDEO_FIELDS)
             if misplaced:
                 raise InvalidParameterError(
-                    f"字段 {misplaced} 只属于**视频接口** "
-                    f"`/async/v1/videos/generations`（图片接口没有这些参数）。",
+                    f"字段 {misplaced} 只属于**视频请求**（方舟门面 "
+                    f"`/api/v3/contents/generations/tasks`；图片接口没有这些参数）。",
                     param=misplaced[0])
 
         degradations: list[str] = list(preset_degradations or [])
@@ -434,12 +435,21 @@ class Service:
             raise InvalidParameterError("prompt 必须是字符串", param="prompt")
         prompt = (prompt or "").strip()
 
-        #: 🔴 视频端点的默认推导在**这里**定死（resolve 只负责形态校验）：
-        #: 带参考素材（video/audio/图片）⇒ 全能参考；给了 `source_task_id` ⇒ 补帧；
-        #: 否则 ⇒ t2v。不留给"多个候选挑不出"的歧义报错。
+        #: 🔴 视频受理的模型解析（2026-09-24 起对外只有方舟模型名）：
+        #: `doubao-seedance-*` 前缀 ⇒ 方舟语义 —— 带 source_task_id/target_fps ⇒
+        #: 补帧（视频生视频）；带素材 ⇒ 全能参考；否则按方舟名分流到即梦档位。
+        #: `jimeng-*` 内部名仍然直通（内部调用/测试兼容层）。
         has_materials = bool(body.get("video") or body.get("audio")
                              or image)
         eff_model = body.get("model")
+        if video and eff_model \
+                and str(eff_model).lower().startswith("doubao-seedance"):
+            if body.get("source_task_id") or body.get("target_fps") is not None:
+                eff_model = "jimeng-vfi"
+            elif has_materials:
+                eff_model = "jimeng-omni-video"
+            else:
+                eff_model = resolve_ark_model(str(eff_model))[0]
         if not eff_model:
             if video:
                 if has_materials:
@@ -624,8 +634,11 @@ class Service:
                 if local_video_ref:
                     # 本地视频补帧：实测组合仅 720p×4s（源视频 5s 也按 4s 提交
                     # 成功）；改档位没有依据，拒绝。
+                    # 🔴 检查必须用 `duration`（秒）而不是 duration_ms —— 后者
+                    # 在此处尚未赋值（下方 665 行才算），恒 None，之前这条
+                    # 恒 400 的 bug 被 vfi 门面用例首次踩到（2026-09-24）。
                     if resolution != DEFAULT_VIDEO_RESOLUTION \
-                            or duration_ms != 4000:
+                            or duration != 4:
                         raise InvalidParameterError(
                             "本地视频补帧的实测档位是 720p×4s（resolution/"
                             "duration 请省略让服务取默认）。",

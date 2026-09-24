@@ -89,20 +89,7 @@ class GenerationRequest(BaseModel):
     negative_prompt: str | None = None
 
 
-class VideoGenerationRequest(BaseModel):
-    """`POST /async/v1/videos/generations` 的请求体（宽松策略与图片端点一致）。"""
-
-    model_config = ConfigDict(extra="allow")
-
-    model: str | None = Field(default=None, description="能力名，如 jimeng-t2v（留空即默认）")
-    prompt: str | None = Field(default=None, description="提示词（视频必填）")
-    resolution: str | None = Field(default=None, description="分辨率档位（如 720p）")
-    duration: int | None = Field(default=None, description="时长（秒，整数）")
-    aspect_ratio: str | None = Field(default=None, description="画面比例（如 16:9）")
-    n: int | None = Field(default=None, description="条数（视频草稿无张数字段，恒按 1 处理并降级留痕）")
-    seed: int | None = None
-    source_task_id: str | None = Field(default=None, description="jimeng-vfi（补帧）：源视频任务 id")
-    target_fps: int | None = Field(default=None, description="jimeng-vfi：插帧目标帧率（默认 60）")
+# （`VideoGenerationRequest` 已随 `/async/v1/videos` 端点一并移除 —— 2026-09-24）
 
 
 # ---------------------------------------------------------------------------
@@ -401,45 +388,10 @@ def _install_routes(app: FastAPI) -> None:
         本地删掉只会让"还在跑并继续计费"变成看不见的事。"""
         return request.app.state.service.delete_for_credential(task_id, credential)
 
-    # ------------------------------------------------------------- 视频受理
-    @app.post("/async/v1/videos/generations", status_code=202)
-    async def create_video(
-        request: Request,
-        body: VideoGenerationRequest,
-        credential: str = Depends(require_key),
-    ) -> JSONResponse:
-        """受理一次**文生视频**，只回一个 task_id（语义与图片受理完全一致）。"""
-        svc: Service = request.app.state.service
-        rec = svc.create(body.model_dump(), credential=credential, video=True)
-        request.app.state.coordinator.wake()
-        return JSONResponse(
-            status_code=202, content={"task_id": rec.task_id},
-            headers={"Location": f"/async/v1/videos/generations/{rec.task_id}"})
-
-    # ------------------------------------------------------------- 视频查询
-    @app.get("/async/v1/videos/generations/{task_id}")
-    async def get_video(
-        request: Request,
-        task_id: str,
-        credential: str = Depends(require_key),
-    ) -> JSONResponse:
-        """查视频任务（鉴权与属主口径与图片查询完全一致：都要 Bearer）。"""
-        svc: Service = request.app.state.service
-        rec = svc.get_for_credential(task_id, credential)
-        status_code, payload = view(rec)
-        return JSONResponse(status_code=status_code, content=payload)
-
-    # ------------------------------------------------------------- 视频删除
-    @app.delete("/async/v1/videos/generations/{task_id}")
-    async def delete_video(
-        request: Request,
-        task_id: str,
-        credential: str = Depends(require_key),
-    ) -> dict:
-        """删除视频任务（未终态响亮失败 —— 与图片删除同一纪律）。"""
-        return request.app.state.service.delete_for_credential(task_id, credential)
-
     # ------------------------------------------------- Ark 契约门面（方舟形态）
+    # 🔴 2026-09-24 用户拍板：**视频唯一入口 = 方舟门面**。原生
+    # `/async/v1/videos/*` 三路由已整体移除（受理/查询/删除），视频任务
+    # 一律从 `/api/v3/contents/generations/tasks` 进（方舟 SDK 兼容）。
     @app.post("/api/v3/contents/generations/tasks", status_code=200)
     async def ark_create_task(
         request: Request,

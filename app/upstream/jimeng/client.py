@@ -866,9 +866,19 @@ VIDEO_COMMERCE: dict[str, dict[str, tuple[str, tuple[int, ...]]]] = {
     "dreamina_seedance_40_pro_vision": {
         "720p": ("seedance_20_pro_720p_output", (5,)),
     },
+    # ✅ 2026-09-24 实抓 + 三证对账（网页端真跑一次）：
+    #   benefit_type 逐字照抄提交包；**实扣 45**（预扣 amount=5 只是占位，
+    #   再次证明 amount 与实扣无关）。submit_id=59995987-… 见 docs/UPSTREAM.md §16。
+    #   样片模式只有 480p（UI 实读：样片分辨率radiogroup 仅此一档）× 5s。
+    "dreamina_seedance_45_pro_draft": {
+        "480p": ("seedance_25_draft_480p_no_input_video_output", (5,)),
+    },
+    # ⚠️ `dreamina_seedance_45_pro`（2.5 正式版，480p/720p/1080p）**刻意未登记**：
+    #   benefit_type 无提交包依据（网页端正式版还没抓过包）——按纪律拒绝猜。
 }
 #: 分辨率取值（抓包见 720p；1080p 是站点枚举但**无抓包样本**，登记仅供报错提示）。
-VIDEO_RESOLUTIONS: tuple[str, ...] = ("720p", "1080p")
+#: `480p`：2026-09-24 实抓（2.5 样片模式提交包 resolution="480p"，小写）。
+VIDEO_RESOLUTIONS: tuple[str, ...] = ("480p", "720p", "1080p")
 DEFAULT_VIDEO_RESOLUTION = "720p"
 #: 画面比例（图片族同一套枚举标签；抓包样本是 16:9）。
 VIDEO_ASPECT_RATIOS: tuple[str, ...] = tuple(v[0] for v in IMAGE_RATIOS.values())
@@ -909,6 +919,9 @@ def build_video_draft(*, prompt: str,
                       aspect_ratio: str = DEFAULT_VIDEO_ASPECT_RATIO,
                       fps: int = DEFAULT_VIDEO_FPS,
                       seed: int | None = None,
+                      min_version: str = "3.0.5",
+                      min_features: list[str] | None = None,
+                      draft_mode: bool = False,
                       metrics: dict[str, Any] | None = None) -> str:
     """构造**文生视频（t2v）**的 `draft_content` —— 返回 JSON 字符串（双重编码）。
 
@@ -918,6 +931,10 @@ def build_video_draft(*, prompt: str,
     · 参数在 `abilities.gen_video.text_to_video_params`，且**没有 `gen_option`**
       （视频草稿没有张数字段，一次一条）；
     · 组件带 `process_type: 1`（抓包形态）。
+
+    2.5 家族（2026-09-24 实抓 `dreamina_seedance_45_pro_draft`）的差异：
+    `min_version "3.3.28"`、`min_features ["AIGC_Video_Seedance25ResultAction"]`、
+    `video_gen_inputs[0].is_draft_mode: true`（样片标记）。调用方按模型推导。
     """
     if not prompt or not prompt.strip():
         raise JimengParamError("prompt 不能为空（文生视频必填）", code=1001)
@@ -927,8 +944,8 @@ def build_video_draft(*, prompt: str,
     draft = {
         "type": "draft",
         "id": _uid(),
-        "min_version": "3.0.5",
-        "min_features": [],
+        "min_version": min_version,
+        "min_features": list(min_features or []),
         "is_from_tsn": True,
         "version": DA_VERSION,
         "main_component_id": comp_id,
@@ -951,8 +968,9 @@ def build_video_draft(*, prompt: str,
                         "type": "", "id": _uid(),
                         "video_gen_inputs": [{
                             "type": "", "id": _uid(),
-                            "min_version": "3.0.5",
+                            "min_version": min_version,
                             "prompt": prompt,
+                            **({"is_draft_mode": True} if draft_mode else {}),
                             "video_mode": 2,
                             "fps": fps,
                             "duration_ms": duration_ms,
@@ -1558,11 +1576,21 @@ class JimengClient:
                 "materialTypes": [],
             }], separators=(",", ":")),
             "batchNumber": 1, "submitGroupId": _uid(), "hasRejectedAudit": 0,
+            # 2.5 样片实抓多出 videoStage（2026-09-24 提交包）
+            **({"videoStage": "draft"} if model.endswith("_draft") else {}),
         }
+        # 2.5 样片家族（模型 key 以 `_draft` 结尾）：min_version 3.3.28 +
+        # min_features + is_draft_mode —— 差异全部来自 2026-09-24 实抓。
+        draft_mode = model.endswith("_draft")
         draft = build_video_draft(
             prompt=prompt, model=model, resolution=resolution,
             duration_ms=duration_ms, aspect_ratio=aspect_ratio,
-            seed=seed, metrics=metrics)
+            seed=seed,
+            min_version="3.3.28" if draft_mode else "3.0.5",
+            min_features=(["AIGC_Video_Seedance25ResultAction"]
+                          if draft_mode else None),
+            draft_mode=draft_mode,
+            metrics=metrics)
         # ⚠️ 必须在 dry_run 早退**之前**设好（与 blend/edit 同一教训）
         self.last_warnings = []
         self.last_draft = draft
