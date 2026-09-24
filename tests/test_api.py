@@ -355,7 +355,7 @@ _FRAMEWORK_ROUTES = frozenset({"/openapi.json", "/docs", "/docs/oauth2-redirect"
 #: `/v1/models` 是**发现性端点**（客户端在配置 Key 之前先探"这服务有什么能力"
 #: 是常规做法），内容只有能力的公开描述、不含任何任务/凭据/内部状态。
 #: ⚠️ 往这里加东西 = 对公网免鉴权，每一项都必须有一个说得出口的理由。
-_PUBLIC_PATHS = frozenset({"/v1/models"})
+_PUBLIC_PATHS = frozenset({"/v1/models", "/", "/llms.txt"})   # 发现面：给人/给 LLM，刻意公开（2026-09-24）
 
 
 def test_every_business_route_requires_a_bearer(client):

@@ -33,7 +33,7 @@ from typing import Any, Iterator
 
 import uvicorn
 from fastapi import Depends, FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
 from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -41,6 +41,7 @@ from . import models
 from .ark import ark_task_view as ark_view
 from .ark import translate_ark_create as ark_translate
 from .config import Settings
+from .llms_txt import render as render_llms_txt
 from .coordinator import Coordinator
 from .errors import (
     AdapterError,
@@ -473,6 +474,49 @@ def _install_routes(app: FastAPI) -> None:
         svc: Service = request.app.state.service
         rec = svc.get_for_credential(task_id, credential)
         return JSONResponse(status_code=200, content=ark_view(rec))
+
+    # ------------------------------------------------------- 发现面（给人/给 LLM）
+    @app.get("/", include_in_schema=False)
+    async def index() -> HTMLResponse:
+        """根路径落地页（**给人看**）。纯 API 服务的裸 404 会被当成"打不开"。"""
+        items = models.catalog()
+        rows = "".join(
+            f"<tr><td><code>{i['id']}</code></td><td>{i.get('title', '')}</td>"
+            f"<td>{i.get('media', '')}</td><td>{'✅' if i.get('requires_prompt') else '—'}</td></tr>"
+            for i in items)
+        return HTMLResponse(f"""<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>jimeng-service · 即梦生成出口</title>
+<style>body{{margin:0;font:15px/1.7 -apple-system,"PingFang SC",sans-serif;background:#f6f7f9;color:#1a1a1a}}
+.wrap{{max-width:760px;margin:0 auto;padding:44px 22px}}.card{{background:#fff;border:1px solid #e6e8eb;border-radius:12px;padding:18px 20px;margin-bottom:16px}}
+h1{{font-size:25px;margin:0 0 6px}}h2{{font-size:15px;color:#0b57d0;margin:0 0 8px}}
+table{{border-collapse:collapse;width:100%;font-size:13.5px}}td,th{{border-bottom:1px solid #eef0f3;padding:5px 6px;text-align:left}}
+code{{font-family:ui-monospace,Menlo,monospace;font-size:12.5px}}a{{color:#0b57d0;text-decoration:none}}
+pre{{background:#0f172a;color:#e6edf3;padding:12px 14px;border-radius:8px;overflow:auto;font-size:12.5px}}
+@media (prefers-color-scheme:dark){{body{{background:#0b0f14;color:#e6edf3}}.card{{background:#111823;border-color:#1e2836}}
+h2{{color:#7cb0ff}}a{{color:#7cb0ff}}td,th{{border-color:#1e2836}}}}</style></head><body><div class="wrap">
+<h1>jimeng-service</h1>
+<p>即梦（jimeng web 端）生成出口 —— <strong>图片 + 视频</strong>，同步与异步任务两套形态。<br>
+本页只是入口说明；服务本身是 <strong>API</strong>（并无网页 UI）。<strong>建任务即计费</strong>，详见说明书。</p>
+<div class="card"><h2>怎么调</h2>
+<pre>curl -sS &lt;本机地址&gt;/v1/images/generations \
+  -H "Authorization: Bearer $JIMENG_API_KEY" -H 'Content-Type: application/json' \
+  -d '{{"model":"jimeng:t2i","prompt":"一只橘猫在窗台上"}}'</pre>
+<ul><li>异步任务：<code>POST /async/v1/images/generations</code> → <code>GET /async/v1/images/generations/{{task_id}}</code></li>
+<li>字节风格兼容面：<code>/api/v3/contents/generations/tasks</code></li></ul></div>
+<div class="card"><h2>探路（均免鉴权）</h2>
+<ul><li><a href="/llms.txt">/llms.txt</a> —— 给 LLM/Agent 的说明书（能力表 / 计费 / 错误表）</li>
+<li><a href="/v1/models">/v1/models</a> · <a href="/healthz">/healthz</a> · <a href="/readyz">/readyz</a></li></ul></div>
+<div class="card"><h2>能力（{len(items)} 项，由注册表派生）</h2>
+<table><tr><th>model</th><th>名称</th><th>媒介</th><th>需 prompt</th></tr>{rows}</table></div>
+</div></body></html>""")
+
+    @app.get("/llms.txt", include_in_schema=False)
+    async def llms_txt(request: Request) -> PlainTextResponse:
+        """给 LLM / Agent 的说明书（llmstxt.org 约定）——**免鉴权**，内容从注册表派生。"""
+        settings: Settings = request.app.state.settings
+        return PlainTextResponse(render_llms_txt(settings),
+                                 media_type="text/markdown; charset=utf-8")
 
     # ------------------------------------------------------------- 模型
     @app.get("/v1/models")
